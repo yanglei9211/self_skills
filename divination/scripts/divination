@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""算卦 CLI — 周易·推背图·八字命理"""
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import sqlite3
+import sys
+from datetime import datetime, date
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, "..", "data", "divination.db")
+DB_SCHEMA_VERSION = 4
+
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def _get_db_version(conn):
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    need_init = not os.path.exists(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    if need_init or _get_db_version(conn) < DB_SCHEMA_VERSION:
+        conn.close()
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+    return conn
+
+def init_db():
+    from base_data import (TRIGRAMS, HEAVENLY_STEMS, EARTHLY_BRANCHES,
+                           FIVE_ELEMENTS, SIXTY_JIAZI, NAYIN)
+    from yijing_data import HEXAGRAMS
+    from tuibei_data import TUIBEI
+    from qiongtong_data import QIONGTONG
+    from classics_data import CLASSICS
+
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS trigrams (
+        number INTEGER PRIMARY KEY, name TEXT, pinyin TEXT, symbol TEXT,
+        nature TEXT, element TEXT, direction TEXT, family TEXT,
+        body TEXT, animal TEXT, binary_repr TEXT
+    );
+    CREATE TABLE IF NOT EXISTS hexagrams (
+        number INTEGER PRIMARY KEY, name TEXT, pinyin TEXT,
+        upper_trigram TEXT, lower_trigram TEXT,
+        judgment TEXT, image TEXT, extra TEXT, keywords TEXT
+    );
+    CREATE TABLE IF NOT EXISTS hexagram_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hexagram_number INTEGER, position INTEGER, text TEXT,
+        UNIQUE(hexagram_number, position),
+        FOREIGN KEY (hexagram_number) REFERENCES hexagrams(number)
+    );
+    CREATE TABLE IF NOT EXISTS heavenly_stems (
+        idx INTEGER PRIMARY KEY, name TEXT, pinyin TEXT,
+        element TEXT, yin_yang TEXT
+    );
+    CREATE TABLE IF NOT EXISTS earthly_branches (
+        idx INTEGER PRIMARY KEY, name TEXT, pinyin TEXT,
+        element TEXT, yin_yang TEXT, animal TEXT,
+        month INTEGER, hour_start INTEGER, hour_end INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS five_elements (
+        name TEXT PRIMARY KEY, generates TEXT, overcomes TEXT,
+        generated_by TEXT, overcome_by TEXT,
+        season TEXT, color TEXT, organ TEXT, emotion TEXT
+    );
+    CREATE TABLE IF NOT EXISTS jiazi (
+        idx INTEGER PRIMARY KEY, name TEXT, nayin TEXT
+    );
+    CREATE TABLE IF NOT EXISTS tuibei (
+        number INTEGER PRIMARY KEY, hexagram TEXT, title TEXT,
+        prophecy TEXT, poem TEXT, interpretation TEXT
+    );
+    CREATE TABLE IF NOT EXISTS qiongtong (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        day_master TEXT, month_branch TEXT, month_name TEXT,
+        content TEXT, yongshen TEXT, keywords TEXT
+    );
+    CREATE TABLE IF NOT EXISTS classics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        book TEXT, chapter TEXT, section TEXT,
+        content TEXT, keywords TEXT
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_all USING fts5(
+        source, source_id, title, content,
+        tokenize='trigram'
+    );
+    """)
+
+    for t in TRIGRAMS:
+        c.execute("INSERT OR REPLACE INTO trigrams VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (t["number"], t["name"], t["pinyin"], t["symbol"],
+                   t["nature"], t["element"], t["direction"], t["family"],
+                   t["body"], t["animal"], t["binary"]))
+
+    for h in HEXAGRAMS:
+        c.execute("INSERT OR REPLACE INTO hexagrams VALUES (?,?,?,?,?,?,?,?,?)",
+                  (h["number"], h["name"], h["pinyin"],
+                   h["upper"], h["lower"],
+                   h["judgment"], h["image"],
+                   h.get("extra", ""), h.get("keywords", "")))
+        for i, line in enumerate(h["lines"]):
+            c.execute("INSERT OR REPLACE INTO hexagram_lines (hexagram_number, position, text) VALUES (?,?,?)",
+                      (h["number"], i + 1, line))
+        all_text = h["judgment"] + " " + h["image"] + " " + " ".join(h["lines"])
+        c.execute("INSERT INTO fts_all (source, source_id, title, content) VALUES (?,?,?,?)",
+                  ("yijing", str(h["number"]), f"第{h['number']}卦·{h['name']}", all_text))
+
+    for s in HEAVENLY_STEMS:
+        c.execute("INSERT OR REPLACE INTO heavenly_stems VALUES (?,?,?,?,?)",
+                  (s["index"], s["name"], s["pinyin"], s["element"], s["yin_yang"]))
+
+    for b in EARTHLY_BRANCHES:
+        c.execute("INSERT OR REPLACE INTO earthly_branches VALUES (?,?,?,?,?,?,?,?,?)",
+                  (b["index"], b["name"], b["pinyin"], b["element"], b["yin_yang"],
+                   b["animal"], b["month"], b["hour_start"], b["hour_end"]))
+
+    for e in FIVE_ELEMENTS:
+        c.execute("INSERT OR REPLACE INTO five_elements VALUES (?,?,?,?,?,?,?,?,?)",
+                  (e["name"], e["generates"], e["overcomes"],
+                   e["generated_by"], e["overcome_by"],
+                   e["season"], e["color"], e["organ"], e["emotion"]))
+
+    for i, name in enumerate(SIXTY_JIAZI):
+        c.execute("INSERT OR REPLACE INTO jiazi VALUES (?,?,?)",
+                  (i, name, NAYIN.get(name, "")))
+
+    for t in TUIBEI:
+        c.execute("INSERT OR REPLACE INTO tuibei VALUES (?,?,?,?,?,?)",
+                  (t["number"], t["hexagram"], t["title"],
+                   t["prophecy"], t["poem"], t["interpretation"]))
+        c.execute("INSERT INTO fts_all (source, source_id, title, content) VALUES (?,?,?,?)",
+                  ("tuibei", str(t["number"]), f"第{t['number']}象·{t['title']}",
+                   t["prophecy"] + " " + t["poem"] + " " + t["interpretation"]))
+
+    for q in QIONGTONG:
+        c.execute("INSERT INTO qiongtong (day_master, month_branch, month_name, content, yongshen, keywords) VALUES (?,?,?,?,?,?)",
+                  (q["stem"], q["month"], q["month_name"], q["content"], q["yongshen"], q.get("keywords", "")))
+        title = f"穷通宝鉴·{q['stem']}木日主·{q['month_name']}" if q["stem"] in "甲乙" else \
+                f"穷通宝鉴·{q['stem']}{'火' if q['stem'] in '丙丁' else '土' if q['stem'] in '戊己' else '金' if q['stem'] in '庚辛' else '水'}日主·{q['month_name']}"
+        c.execute("INSERT INTO fts_all (source, source_id, title, content) VALUES (?,?,?,?)",
+                  ("qiongtong", f"{q['stem']}_{q['month']}", title,
+                   q["content"] + " 用神：" + q["yongshen"]))
+
+    for cl in CLASSICS:
+        c.execute("INSERT INTO classics (book, chapter, section, content, keywords) VALUES (?,?,?,?,?)",
+                  (cl["book"], cl["chapter"], cl["section"], cl["content"], cl.get("keywords", "")))
+        title = f"{cl['book']}·{cl['chapter']}·{cl['section']}"
+        c.execute("INSERT INTO fts_all (source, source_id, title, content) VALUES (?,?,?,?)",
+                  ("classic", title, title, cl["content"]))
+
+    conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
+    conn.commit()
+    conn.close()
+
+# ---------------------------------------------------------------------------
+# 八字 (Four Pillars of Destiny)
+# ---------------------------------------------------------------------------
+
+STEMS = ["甲","乙","丙","丁","戊","己","庚","辛","壬","癸"]
+BRANCHES = ["子","丑","寅","卯","辰","巳","午","未","申","酉","戌","亥"]
+BRANCH_ANIMALS = ["鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"]
+STEM_ELEMENTS = ["木","木","火","火","土","土","金","金","水","水"]
+BRANCH_ELEMENTS = ["水","土","木","木","土","火","火","土","金","金","土","水"]
+MONTH_STEM_BASE = {0:2, 1:4, 2:6, 3:8, 4:0, 5:2, 6:4, 7:6, 8:8, 9:0}
+HOUR_STEM_BASE = {0:0, 1:2, 2:4, 3:6, 4:8, 5:0, 6:2, 7:4, 8:6, 9:0}
+
+SOLAR_TERM_MONTHS = [
+    (2, 4), (3, 6), (4, 5), (5, 6), (6, 6), (7, 7),
+    (8, 8), (9, 8), (10, 8), (11, 7), (12, 7), (1, 6),
+]
+
+def get_year_pillar(year, month, day):
+    start_m, start_d = 2, 4
+    if month < start_m or (month == start_m and day < start_d):
+        year -= 1
+    si = (year - 4) % 10
+    bi = (year - 4) % 12
+    return STEMS[si], BRANCHES[bi]
+
+def get_month_pillar(year, month, day):
+    lunar_month = None
+    for i, (sm, sd) in enumerate(SOLAR_TERM_MONTHS):
+        nm, nd = SOLAR_TERM_MONTHS[(i + 1) % 12]
+        if sm <= nm:
+            if (month > sm or (month == sm and day >= sd)) and \
+               (month < nm or (month == nm and day < nd)):
+                lunar_month = i + 1
+                break
+        else:
+            if (month > sm or (month == sm and day >= sd)) or \
+               (month < nm or (month == nm and day < nd)):
+                lunar_month = i + 1
+                break
+    if lunar_month is None:
+        lunar_month = 12
+
+    ys, _ = get_year_pillar(year, month, day)
+    base = MONTH_STEM_BASE[STEMS.index(ys)]
+    si = (base + (lunar_month - 1)) % 10
+    bi = (lunar_month + 1) % 12
+    return STEMS[si], BRANCHES[bi]
+
+def get_day_pillar(year, month, day):
+    ref = date(1900, 1, 1)  # 甲戌日, 六十甲子序号 10
+    target = date(year, month, day)
+    delta = (target - ref).days
+    idx = (delta + 10) % 60
+    return STEMS[idx % 10], BRANCHES[idx % 12]
+
+def _adjust_for_late_zi(year, month, day, hour):
+    """晚子时（23:00-23:59）日柱归次日"""
+    if hour >= 23:
+        d = date(year, month, day) + __import__("datetime").timedelta(days=1)
+        return d.year, d.month, d.day, hour
+    return year, month, day, hour
+
+def get_hour_pillar(year, month, day, hour):
+    ay, am, ad, _ = _adjust_for_late_zi(year, month, day, hour)
+    ds, _ = get_day_pillar(ay, am, ad)
+    branch_idx = ((hour + 1) // 2) % 12
+    base = HOUR_STEM_BASE[STEMS.index(ds)]
+    si = (base + branch_idx) % 10
+    return STEMS[si], BRANCHES[branch_idx]
+
+def calc_bazi(year, month, day, hour):
+    from base_data import (NAYIN, BRANCH_HIDDEN_STEMS, get_ten_god,
+                           TIANGAN_HEHUA, DIZHI_LIUHE, DIZHI_SANHE,
+                           DIZHI_SANHUI, DIZHI_LIUCHONG, DIZHI_XING, DIZHI_HAI)
+
+    ay, am, ad, _ = _adjust_for_late_zi(year, month, day, hour)
+    yg, yz = get_year_pillar(year, month, day)
+    mg, mz = get_month_pillar(year, month, day)
+    dg, dz = get_day_pillar(ay, am, ad)
+    hg, hz = get_hour_pillar(year, month, day, hour)
+
+    def _build_pillar(name, stem, branch, extra=None):
+        p = {
+            "pillar": name, "stem": stem, "branch": branch,
+            "stem_element": STEM_ELEMENTS[STEMS.index(stem)],
+            "branch_element": BRANCH_ELEMENTS[BRANCHES.index(branch)],
+            "nayin": NAYIN.get(stem + branch, ""),
+            "stem_ten_god": get_ten_god(dg, stem) if stem != dg else "日主",
+            "hidden_stems": [
+                {"stem": hs, "type": ht, "ten_god": get_ten_god(dg, hs)}
+                for hs, ht in BRANCH_HIDDEN_STEMS.get(branch, [])
+            ],
+        }
+        if extra:
+            p.update(extra)
+        return p
+
+    pillars = [
+        _build_pillar("年柱", yg, yz, {"animal": BRANCH_ANIMALS[BRANCHES.index(yz)]}),
+        _build_pillar("月柱", mg, mz),
+        _build_pillar("日柱", dg, dz, {"day_master": dg}),
+        _build_pillar("时柱", hg, hz),
+    ]
+
+    elements_count = {"金": 0, "木": 0, "水": 0, "火": 0, "土": 0}
+    for p in pillars:
+        elements_count[p["stem_element"]] += 1
+        elements_count[p["branch_element"]] += 1
+
+    stems_list = [yg, mg, dg, hg]
+    branches_list = [yz, mz, dz, hz]
+
+    relations = []
+    # 天干五合
+    for a, b, elem in TIANGAN_HEHUA:
+        idxs = [i for i, s in enumerate(stems_list) if s == a or s == b]
+        if len(set(stems_list[i] for i in idxs)) == 2 and a in stems_list and b in stems_list:
+            pos_a = ["年","月","日","时"][stems_list.index(a)]
+            pos_b = ["年","月","日","时"][stems_list.index(b)]
+            relations.append({"type": "天干合", "detail": f"{a}{b}合化{elem}", "positions": [pos_a, pos_b]})
+    # 地支六冲
+    for a, b in DIZHI_LIUCHONG:
+        if a in branches_list and b in branches_list:
+            pos_a = ["年","月","日","时"][branches_list.index(a)]
+            pos_b = ["年","月","日","时"][branches_list.index(b)]
+            relations.append({"type": "地支冲", "detail": f"{a}{b}冲", "positions": [pos_a, pos_b]})
+    # 地支六合
+    for a, b, elem in DIZHI_LIUHE:
+        if a in branches_list and b in branches_list:
+            pos_a = ["年","月","日","时"][branches_list.index(a)]
+            pos_b = ["年","月","日","时"][branches_list.index(b)]
+            relations.append({"type": "地支合", "detail": f"{a}{b}合化{elem}", "positions": [pos_a, pos_b]})
+    # 地支三合
+    for a, b, c, elem in DIZHI_SANHE:
+        present = [x for x in [a, b, c] if x in branches_list]
+        if len(present) >= 2:
+            positions = [["年","月","日","时"][branches_list.index(x)] for x in present]
+            label = "三合局" if len(present) == 3 else "半合"
+            relations.append({"type": label, "detail": f"{''.join(present)}合{elem}局", "positions": positions})
+    # 地支三会
+    for a, b, c, elem in DIZHI_SANHUI:
+        present = [x for x in [a, b, c] if x in branches_list]
+        if len(present) == 3:
+            positions = [["年","月","日","时"][branches_list.index(x)] for x in present]
+            relations.append({"type": "三会局", "detail": f"{a}{b}{c}会{elem}局", "positions": positions})
+    # 地支相害
+    for a, b in DIZHI_HAI:
+        if a in branches_list and b in branches_list:
+            pos_a = ["年","月","日","时"][branches_list.index(a)]
+            pos_b = ["年","月","日","时"][branches_list.index(b)]
+            relations.append({"type": "地支害", "detail": f"{a}{b}害", "positions": [pos_a, pos_b]})
+
+    return {
+        "birth": f"{year}-{month:02d}-{day:02d} {hour:02d}:00",
+        "bazi": f"{yg}{yz} {mg}{mz} {dg}{dz} {hg}{hz}",
+        "pillars": pillars,
+        "day_master": dg,
+        "day_master_element": STEM_ELEMENTS[STEMS.index(dg)],
+        "five_elements_count": elements_count,
+        "relations": relations,
+    }
+
+# ---------------------------------------------------------------------------
+# 起卦 (Casting Hexagrams)
+# ---------------------------------------------------------------------------
+
+TRIGRAM_MAP = {
+    "111": "乾", "110": "兑", "101": "离", "100": "震",
+    "011": "巽", "010": "坎", "001": "艮", "000": "坤",
+}
+
+HEXAGRAM_LOOKUP = None
+
+def build_hexagram_lookup():
+    global HEXAGRAM_LOOKUP
+    if HEXAGRAM_LOOKUP:
+        return
+    from yijing_data import HEXAGRAMS
+    HEXAGRAM_LOOKUP = {}
+    for h in HEXAGRAMS:
+        key = (h["upper"], h["lower"])
+        HEXAGRAM_LOOKUP[key] = h
+
+def find_hexagram(upper_name, lower_name):
+    build_hexagram_lookup()
+    return HEXAGRAM_LOOKUP.get((upper_name, lower_name))
+
+def cast_coin():
+    """铜钱起卦：模拟三枚铜钱掷六次"""
+    lines = []
+    for _ in range(6):
+        coins = [random.choice([2, 3]) for _ in range(3)]
+        total = sum(coins)
+        if total == 6:
+            lines.append({"value": 6, "type": "老阴", "changing": True, "binary": "0"})
+        elif total == 7:
+            lines.append({"value": 7, "type": "少阳", "changing": False, "binary": "1"})
+        elif total == 8:
+            lines.append({"value": 8, "type": "少阴", "changing": False, "binary": "0"})
+        else:
+            lines.append({"value": 9, "type": "老阳", "changing": True, "binary": "1"})
+
+    lower = "".join(l["binary"] for l in lines[:3])
+    upper = "".join(l["binary"] for l in lines[3:])
+    main_hex = find_hexagram(TRIGRAM_MAP[upper], TRIGRAM_MAP[lower])
+
+    changed = "".join(("1" if l["binary"] == "0" else "0") if l["changing"] else l["binary"]
+                      for l in lines)
+    changed_lower = changed[:3]
+    changed_upper = changed[3:]
+    changed_hex = find_hexagram(TRIGRAM_MAP[changed_upper], TRIGRAM_MAP[changed_lower])
+
+    changing_lines = [i + 1 for i, l in enumerate(lines) if l["changing"]]
+
+    return {
+        "method": "铜钱法",
+        "lines_detail": [{"position": i+1, **l} for i, l in enumerate(lines)],
+        "main_hexagram": main_hex,
+        "changing_lines": changing_lines,
+        "changed_hexagram": changed_hex if changing_lines else None,
+    }
+
+def cast_time(dt=None):
+    """时间起卦：用当前时间数值起卦"""
+    if dt is None:
+        dt = datetime.now()
+    upper_num = (dt.year + dt.month + dt.day) % 8 or 8
+    lower_num = (dt.year + dt.month + dt.day + dt.hour) % 8 or 8
+    moving_line = (dt.year + dt.month + dt.day + dt.hour + dt.minute) % 6 or 6
+
+    trigram_order = ["乾","兑","离","震","巽","坎","艮","坤"]
+    upper_name = trigram_order[upper_num - 1]
+    lower_name = trigram_order[lower_num - 1]
+    main_hex = find_hexagram(upper_name, lower_name)
+
+    return {
+        "method": "时间起卦",
+        "time": dt.strftime("%Y-%m-%d %H:%M"),
+        "upper_trigram": upper_name,
+        "lower_trigram": lower_name,
+        "main_hexagram": main_hex,
+        "moving_line": moving_line,
+    }
+
+def cast_number(num1, num2=None):
+    """数字起卦：梅花易数"""
+    if num2 is None:
+        num2 = num1
+        num1 = num1 // 2
+
+    upper_num = num1 % 8 or 8
+    lower_num = num2 % 8 or 8
+    moving_line = (num1 + num2) % 6 or 6
+
+    trigram_order = ["乾","兑","离","震","巽","坎","艮","坤"]
+    upper_name = trigram_order[upper_num - 1]
+    lower_name = trigram_order[lower_num - 1]
+    main_hex = find_hexagram(upper_name, lower_name)
+
+    return {
+        "method": "梅花易数",
+        "numbers": [num1, num2],
+        "upper_trigram": upper_name,
+        "lower_trigram": lower_name,
+        "main_hexagram": main_hex,
+        "moving_line": moving_line,
+    }
+
+def cast_text(text):
+    """文字起卦：用文字的哈希值起卦"""
+    h = hashlib.md5(text.encode()).hexdigest()
+    num1 = int(h[:8], 16)
+    num2 = int(h[8:16], 16)
+    result = cast_number(num1, num2)
+    result["method"] = "文字起卦"
+    result["input_text"] = text
+    return result
+
+# ---------------------------------------------------------------------------
+# Query functions
+# ---------------------------------------------------------------------------
+
+def query_hexagram(conn, number=None, name=None):
+    c = conn.cursor()
+    if number:
+        c.execute("SELECT * FROM hexagrams WHERE number = ?", (number,))
+    elif name:
+        c.execute("SELECT * FROM hexagrams WHERE name = ? OR pinyin = ?", (name, name))
+    else:
+        return None
+    row = c.fetchone()
+    if not row:
+        return None
+    cols = [d[0] for d in c.description]
+    hexagram = dict(zip(cols, row))
+    c.execute("SELECT position, text FROM hexagram_lines WHERE hexagram_number = ? ORDER BY position",
+              (hexagram["number"],))
+    hexagram["lines"] = [{"position": r[0], "text": r[1]} for r in c.fetchall()]
+    return hexagram
+
+def query_trigram(conn, name=None):
+    c = conn.cursor()
+    if name:
+        c.execute("SELECT * FROM trigrams WHERE name = ? OR pinyin = ?", (name, name))
+    else:
+        c.execute("SELECT * FROM trigrams")
+    rows = c.fetchall()
+    cols = [d[0] for d in c.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+def query_tuibei(conn, number=None, keyword=None):
+    c = conn.cursor()
+    if number:
+        c.execute("SELECT * FROM tuibei WHERE number = ?", (number,))
+    elif keyword:
+        c.execute("SELECT * FROM tuibei WHERE prophecy LIKE ? OR poem LIKE ? OR interpretation LIKE ? OR title LIKE ?",
+                  (f"%{keyword}%",) * 4)
+    else:
+        c.execute("SELECT * FROM tuibei")
+    rows = c.fetchall()
+    cols = [d[0] for d in c.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+def query_qiongtong(conn, stem, month=None):
+    c = conn.cursor()
+    if month:
+        c.execute("SELECT * FROM qiongtong WHERE day_master = ? AND month_branch = ?", (stem, month))
+    else:
+        c.execute("SELECT * FROM qiongtong WHERE day_master = ?", (stem,))
+    rows = c.fetchall()
+    cols = [d[0] for d in c.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+def query_classic(conn, book=None, keyword=None):
+    c = conn.cursor()
+    if book and keyword:
+        c.execute("SELECT * FROM classics WHERE book = ? AND (content LIKE ? OR section LIKE ? OR keywords LIKE ?)",
+                  (book, f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"))
+    elif book:
+        c.execute("SELECT * FROM classics WHERE book = ?", (book,))
+    elif keyword:
+        c.execute("SELECT * FROM classics WHERE content LIKE ? OR section LIKE ? OR keywords LIKE ?",
+                  (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"))
+    else:
+        c.execute("SELECT * FROM classics")
+    rows = c.fetchall()
+    cols = [d[0] for d in c.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+def query_element(conn, name=None):
+    c = conn.cursor()
+    if name:
+        c.execute("SELECT * FROM five_elements WHERE name = ?", (name,))
+    else:
+        c.execute("SELECT * FROM five_elements")
+    rows = c.fetchall()
+    cols = [d[0] for d in c.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+def search_all(conn, keyword):
+    c = conn.cursor()
+    results = []
+    try:
+        c.execute("""
+            SELECT source, source_id, title, snippet(fts_all, 3, '【', '】', '...', 32)
+            FROM fts_all WHERE fts_all MATCH ?
+            ORDER BY rank LIMIT 20
+        """, (keyword,))
+        for row in c.fetchall():
+            results.append({
+                "source": row[0], "source_id": row[1],
+                "title": row[2], "snippet": row[3],
+            })
+    except sqlite3.OperationalError:
+        pass  # trigram tokenizer requires >= 3 bytes, fallback to LIKE below
+
+    if not results:
+        escaped = keyword.replace("%", r"\%").replace("_", r"\_")
+        like_pat = f"%{escaped}%"
+        c.execute("""
+            SELECT source, source_id, title, content
+            FROM fts_all WHERE content LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'
+            LIMIT 20
+        """, (like_pat, like_pat))
+        for row in c.fetchall():
+            content = row[3]
+            idx = content.find(keyword)
+            if idx < 0:
+                idx = row[2].find(keyword)
+                content = row[2] + " " + content
+                idx = content.find(keyword)
+            if idx < 0:
+                results.append({"source": row[0], "source_id": row[1],
+                                "title": row[2], "snippet": content[:60] + "..."})
+                continue
+            start = max(0, idx - 20)
+            end = min(len(content), idx + len(keyword) + 20)
+            snip = ("..." if start > 0 else "") + \
+                   content[start:idx] + "【" + keyword + "】" + \
+                   content[idx+len(keyword):end] + \
+                   ("..." if end < len(content) else "")
+            results.append({
+                "source": row[0], "source_id": row[1],
+                "title": row[2], "snippet": snip,
+            })
+    return results
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def output(data, pretty=False):
+    if pretty:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(data, ensure_ascii=False))
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="divination",
+        description="算卦 CLI — 周易·推背图·八字命理",
+    )
+    parser.add_argument("--pretty", "-p", action="store_true", help="格式化 JSON 输出")
+    pretty_parent = argparse.ArgumentParser(add_help=False)
+    pretty_parent.add_argument("--pretty", "-p", action="store_true", dest="_sub_pretty")
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    sub.add_parser("init", help="初始化/重建数据库", parents=[pretty_parent])
+
+    # bazi
+    p_bazi = sub.add_parser("bazi", help="八字排盘", parents=[pretty_parent])
+    p_bazi.add_argument("--birth", required=True, help="出生时间 YYYY-MM-DD HH:MM")
+
+    # cast (起卦)
+    p_cast = sub.add_parser("cast", help="起卦", parents=[pretty_parent])
+    p_cast.add_argument("--method", choices=["coin", "time", "number", "text"],
+                        default="coin", help="起卦方法: coin(铜钱) time(时间) number(数字) text(文字)")
+    p_cast.add_argument("--num1", type=int, help="数字起卦: 第一个数")
+    p_cast.add_argument("--num2", type=int, help="数字起卦: 第二个数 (可选)")
+    p_cast.add_argument("--text", help="文字起卦: 输入文字")
+    p_cast.add_argument("--seed", type=int, help="随机种子 (用于复现)")
+
+    # hexagram (查卦)
+    p_hex = sub.add_parser("hexagram", help="查询卦象", parents=[pretty_parent])
+    p_hex.add_argument("--number", type=int, help="卦序号 (1-64)")
+    p_hex.add_argument("--name", help="卦名 (如 乾/qián)")
+
+    # trigram (查八卦)
+    p_tri = sub.add_parser("trigram", help="查询八卦", parents=[pretty_parent])
+    p_tri.add_argument("--name", help="卦名 (如 乾)，不传则列出全部")
+
+    # tuibei (推背图)
+    p_tuibei = sub.add_parser("tuibei", help="查询推背图", parents=[pretty_parent])
+    p_tuibei.add_argument("--number", type=int, help="象序号 (1-60)")
+    p_tuibei.add_argument("--keyword", help="关键词搜索")
+
+    # element (五行)
+    p_elem = sub.add_parser("element", help="查询五行", parents=[pretty_parent])
+    p_elem.add_argument("--name", help="元素名 (金/木/水/火/土)，不传则列出全部")
+
+    # qiongtong (穷通宝鉴)
+    p_qt = sub.add_parser("qiongtong", help="查询穷通宝鉴用神", parents=[pretty_parent])
+    p_qt.add_argument("--stem", required=True, help="日主天干 (甲/乙/丙/丁/戊/己/庚/辛/壬/癸)")
+    p_qt.add_argument("--month", help="月支 (寅/卯/辰/巳/午/未/申/酉/戌/亥/子/丑)")
+
+    # classic (经典查询)
+    p_cl = sub.add_parser("classic", help="查询命理经典", parents=[pretty_parent])
+    p_cl.add_argument("--book", help="书名 (如 滴天髓/子平真诠)")
+    p_cl.add_argument("--keyword", help="关键词搜索")
+
+    # search (全文搜索)
+    p_search = sub.add_parser("search", help="全库全文搜索", parents=[pretty_parent])
+    p_search.add_argument("keyword", help="搜索关键词")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    if getattr(args, "_sub_pretty", False):
+        args.pretty = True
+
+    if args.command == "init":
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        init_db()
+        output({"status": "ok", "message": "数据库已初始化",
+                "path": os.path.realpath(DB_PATH),
+                "schema_version": DB_SCHEMA_VERSION}, args.pretty)
+        return
+
+    if args.command == "bazi":
+        try:
+            dt = datetime.strptime(args.birth, "%Y-%m-%d %H:%M")
+        except ValueError:
+            try:
+                dt = datetime.strptime(args.birth, "%Y-%m-%d")
+                dt = dt.replace(hour=12)
+            except ValueError:
+                output({"error": "日期格式错误，请使用 YYYY-MM-DD HH:MM"})
+                sys.exit(1)
+        result = calc_bazi(dt.year, dt.month, dt.day, dt.hour)
+        output(result, args.pretty)
+        return
+
+    if args.command == "cast":
+        if args.seed is not None:
+            random.seed(args.seed)
+        if args.method == "coin":
+            result = cast_coin()
+        elif args.method == "time":
+            result = cast_time()
+        elif args.method == "number":
+            if args.num1 is None:
+                output({"error": "数字起卦需要 --num1 参数"})
+                sys.exit(1)
+            result = cast_number(args.num1, args.num2)
+        elif args.method == "text":
+            if args.text is None:
+                output({"error": "文字起卦需要 --text 参数"})
+                sys.exit(1)
+            result = cast_text(args.text)
+        output(result, args.pretty)
+        return
+
+    conn = get_db()
+    try:
+        if args.command == "hexagram":
+            if not args.number and not args.name:
+                output({"error": "请指定 --number 或 --name"})
+                sys.exit(1)
+            result = query_hexagram(conn, args.number, args.name)
+            if result:
+                output(result, args.pretty)
+            else:
+                output({"error": "未找到该卦"})
+                sys.exit(1)
+
+        elif args.command == "trigram":
+            result = query_trigram(conn, args.name)
+            output(result if len(result) != 1 else result[0], args.pretty)
+
+        elif args.command == "tuibei":
+            result = query_tuibei(conn, args.number, args.keyword)
+            if args.number and result:
+                output(result[0], args.pretty)
+            elif result:
+                output(result, args.pretty)
+            else:
+                output({"error": "未找到匹配内容"})
+                sys.exit(1)
+
+        elif args.command == "element":
+            result = query_element(conn, args.name)
+            output(result if len(result) != 1 else result[0], args.pretty)
+
+        elif args.command == "qiongtong":
+            result = query_qiongtong(conn, args.stem, args.month)
+            if args.month and result:
+                output(result[0], args.pretty)
+            elif result:
+                output(result, args.pretty)
+            else:
+                output({"error": f"未找到 {args.stem}日主" + (f" {args.month}月" if args.month else "") + " 的记录"})
+                sys.exit(1)
+
+        elif args.command == "classic":
+            if not args.book and not args.keyword:
+                output({"error": "请指定 --book 或 --keyword"})
+                sys.exit(1)
+            result = query_classic(conn, args.book, args.keyword)
+            output(result, args.pretty)
+
+        elif args.command == "search":
+            result = search_all(conn, args.keyword)
+            output({"keyword": args.keyword, "count": len(result), "results": result}, args.pretty)
+
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()

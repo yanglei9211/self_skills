@@ -1,0 +1,18 @@
+# self_skills 依赖清单
+#
+# 核心原则：大部分脚本只用 Python 标准库（argparse / json / sqlite3 / urllib 等），
+# 能不装就不装。下面只列出个别脚本必需的第三方包。
+#
+# 安装：
+#   pip install -r requirements.txt
+#   playwright install chromium        # 仅当要使用 generate_cards.py 时执行
+
+# ---- newsboat-news-hub / generate_cards.py ----
+# 用 Chromium 渲染 HTML 生成小红书风格新闻卡片
+playwright>=1.40.0
+
+# ---- divination ----
+# 仅使用 Python 3.8+ 标准库，无第三方依赖
+
+# ---- newsboat-news-hub / fetch_news.py ----
+# 仅使用 Python 3.8+ 标准库，无第三方依赖

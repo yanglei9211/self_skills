@@ -1,0 +1,56 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== Virtual envs =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== Editor / OS =====
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== Secrets / tokens =====
+# 防止意外提交 GitHub token、API key 等
+*.token
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+secrets/
+credentials.json
+
+# ===== 项目产物 =====
+# divination: 数据库由脚本自动生成，不纳入版本控制（如需共享可手动去掉这行）
+self_skills/divination/data/divination.db
+divination/data/*.db
+divination/data/*.db-journal
+
+# newsboat-news-hub: 抓取结果、生成的卡片
+news_cn.json
+news_full.json
+cards/
+*.png
+!references/**/*.png
+
+# ===== Playwright 浏览器缓存 =====
+.playwright/

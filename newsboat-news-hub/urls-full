@@ -1,0 +1,58 @@
+# ══════════════════════════════════════════════
+# Newsboat RSS 源 — 完整版（需要代理或海外网络）
+# 包含被墙的 NYT/WaPo/BBC/WSJ/Bloomberg
+# ══════════════════════════════════════════════
+
+# ── 通讯社（最中立）─────────────────────────────
+https://apnews.com/hub/apf-topnews?output=rss "~AP 美联社 - 头条" wire
+https://apnews.com/hub/world-news?output=rss "~AP 美联社 - 国际" wire world
+https://apnews.com/hub/politics?output=rss "~AP 美联社 - 政治" wire politics
+https://apnews.com/hub/business?output=rss "~AP 美联社 - 商业" wire business
+https://apnews.com/hub/technology?output=rss "~AP 美联社 - 科技" wire tech
+
+# ── 新闻聚合 ─────────────────────────────────
+https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en "~Google News - 美国头条" aggregator
+https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx1YlY4U0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en "~Google News - 美国" aggregator
+https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRFp0Y1RjU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en "~Google News - 国际" aggregator world
+
+# ── 偏左 ──────────────────────────────────────
+https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml "~NYT 纽约时报 - 首页" left-center
+https://rss.nytimes.com/services/xml/rss/nyt/World.xml "~NYT 纽约时报 - 国际" left-center world
+https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml "~NYT 纽约时报 - 政治" left-center politics
+https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml "~NYT 纽约时报 - 科技" left-center tech
+https://feeds.washingtonpost.com/rss/national "~WaPo 华盛顿邮报 - 国内" left-center
+https://feeds.washingtonpost.com/rss/world "~WaPo 华盛顿邮报 - 国际" left-center world
+https://feeds.washingtonpost.com/rss/politics "~WaPo 华盛顿邮报 - 政治" left-center politics
+https://feeds.npr.org/1001/rss.xml "~NPR - 头条" left-center
+https://feeds.npr.org/1014/rss.xml "~NPR - 政治" left-center politics
+https://feeds.npr.org/1004/rss.xml "~NPR - 国际" left-center world
+
+# ── 中间 ──────────────────────────────────────
+https://abcnews.go.com/abcnews/topstories "~ABC News - 头条" center
+https://www.cbsnews.com/latest/rss/main "~CBS News - 头条" center
+
+# ── 政治专业 ──────────────────────────────────
+https://rss.politico.com/politics-news.xml "~Politico - 政治新闻" politics-pro politics
+https://thehill.com/feed/ "~The Hill 国会山报" politics-pro politics
+
+# ── 偏右 ──────────────────────────────────────
+https://www.wsj.com/xml/rss/3_7085.xml "~WSJ 华尔街日报 - 头条" right-center business
+http://feeds.foxnews.com/foxnews/latest "~Fox News - 最新" right
+http://feeds.foxnews.com/foxnews/politics "~Fox News - 政治" right politics
+http://feeds.foxnews.com/foxnews/world "~Fox News - 国际" right world
+
+# ── 财经 ──────────────────────────────────────
+https://feeds.bloomberg.com/markets/news.rss "~Bloomberg 彭博 - 市场" finance
+https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114 "~CNBC - 头条" finance
+https://feeds.content.dowjones.io/public/rss/mw_topstories "~MarketWatch - 头条" finance
+
+# ── 科技 ──────────────────────────────────────
+https://feeds.arstechnica.com/arstechnica/index "~Ars Technica" tech
+https://www.theverge.com/rss/index.xml "~The Verge" tech
+
+# ── 国际视角 ──────────────────────────────────
+https://feeds.bbci.co.uk/news/rss.xml "~BBC - 头条" intl
+https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml "~BBC - 美国与加拿大" intl
+https://feeds.skynews.com/feeds/rss/us.xml "~Sky News - 美国" intl
+https://feeds.skynews.com/feeds/rss/world.xml "~Sky News - 国际" intl world
+https://www.france24.com/en/rss "~France 24 法国24" intl
