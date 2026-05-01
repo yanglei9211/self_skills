@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# stock-market-hub 统一 CLI 入口
+#
+# Usage:
+#   smh company SZ300750               公司深度卡片
+#   smh company HK01810 --with-peers   含同业横向对比
+#   smh company BABA --ann-days 60     SEC EDGAR 中概股
+#
+#   smh sector "AI PC"                 板块扫描
+#   smh sector --list                  列出可用板块
+#
+#   smh news                           当日财经新闻聚合
+#   smh news --limit 100 --skip xueqiu
+#
+#   smh market --board gainers --top 10  全市场涨幅榜
+#   smh market --markets all_a,hk,us --board gainers --top 5
+#
+#   smh risk                           风险扫描（默认 R1+R2+R5）
+#   smh risk --all                     全规则
+#
+#   smh ann SZ300750                   公告查询
+#   smh ann --keyword "立案调查" --days 30
+#
+#   smh timeline HK01810 --days 30     事件时间轴
+#
+#   smh pdf URL                        PDF 关键章节抽取
+#   smh supply SZ300750                上下游图谱
+#
+#   smh cache stats                    缓存统计
+#   smh cache clear --prefix kline    清理缓存
+#
+# 环境变量：
+#   SEC_USER_AGENT   SEC EDGAR 合规 UA（推荐设置）
+#   XUEQIU_COOKIE    雪球登录 cookie（启用热门帖/个股新闻）
+
+set -e
+
+# 自动定位仓库目录（脚本可以软链）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPTS="$SKILL_DIR/scripts"
+VPY="$SKILL_DIR/../.venv/bin/python3"
+
+# 如果 venv 不在父目录（比如直接调用 ~/.cursor/skills/stock-market-hub/bin/smh），
+# 解析软链找到真身
+if [ ! -x "$VPY" ]; then
+    REAL_DIR="$(readlink -f "$SCRIPT_DIR" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$SCRIPT_DIR")"
+    REAL_SKILL="$(cd "$REAL_DIR/.." && pwd)"
+    VPY="$REAL_SKILL/../.venv/bin/python3"
+    SCRIPTS="$REAL_SKILL/scripts"
+fi
+
+if [ ! -x "$VPY" ]; then
+    echo "ERROR: 找不到 venv python: $VPY" >&2
+    echo "请确认 self_skills/.venv 已建立" >&2
+    exit 1
+fi
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+    company|c)
+        exec "$VPY" "$SCRIPTS/analyze_company.py" --symbol "$@"
+        ;;
+    sector|s)
+        exec "$VPY" "$SCRIPTS/scan_sector.py" "$@"
+        ;;
+    news|n)
+        exec "$VPY" "$SCRIPTS/fetch_market_news.py" "$@"
+        ;;
+    market|m)
+        exec "$VPY" "$SCRIPTS/xueqiu_market.py" "$@"
+        ;;
+    risk|r)
+        exec "$VPY" "$SCRIPTS/risk_scan.py" "$@"
+        ;;
+    ann|announcements|a)
+        # 第一个参数若不以 -- 开头，视为 --symbol
+        if [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            sym="$1"; shift
+            exec "$VPY" "$SCRIPTS/fetch_announcements.py" --symbol "$sym" "$@"
+        else
+            exec "$VPY" "$SCRIPTS/fetch_announcements.py" "$@"
+        fi
+        ;;
+    timeline|t)
+        if [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            sym="$1"; shift
+            exec "$VPY" "$SCRIPTS/event_timeline.py" --symbol "$sym" "$@"
+        else
+            exec "$VPY" "$SCRIPTS/event_timeline.py" "$@"
+        fi
+        ;;
+    pdf|p)
+        if [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            url="$1"; shift
+            exec "$VPY" "$SCRIPTS/pdf_extract.py" --url "$url" "$@"
+        else
+            exec "$VPY" "$SCRIPTS/pdf_extract.py" "$@"
+        fi
+        ;;
+    supply)
+        if [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            sym="$1"; shift
+            exec "$VPY" "$SCRIPTS/supply_chain.py" --symbol "$sym" "$@"
+        else
+            exec "$VPY" "$SCRIPTS/supply_chain.py" "$@"
+        fi
+        ;;
+    cache)
+        exec "$VPY" "$SCRIPTS/core/cache.py" "$@"
+        ;;
+    help|--help|-h|"")
+        sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//'
+        ;;
+    *)
+        echo "未知命令: $cmd" >&2
+        echo "" >&2
+        sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//' >&2
+        exit 1
+        ;;
+esac

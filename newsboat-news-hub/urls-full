@@ -11,9 +11,13 @@ https://apnews.com/hub/business?output=rss "~AP 美联社 - 商业" wire busines
 https://apnews.com/hub/technology?output=rss "~AP 美联社 - 科技" wire tech
 
 # ── 新闻聚合 ─────────────────────────────────
-https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en "~Google News - 美国头条" aggregator
-https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx1YlY4U0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en "~Google News - 美国" aggregator
-https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRFp0Y1RjU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en "~Google News - 国际" aggregator world
+# 注：Google News RSS 吐出的 link 字段是 news.google.com/rss/articles/CBMi... 格式，
+#     这类 token URL 无法在国内直连访问，且无法服务端解码为原始文章链接。
+#     已替换为真实返回原始文章链接的 RSS 源（2026.4 实测）。
+#     有代理时可直接用 urls-full 中的 NYT/WaPo/BBC/WSJ 等被墙媒体，聚合源优先级降低。
+https://feeds.npr.org/1001/rss.xml "~NPR - 美国头条" aggregator
+https://feeds.npr.org/1004/rss.xml "~NPR - 国际" aggregator world
+https://feeds.skynews.com/feeds/rss/world.xml "~Sky News - 国际" aggregator world
 
 # ── 偏左 ──────────────────────────────────────
 https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml "~NYT 纽约时报 - 首页" left-center

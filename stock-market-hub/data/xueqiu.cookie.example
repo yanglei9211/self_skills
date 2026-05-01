@@ -1,0 +1,29 @@
+# 雪球登录 Cookie 配置示例
+#
+# 把本文件拷贝到 ~/.config/stock-market-hub/xueqiu.cookie 并填入你的真实 cookie，即可启用：
+#   - 雪球热门帖（fetch_market_news.py 的 xueqiu 源）
+#   - 个股新闻流（XueqiuClient.stock_news）
+#   - 个股评论（XueqiuClient.stock_comments）
+#
+# 获取 cookie 步骤（Chrome）：
+#   1. 在 Chrome 登录 https://xueqiu.com
+#   2. F12 打开开发者工具 → Network 标签
+#   3. 刷新页面，点击任一对 xueqiu.com 的请求
+#   4. Headers 里找 Request Headers → Cookie，整段复制
+#   5. 粘贴到本文件（也可以多行，自动合并）
+#
+# 关键 cookie 字段（必须包含其中至少 xqat 或 xq_a_token）：
+#   xq_a_token=xxxxxxxxxxxxxxxxxxxxxxxx
+#   xqat=xxxxxxxxxxxxxxxxxxxxxxxx
+#   xq_r_token=xxxxxxxxxxxxxxxxxxxxxxxx
+#   xq_id_token=xxxxxxxxxxxxxxxxxxxxxxxx
+#   u=xxxxx
+#   acw_tc=xxxxxxxx
+#
+# Cookie 默认有效 30 天，到期后会失效要重新拷贝。
+#
+# 也可以用环境变量代替本文件：
+#   export XUEQIU_COOKIE="xq_a_token=xxx; xqat=xxx; ..."
+
+# ============ 把你的 cookie 粘贴在下面（可以多行） ============
+

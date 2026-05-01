@@ -1,0 +1,337 @@
+---
+name: stock-market-hub
+description: >-
+  A股 / 港股 / 中概股 金融市场分析中心：当日财经新闻聚合、板块龙头/热门/风险股扫描、
+  公司深度尽调（基本面、财报、高管、主要股东、上下游、近期公告、财报 PDF 解析）。
+  当用户提到 A股、港股、中概、股票分析、个股分析、板块扫描、行情、涨幅榜、跌幅榜、
+  主力净流入、雪球热度、ST 风险股、上市公司、公司分析、商业模式、上下游、
+  财报、年报、季报、招股书、巨潮、披露易、HKEX、CSRC、董事变更、立案调查、
+  财联社电报、券商研报 时使用。
+---
+
+# Stock Market Hub — 股票金融市场分析中心
+
+一套面向 A 股 + 港股 + 中概股的市场情报与个股深度分析工具。
+覆盖三个核心场景：当日金融市场新闻、板块/榜单扫描、公司深度尽调。
+
+## 0. 安装与依赖
+
+```bash
+# Python 依赖
+cd /Users/dp/Documents/local2/self_skills
+python3 -m venv .venv
+.venv/bin/pip install akshare pdfplumber curl_cffi pandas lxml pytesseract pdf2image
+
+# 系统依赖（用于港股年报 OCR fallback）
+brew install tesseract tesseract-lang poppler
+
+# 可选：SEC EDGAR 合规 UA（中概股查询时会用）
+export SEC_USER_AGENT="your-name your-email@example.com"
+
+# 可选：雪球登录 cookie（启用热门帖 / 个股新闻流）
+mkdir -p ~/.config/stock-market-hub
+cat data/xueqiu.cookie.example
+# 按说明复制粘贴你浏览器的雪球 cookie 到 ~/.config/stock-market-hub/xueqiu.cookie
+```
+
+## 0.1 统一 CLI 入口（推荐）
+
+所有功能都可以通过 `bin/smh` 调用：
+
+```bash
+SMH=/Users/dp/Documents/local2/self_skills/stock-market-hub/bin/smh
+
+# 公司深度卡片
+$SMH company SZ300750               # A 股
+$SMH company HK01810 --with-peers   # 港股 + 同业横向对比
+$SMH company BABA --ann-days 60     # 中概股（SEC EDGAR）
+
+# 板块扫描 / 市场速览 / 风险扫描
+$SMH sector "AI PC"
+$SMH market --board gainers --top 10
+$SMH risk --rules R1,R2,R5
+
+# 公告 / 时间轴 / PDF / 上下游
+$SMH ann SZ300750 --days 60
+$SMH timeline HK01810 --days 30 --news-keywords "小米,Xiaomi,SU7,YU7"
+$SMH pdf URL --sections business,risks
+$SMH supply SZ300750
+
+# 缓存管理
+$SMH cache stats
+$SMH cache clear --prefix kline
+```
+
+直接调脚本也可以（每个脚本独立 `argparse --help`）：
+
+```bash
+VPY=/Users/dp/Documents/local2/self_skills/.venv/bin/python3
+$VPY scripts/analyze_company.py --symbol SZ300750 --with-peers
+```
+
+## 1. 数据源全景
+
+详见 [references/data_sources.md](references/data_sources.md)。要点：
+
+- **核心源（公开免费）**：财联社电报、雪球 screener、新浪行情/财报、巨潮（A股权威公告）、披露易（港股权威公告）、同花顺板块
+- **被反爬封禁**：东方财富 push2 接口（即使 Chrome 指纹也立即断开）→ 已绕开，不依赖
+- **WAF 受限**：雪球热门帖 → v1 不启用，要稳定使用需用户提供已登录 cookie
+- **统一调用层**：所有 HTTP 请求走 `scripts/core/http.py`（curl_cffi + Chrome 指纹 + 自动重试）
+
+## 2. 三大场景及调用契约
+
+### 场景 A：当日金融市场情报
+
+> 用户语境："今天 A 股发生了什么"、"现在的市场行情怎么样"、"今天有什么大新闻"
+
+**核心脚本**：`xueqiu_market.py` + `fetch_market_news.py`
+
+```bash
+# 1. 市场速览（涨跌榜 / 成交额 / 主力资金 / 散户热度 / ST 风险）
+$VPY scripts/xueqiu_market.py --board all --top 5
+$VPY scripts/xueqiu_market.py --markets all_a,hk,us --board gainers --top 5
+
+# 2. 当日新闻流（财联社电报为主）
+$VPY scripts/fetch_market_news.py --limit 50 --format json
+```
+
+**Agent 输出格式（中文 Markdown）**：
+
+```
+# YYYY 年 M 月 D 日 A 股 / 港股 / 中概 市场速览
+
+## 一、市场情报
+- `HH:MM` ★ **重点新闻一句话摘要**。 — [来源](url)
+- `HH:MM` 普通新闻一句话摘要。 — [来源](url)
+
+## 二、涨跌榜
+### A 股涨幅榜 Top 10
+| 代码 | 名称 | 现价 | 涨跌幅 | 成交额 | 总市值 |
+
+## 三、资金动向
+### 主力净流入榜 Top 5
+（同上表格）
+
+## 四、风险预警
+### ST 跌幅榜 / 连续跌停股
+（同上）
+
+## 五、雪球散户热度榜
+（同上）
+```
+
+### 场景 B：板块扫描
+
+> 用户语境："看一下半导体板块"、"AI 概念股有哪些龙头"、"今天哪个板块异动"
+
+**核心脚本**：`scan_sector.py`
+
+```bash
+$VPY scripts/scan_sector.py --sector "半导体" --top 10
+$VPY scripts/scan_sector.py --sector "新能源车" --include-risk
+$VPY scripts/scan_sector.py --list  # 列出所有可用板块
+```
+
+**输出**：板块涨跌幅、龙头股 Top N（按市值+成交额）、热门股 Top N（按换手率+雪球关注度）、高风险股（ST/连续跌停/财务恶化）
+
+### 场景 C：公司深度卡片
+
+> 用户语境："分析一下宁德时代 300750"、"腾讯 0700 财务怎么样"、"阿里巴巴 BABA 商业模式"
+
+**核心脚本**：`analyze_company.py`（速查模式）/ `analyze_company.py --deep`（含 PDF 年报 + 上下游）
+
+```bash
+# 速查卡片（基本信息 + 财报 + 高管 + 主要股东 + 概念归属 + 近 30 天公告）
+$VPY scripts/analyze_company.py --symbol SZ300750
+$VPY scripts/analyze_company.py --symbol HK00700
+$VPY scripts/analyze_company.py --symbol BABA   # 中概股
+
+# 深度模式（再加：年报 PDF 解析的业务概要 / 主要客户供应商 / 风险因素 / 上下游图谱 / 同业对比）
+$VPY scripts/analyze_company.py --symbol SZ300750 --deep
+```
+
+**Agent 输出模板（中文 Markdown）**：
+
+```
+# {名称} ({代码}) — 公司深度卡片
+
+## 一、公司基础信息
+- 行业 / 概念归属
+- 上市日期 / 总市值 / 流通市值
+- 主营业务一句话
+
+## 二、关键财务指标（最近报告期 + 同比 + 滚动）
+| 指标 | 本期 | YoY | 行业中位 |
+| 营业收入 | ... | ... | ... |
+| 归母净利 | ... | ... | ... |
+| 毛利率 | ... | ... | ... |
+| ROE TTM | ... | ... | ... |
+| 资产负债率 | ... | ... | ... |
+| 经营性现金流 | ... | ... | ... |
+
+## 三、核心高管
+| 姓名 | 职位 | 任期 | 薪酬 | 持股 |
+
+## 四、主要股东（前 10）
+| 股东 | 性质 | 持股比例 | 变动 |
+
+## 五、近 30 天关键公告
+- YYYY-MM-DD **公告标题** [PDF](url)
+
+## 六、商业模式 / 上下游 (--deep 才有)
+{基于年报"业务概要"章节 + 主要客户/供应商列表 + LLM 整合}
+
+## 七、风险提示 (--deep 才有)
+{年报"风险因素"章节摘要 + 当前公告中的风险关键词命中}
+
+## 八、同业对比 (--deep 才有)
+{同板块 5 家公司的 PE/PB/营收增速/净利润增速对比}
+```
+
+## 3. Agent 行为约束
+
+### 输出语言
+- **默认中文输出**，公司名 / 人名 / 产品名保留英文（Tencent / NVIDIA / GPT-5 等）
+- **每条数据都要给来源链接**（巨潮公告 PDF / 披露易公告 / 雪球行情 / 财联社电报）
+
+### 🔴 核心约束：充分利用已配置的工具，所有结论必须有数据溯源
+
+本 skill 已配置了大量数据源（财联社、披露易公告、巨潮、雪球 K 线、年报 PDF 解析、SEC EDGAR 等）。
+**既然工具已经配好，就必须充分使用，不得用训练集里的记忆代替真实抓取。**
+
+**核心原则：每一个写进分析的事实，都必须能说出来源是哪条数据/哪个接口/哪个 PDF 第几页。**
+
+#### 违规场景（必须避免，均来自 2026-04-30 实战翻车记录）
+
+| 违规行为 | 具体案例 | 正确做法 |
+|---|---|---|
+| 凭记忆写产品发布时间 | 写"6-7 月 YU7 发布（最大催化剂）"，但年报已明确 YU7 已连续销售 7 个月 | **先读年报/公告 PDF**，再说产品时间线 |
+| 凭记忆写价格区间 | 写"HK$ 28（年内多次震荡的支撑位）"，实际 28 是今天才第一次跌破 | **先调 `price_history.thresholds`**，再说价位 |
+| 归因错误（事实方向反了）| 写"原油涨价→小米上游成本压力"，实际原油涨价对电动车是利好 | 先把因果链想清楚，有疑问的不写 |
+| 混淆两份文件 | 把"全年業績公告（3-24）"和"年度報告（4-28）"当同一件事 | 公告标题+日期都要核实 |
+| 未抓取就推断 | 在没有读年报的情况下写"业绩消化期是下跌原因" | 先用 `pdf_extract.py` 读原文，再分析 |
+
+#### 强制工作流：分析前必须做的动作
+
+在写任何归因 / 时间节点 / 产品线信息之前，**必须按优先级依次执行**：
+
+```
+1. fetch_announcements → 看最近公告标题 + 日期，确认事件时间线
+2. pdf_extract（业绩公告）→ 从原文抽取数字，不从脑子里"记"
+3. fetch_market_news → 确认今日宏观新闻，对每条因果逻辑给出新闻链接
+4. price_history（K 线） → 所有价位描述必须基于此，不基于感觉
+5. analyze_company → 整合上述，产出卡片
+```
+
+**如果没有运行上述工具就直接开始写分析 → 违规**。
+
+#### 数据溯源格式（每条关键结论后面必须标注来源）
+
+```
+✅ 正确：
+"YU7 已于 2025 年 7 月上市，截至 2026 年 2 月连续 7 个月中大型 SUV 销量第一
+（来源：全年業績公告 p.7，2026-03-24，URL: hkexnews...）"
+
+❌ 违规：
+"6-7 月 YU7 正式发布（市场预期）🔴 最大催化剂"
+↑ 没有来源、与公告原文矛盾、方向完全错误
+```
+
+#### "我不确定"优于"凭印象填空"
+
+- 如果某个信息（如下一款新车型的时间表）在已拿到的数据里找不到 → **明确说"当前没有公告确认"**，不要猜
+- 如果某个宏观数据（如原油价格）拿不到实时数字 → **先跑 `fetch_market_news` 找对应新闻**，或明确标注"无法核实，暂不引用"
+
+### 数据准确性硬约束
+
+1. **任何财务数字必须从抓取的原始 JSON / PDF 中取**，不要"凭印象"或"约等于"
+2. **如果某个数据源失败**（stderr 有 FAIL 提示），必须在汇总末尾的"数据覆盖说明"小节里告诉用户哪些维度缺失，**不要假装数据完整**
+3. **公告链接**必须用真实抓到的 PDF URL，不要用首页 URL 或 `...` 省略号代替
+4. **股价/财报时点**：必须明确写出"截至 YYYY-MM-DD HH:MM (CST)"，不要含糊"目前"
+5. **宏观数据（汇率/大宗商品价格）**：必须从 `fetch_market_news` 实际抓到的新闻里引用，并附上财联社/CNBC 等来源链接。没有实时数据不得引用。
+
+### ⚠️ 技术分析硬约束（K 线驱动，禁止凭印象）
+
+任何涉及"支撑位/压力位/破位/历史区间"的判断，**必须**：
+
+1. **必须先调用 `analyze_company.py`** 拿到 `price_history` 字段（包含 YTD 高低/52w 高低/历史最高最低/历年高低段/关键价位倒查/regime/breakout）
+2. **任何"X 港元/X 元"作为支撑位/压力位的描述，必须给出"上一次盘中触及该价位的日期"作为证据**——这个日期来自 `price_history.thresholds[].last_touched_below`，**不要自己脑补**
+3. **regime 字段决定语境**：
+   - `NEW_YTD_LOW / NEW_52W_LOW / NEW_ALL_TIME_LOW` → 必须用"破位下行 / 创新低"，**不能**说"在支撑位震荡"
+   - `NEW_YTD_HIGH / NEW_52W_HIGH / NEW_ALL_TIME_HIGH` → 必须用"突破/创新高"
+   - `NEAR_YTD_HIGH / NEAR_YTD_LOW` → 用"接近年内高/低位"
+4. **历年高低段必须列出原始数据**（取自 `price_history.yearly`），让读者自己验证
+5. **如果 K 线数据获取失败**（`price_history.error` 存在或为空），**必须明确告诉用户"无 K 线数据，无法做技术分析"**，禁止继续编写技术段落
+
+**反例**（4-30 已发生的真实翻车）：
+> 技术位：HK$ 28（年内多次震荡的支撑位）。
+
+**正例**：
+> 截至 2026-04-30，小米港股盘中触及 HK$ 28.80，**创 2026 年新低 + 52 周新低**（regime=NEW_YTD_LOW）。
+> 上一次盘中跌到 HK$ 28 是 **2024-12-02**（514 天前），意味着今天突破了过去 1 年半的运行区间，
+> 技术上属**破位下行**而非支撑位震荡。
+
+
+
+### 输出格式硬约束（参考 newsboat-news-hub）
+- 标题用 `# / ## / ###`
+- 列表用 `-` 或 `1.`
+- 财务表格用 Markdown 表格
+- 链接用 `[文字](url)` 完整格式
+- 末尾追加"数据覆盖说明"，列出脚本 stderr 的统计
+
+### 不要做的事
+1. **不要**使用付费源（Wind / iFinD）的"假装数据"——本 skill 完全免费源驱动
+2. **不要**把雪球关注度数字当作"机构看好"——这是散户情绪指标，要标明
+3. **不要**对未来股价做预测，可以引用券商研报观点但要注明来源和日期
+4. **不要**主动建议买卖——本 skill 是信息整合工具，不是投资建议
+5. **不要**在没有数据来源的情况下写出具体时间节点（如"X 月发布"）、具体价格（如"X 元是支撑位"）、宏观数据（如"原油 X 美元"）——必须先用工具确认，无来源就明说"暂无数据"
+6. **不要**在已有 PDF / 公告可以查的情况下凭记忆写公司的产品线、发布时间、财务数字——凡公告/年报/财报能查到的，必须查，不能估
+
+## 4. 限频与稳定性
+
+| 源 | 推荐 QPS | 备注 |
+|---|---|---|
+| 雪球 screener | 2/s（已在客户端做了节流） | 单 IP 每天 ~10000 次额度 |
+| 巨潮公告 | 0.5/s | 频率高会 429 |
+| 新浪行情 | 5/s（批量给 50 个代码一次） | |
+| 财联社电报 | 1/s | |
+| 同花顺 HTML | 0.3/s | 反爬较严，加 sleep |
+
+所有脚本都已在 `core/http.py` 实现指数退避重试，遇到瞬态错误自动恢复。
+若用户报告"数据缺失"，先看 stderr 的 FAIL 行；若是同花顺的 503/429，可以加 `--retry 3` 或重跑一次。
+
+## 5. 已知限制（v1.6）
+
+| 维度 | 状态 |
+|---|---|
+| K 线 / 历年高低 / 创新低创新高检测 | ✅ v1.5 已加 |
+| ST 误报修复 | ✅ v1.6 已修 |
+| A 股概念归属（用东财 emweb，35+ 板块） | ✅ v1.6 已修 |
+| 港股公司基本信息（30+ 字段） | ✅ v1.6 已修 |
+| 港股年报 PDF（CID 编码 OCR fallback） | ✅ v1.6 已加 |
+| 同业横向财务对比（PE/PB/ROE） | ✅ v1.6 已加 |
+| 事件时间轴（价格+公告+新闻） | ✅ v1.6 已加 |
+| 中概股 SEC EDGAR 集成 | ✅ v1.6 已加 |
+| 雪球登录 cookie 热门帖 | ✅ v1.6 已加（用户配 cookie 后启用） |
+| 增量缓存层 | ✅ v1.6 已加（行情 4h / 公告 1h / 财报 24h） |
+| CLI 统一入口 `smh` | ✅ v1.6 已加 |
+| 卖方研报观点 | ⏳ v2.5 |
+| 上下游图谱 LLM 抽取（替代纯正则） | ⏳ v2.5 |
+| 不做 K 线图（专业图表请用雪球/同花顺 App） | 设计选择 |
+
+## 6. 快速触发示例
+
+```
+用户："分析一下宁德时代 300750"
+→ Agent 调用 analyze_company.py --symbol SZ300750，按 §2.C 模板输出
+
+用户："今天 A 股有什么异动"
+→ Agent 调用 xueqiu_market.py --board all --top 5 + fetch_market_news.py --limit 30，按 §2.A 模板输出
+
+用户："看下半导体板块的龙头"
+→ Agent 调用 scan_sector.py --sector "半导体" --top 10，按 §2.B 模板输出
+
+用户："腾讯最近发了什么公告"
+→ Agent 调用 fetch_announcements.py --symbol HK00700 --days 30，按时间倒序列出公告 + PDF 链接
+```

@@ -54,17 +54,16 @@ proxy-type socks5
 | 文件 | 适用场景 | 源数量 |
 |------|---------|--------|
 | [urls-china](urls-china) | **中国大陆直连**（无需代理） | 28 源 |
-| [urls-full](urls-full) | **有代理** 或海外网络 | 33 源 |
+| [urls-full](urls-full) | **有代理** 或海外网络 | 36 源 |
 
 ### 中国大陆可直连的域名（2026.4 实测）
 
 ```
-✓ apnews.com          ✓ news.google.com     ✓ feeds.npr.org
-✓ abcnews.go.com      ✓ cbsnews.com         ✓ rss.politico.com
-✓ thehill.com          ✓ feeds.foxnews.com   ✓ cnbc.com
-✓ feeds.content.dowjones.io (MarketWatch)
-✓ feeds.arstechnica.com ✓ theverge.com
-✓ feeds.skynews.com    ✓ france24.com
+✓ apnews.com          ✓ feeds.npr.org        ✓ abcnews.go.com
+✓ cbsnews.com         ✓ rss.politico.com     ✓ thehill.com
+✓ feeds.foxnews.com   ✓ cnbc.com             ✓ feeds.content.dowjones.io (MarketWatch)
+✓ feeds.arstechnica.com ✓ theverge.com        ✓ feeds.skynews.com
+✓ france24.com
 ```
 
 ### 中国大陆不可达的域名（被墙）
@@ -75,6 +74,7 @@ proxy-type socks5
 ✗ feeds.bloomberg.com  ✗ theguardian.com
 ✗ reutersagency.com (已下线 RSS)
 ✗ rsshub.app           ✗ feedx.net
+✗ news.google.com（token URL 无法直连访问）
 ```
 
 ### 新增/排查源的流程
@@ -130,38 +130,148 @@ newsboat --tui        # 如果版本支持 TUI
 
 ## 5. 生成每日新闻汇总
 
-当用户要求生成新闻汇总时，执行 [scripts/fetch_news.py](scripts/fetch_news.py)：
+当用户要求生成新闻汇总时，执行 [scripts/fetch_news.py](scripts/fetch_news.py)。
+
+### 命令选择（按用户意图）
 
 ```bash
-python3 SKILL_DIR/scripts/fetch_news.py
+# 用户说"今天的新闻"、"最近一天的新闻"
+python3 SKILL_DIR/scripts/fetch_news.py --tz ET
+
+# 用户说"4月20日的新闻" / "昨天的新闻" / 某个具体日期
+# ★ 必须使用 --date 严格过滤，不要用默认 24h 窗口 "估计"
+python3 SKILL_DIR/scripts/fetch_news.py --date 2026-04-20 --tz ET
+
+# 多日区间
+python3 SKILL_DIR/scripts/fetch_news.py --since 2026-04-18 --until 2026-04-21 --tz ET
+
+# 时区按用户语境选：美东新闻 → ET（默认）；国内新闻 → CN（= Asia/Shanghai）
+python3 SKILL_DIR/scripts/fetch_news.py --date 2026-04-20 --tz CN
+
+# 遇到 AP / Fox 等源返回 429 / 403 / 5xx 时自动指数退避重试（推荐日常加上）
+python3 SKILL_DIR/scripts/fetch_news.py --date 2026-04-20 --tz ET --retry-failed 3
 ```
 
-脚本会：
-1. 并行抓取所有 urls 文件中的 RSS 源
-2. 解析标题、来源、链接
-3. 按主题自动分类（伊朗/中东、美国政治、中国、科技/AI 等 18 个类别）
-4. 去重后输出 JSON 到 stdout
+### 失败重试（`--retry-failed`）
+
+- `--retry-failed N`：对**可重试错误**（HTTP 429 / 403 / 408 / 425 / 5xx、timeout、URLError）最多重试 N 次。默认 0（不重试，向后兼容）。
+- 退避策略：指数退避 `base * 2^attempt + jitter`，如果服务器在 429 响应中带 `Retry-After`，则尊重该头（上限 60s）。
+- **不会重试的错误**：XML 解析失败（源本身返回坏 XML）、HTTP 401 / 404 —— 这类错误重试也没用，脚本会直接标 FAIL。
+- 启用重试后，并发数自动从 16 降到 8，避免对同一个正在退避的域名继续施压。
+- **推荐默认加 `--retry-failed 3`**，尤其是用户明确希望"尽量补齐来源"时。AP 美联社 429 是常态，Fox News 偶尔 403，一次重试通常能救回来。
+- 代价：启用后单次运行可能从 ~5s 延长到 60s+（取决于服务器的 `Retry-After`），用户时间紧迫时可以不加。
+
+### 日期过滤硬约束
+
+- **只要用户说出具体日期**（含"昨天"/"今天 ET"/"周一"等可换算的说法），**必须加 `--date YYYY-MM-DD`**，不得省略。
+- 过滤窗口：`[--date 00:00, 次日 00:00)`，时区由 `--tz` 决定（默认 `America/New_York`）。
+- 用户没明示时区但在讨论美国新闻 → `--tz ET`；讨论国内新闻 → `--tz CN`；讨论欧洲新闻 → 按具体国家（`Europe/London` / `Europe/Paris` 等）。
+- stderr 会打印 `in_window=N  before=X  after=Y` 统计，**必须在汇总末尾的"抓取说明"里把这几个数字告诉用户**，用于交代数据覆盖情况。
+- **RSS 的天然限制**：绝大多数源只保留最近 24–48 小时内容，请求超过 2 天之前的日期会返回几乎空的结果。遇到这种情况要主动告诉用户原因，而不是硬凑。
+
+脚本行为：
+1. 并行抓取所有 urls 文件中的 RSS 源（每源最多 60 条，启用日期过滤时）
+2. 解析标题、来源、链接、`pubDate`
+3. **按 `--date` / `--since`/`--until` + `--tz` 严格过滤**（不在窗口的直接丢弃，除非显式 `--allow-no-date`）
+4. 按主题自动分类（18 个类别）、去重
+5. 输出 JSON 到 stdout，每条含 `title / source / link / pubDate`
+
+### 输出格式硬约束
 
 拿到 JSON 后，按以下模板组织汇总：
 
 ```
-# YYYY年M月D日（周X）全球新闻汇总
+# YYYY年M月D日（周X，[时区]）全球新闻汇总
 
 ## 一、[最重要主题]
-- **标题摘要**。 — [来源](链接)
-
-## 二、[第二重要主题]
-...
+- `HH:MM` **中文摘要一句话**。 — [来源名](it["link"])
 ```
 
-要求：
-- 每个主题下最多 5-8 条，按重要性排序
-- 每条必须带 `— [来源名](原文链接)` 引用
-- Google News 的标题通常包含 ` - 来源名`，提取真实来源展示
-- 多家媒体报道同一事件时合并为一条，列出多个来源
-- 用中文撰写摘要，保留人名/机构名英文原文
+**语言要求（默认中文）**：
+- **默认整份汇总用中文输出**，除非用户明确要求英文。
+- **每条的中文摘要必须由你翻译/改写生成**，不要直接粘贴 JSON 里的英文原标题。JSON 里的 `title` 只是素材，不是最终呈现。
+- 例外：**人名、机构名、产品名、地名**（Trump、NVIDIA、Anthropic、Gaza 等）保留英文原文，便于检索与交叉阅读。
+- 如果需要让读者看到原标题（比如长标题信息量大），可以在中文摘要后用括号附带 `（原文：...）`，不要替代中文摘要。
 
-## 6. 媒体立场参考
+其余要求：
+- 每个主题下最多 5–8 条，按重要性排序。
+- **每条必须使用 JSON 里的 `it["link"]` 字段的完整原始字符串作为 URL**。严禁以下三种偷懒做法：
+  1. 用媒体首页 URL（`https://www.nytimes.com/`）代替真实文章 URL
+  2. 链接留空或写 `(链接)` 占位
+  3. **在 URL 中使用 `...` / `[省略]` / `xxx` 等省略符号**。`news.google.com/rss/articles/CBMi...` 这样的写法是错的 —— Google News 的 token 是 90+ 字符的 base64，**少一个字符都会 404/400**。要么完整粘贴，要么不要贴。
+- 如果因为 URL 太长担心影响可读性，**不要**自作主张截断；可以把每条的链接放到行尾或者额外用脚注，但 token 必须完整。
+- Google News 的标题通常包含 ` - 来源名`，脚本已自动拆分，直接用 `it["source"]` 展示即可。
+- 多家媒体报道同一事件时合并为一条，把多个来源链接都列出来。
+- 条目开头可以附带 `\`HH:MM\`` 时间戳（取自 `pubDate` 的小时分钟）便于定位，时区同 `--tz`。
+- 汇总末尾追加"抓取说明"小节：列出 `--date`/`--tz` 实际参数、`in_window / before / after / no_date` 统计、失败的源（如 AP 美联社经常 429）。
+
+#### URL 书写反例（务必不要这样做）
+
+<bad>
+[New York Post via GN](https://news.google.com/rss/articles/CBMi...)
+</bad>
+
+<reasoning>
+省略号不是 URL 的一部分，点开必然 404/400。用户会直接看到问题。
+</reasoning>
+
+<good>
+[New York Post via Google News](https://news.google.com/rss/articles/CBMitgFBVV95cUxPVXVWbDYxS1k0VFRxWjhQNDdNT0Flbzgxd0VERk1kWm9xS3ROTXVQQXFmUEVSMndoTklFbDkxTXQ4Zm9pUDZYdjJPUmFHNHljZXlybmZObUNETmFJVDFkSUZ1b3BxYkVlQUlHNEF6UFpNZEJ3c3BGdGpYT1VGaFRaZnpTWDZNMzN4ZjlMSzFHbGVsRG1Nc1JmSnlLcVl4cU5BVDlXOEZOUk9ocnV3eVJSUG00YzEtUQ?oc=5)
+</good>
+
+### 正例 / 反例对照
+
+<good>
+- `17:42` **苹果 CEO Tim Cook 宣布卸任，硬件工程高级副总裁 John Ternus 接任**。执掌 15 年告一段落。 — [CBS News](https://www.cbsnews.com/news/tim-cook-apple-ceo-to-step-down-john-ternus/)
+</good>
+
+<bad>
+- Tim Cook to step down as Apple CEO, with John Ternus tapped as successor — [CBS News](https://www.cbsnews.com/...)
+</bad>
+
+<reasoning>反例直接粘贴了英文原标题，没有中文摘要。默认应该输出中文。</reasoning>
+
+## 6. 导出为 Word（.docx）—— 可选，仅在用户明确要求时使用
+
+**默认流程就是把汇总直接在对话里输出**，**不要**主动生成 .docx 文件。只有当用户明确说"导出 Word / 导成 docx / 存成文档 / 下载下来"等意图时，才执行这一步。
+
+### 用法
+
+先把第 5 节生成的汇总（含完整链接、中文摘要、抓取说明）写入一份 markdown 文件，然后转换：
+
+```bash
+# 1. 把汇总 markdown 落盘（例：当天日期 + 时区）
+cat > /tmp/news_2026-04-21_ET.md <<'MDEOF'
+# 2026 年 4 月 21 日（周二，美东时间）全球新闻汇总
+
+...（第 5 节生成的完整汇总正文）...
+MDEOF
+
+# 2. 转成 docx（默认存到工作区 exports/ 下）
+mkdir -p exports
+python3 SKILL_DIR/scripts/md_to_docx.py \
+  /tmp/news_2026-04-21_ET.md \
+  exports/news_2026-04-21_ET.docx
+```
+
+### 脚本行为
+
+- 依赖：`python-docx`（`pip install python-docx`，大多数 Python 环境已预装）
+- 输入：任何上述格式约束下生成的 markdown 文件
+- 输出：.docx 文件，包含：
+  - `# / ## / ###` 映射为 Word 的 Heading 1/2/3（可在导航面板里跳转）
+  - `[text](url)` 保留为**真正的 Word 超链接**（蓝色下划线、Ctrl/Cmd+点击跳转），URL 原样粘贴不截断
+  - `**bold**`、`` `code` ``（等宽字体）、`>` 引用块
+  - 中文字体：macOS 上 PingFang SC；Windows Word 会自动回退到默认东亚字体
+- 生成后**只向用户报告文件路径 + 大小**（如 `57 KB / 99 条链接`），**不要**把 docx 的内容再重复贴回聊天框
+
+### Agent 行为约束
+
+1. **不要预先生成 docx**：用户不提"导出"就别做。不要在对话里问"要不要导出 Word？"—— 除非聊天流程自然需要。
+2. **不要在聊天框里重复内容**：导出成功后一句话回报路径即可，用户自己打开。
+3. **如果 markdown 没落盘**：先让 md 内容落到 `/tmp/news_<日期>_<tz>.md`，再转 docx，不要试图直接把聊天框里的内容"截出来"。
+
+## 7. 媒体立场参考
 
 写汇总时注明来源的政治光谱位置，帮助读者交叉阅读：
 

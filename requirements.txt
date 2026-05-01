@@ -11,6 +11,10 @@
 # 用 Chromium 渲染 HTML 生成小红书风格新闻卡片
 playwright>=1.40.0
 
+# ---- newsboat-news-hub / md_to_docx.py ----
+# 可选：将新闻汇总 markdown 转为 Word 文档（仅在用户要求导出时需要）
+python-docx>=1.0.0
+
 # ---- divination ----
 # 仅使用 Python 3.8+ 标准库，无第三方依赖
 
