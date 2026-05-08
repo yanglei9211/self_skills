@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPTS="$SKILL_DIR/scripts"
+VPY="$SKILL_DIR/../.venv/bin/python3"
+
+if [ ! -x "$VPY" ]; then
+    REAL_DIR="$(readlink -f "$SCRIPT_DIR" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$SCRIPT_DIR")"
+    REAL_SKILL="$(cd "$REAL_DIR/.." && pwd)"
+    VPY="$REAL_SKILL/../.venv/bin/python3"
+    SCRIPTS="$REAL_SKILL/scripts"
+fi
+
+if [ ! -x "$VPY" ]; then
+    VPY="python3"
+fi
+
+exec "$VPY" "$SCRIPTS/main.py" "$@"

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Stock Market Hub"
+  short_description: "Scan A/H stocks, news, risk, and company analysis fast"
+  brand_color: "#1D4ED8"
+  default_prompt: "Use $stock-market-hub to analyze HK01810 with announcements, news, and price history."

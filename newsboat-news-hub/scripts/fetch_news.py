@@ -40,6 +40,7 @@ import os
 import random
 import time
 import argparse
+from html.parser import HTMLParser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -75,6 +76,10 @@ CATEGORY_ORDER = [c[0] for c in CATEGORY_RULES] + ["其他"]
 SOURCE_FALLBACK_CATEGORIES = {
     "tech": "科技/AI", "verge": "科技/AI", "ars": "科技/AI",
     "market": "经济/市场", "cnbc": "经济/市场",
+    "cgtn": "中国相关", "sixth tone": "中国相关",
+    "pandaily": "中国相关", "technode": "中国相关",
+    "scmp": "中国相关", "nikkei asia": "亚太",
+    "the diplomat": "亚太", "bbc - 亚洲": "亚太",
 }
 
 
@@ -138,6 +143,24 @@ def parse_pubdate(raw):
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt
     except (TypeError, ValueError):
+        pass
+
+    # Sixth Tone / custom formats
+    # "May 05, 2026"  (month name, day, year — no time, assume midnight UTC)
+    try:
+        dt = datetime.strptime(raw, "%B %d, %Y")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    # "2026 May 05   05:01:10 PDT" (year first, extra whitespace)
+    cleaned = re.sub(r"\s+", " ", raw)
+    try:
+        dt = datetime.strptime(cleaned, "%Y %b %d %H:%M:%S %Z")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
         pass
 
     # Try ISO 8601 (Atom <updated>). Handle trailing Z.
@@ -249,6 +272,142 @@ def _fetch_once(url, proxy, timeout=10):
         return resp.read()
 
 
+def _looks_like_html_page(data):
+    """Best-effort detection for HTML fallback sources like AP News hub pages."""
+    head = data[:512].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def _millis_to_iso(raw):
+    """Convert AP's millisecond timestamps to ISO 8601 in UTC."""
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return ""
+    return dt.isoformat()
+
+
+class APHubHTMLParser(HTMLParser):
+    """Extract article title/link/timestamp from AP hub HTML when RSS is unavailable."""
+
+    def __init__(self, limit=25):
+        super().__init__()
+        self.limit = limit
+        self.items = []
+        self._seen_links = set()
+        self._in_promo = False
+        self._promo_div_depth = 0
+        self._in_title = False
+        self._title_parts = []
+        self._current = None
+
+    @staticmethod
+    def _class_tokens(attrs):
+        raw = attrs.get("class", "")
+        return {part.strip() for part in raw.split() if part.strip()}
+
+    def _start_promo(self, attrs):
+        self._in_promo = True
+        self._promo_div_depth = 1
+        self._in_title = False
+        self._title_parts = []
+        self._current = {
+            "title": "",
+            "link": "",
+            "pubDate": _millis_to_iso(
+                attrs.get("data-updated-date-timestamp")
+                or attrs.get("data-posted-date-timestamp")
+            ),
+        }
+
+    def _finish_promo(self):
+        self._in_promo = False
+        self._promo_div_depth = 0
+        self._in_title = False
+        if not self._current:
+            return
+
+        title = " ".join("".join(self._title_parts).split())
+        link = (self._current.get("link") or "").strip()
+        pub = (self._current.get("pubDate") or "").strip()
+        if link.startswith("/"):
+            link = f"https://apnews.com{link}"
+
+        if (
+            title
+            and link
+            and "/article/" in link
+            and link not in self._seen_links
+            and len(self.items) < self.limit
+        ):
+            self._seen_links.add(link)
+            self.items.append({
+                "source": "",
+                "title": title,
+                "link": link,
+                "pubDate": pub,
+            })
+
+        self._current = None
+        self._title_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = self._class_tokens(attrs)
+
+        if not self._in_promo:
+            if tag == "div" and "PagePromo" in classes:
+                self._start_promo(attrs)
+            return
+
+        if tag == "div":
+            self._promo_div_depth += 1
+
+        if tag in {"h1", "h2", "h3", "h4"} and "PagePromo-title" in classes:
+            self._in_title = True
+
+        if tag == "a":
+            href = (attrs.get("href") or "").strip()
+            if href and not self._current["link"] and "/article/" in href:
+                self._current["link"] = href
+
+        if tag == "bsp-timestamp" and not self._current["pubDate"]:
+            self._current["pubDate"] = _millis_to_iso(attrs.get("data-timestamp"))
+
+    def handle_endtag(self, tag):
+        if not self._in_promo:
+            return
+
+        if self._in_title and tag in {"h1", "h2", "h3", "h4"}:
+            self._in_title = False
+
+        if tag == "div":
+            self._promo_div_depth -= 1
+            if self._promo_div_depth <= 0:
+                self._finish_promo()
+
+    def handle_data(self, data):
+        if self._in_promo and self._in_title and data.strip():
+            self._title_parts.append(data)
+
+
+def _parse_ap_html_fallback(data, name, limit=25):
+    """Parse AP hub HTML pages that no longer return RSS XML."""
+    try:
+        text = data.decode("utf-8", errors="replace")
+        parser = APHubHTMLParser(limit=limit)
+        parser.feed(text)
+        parser.close()
+        for item in parser.items:
+            item["source"] = name
+        return parser.items
+    except Exception as e:
+        print(f"FAIL {name}: AP HTML fallback error: {e}", file=sys.stderr)
+        return []
+
+
 def fetch_feed(name, url, proxy=None, limit=25, max_retries=0, base_backoff=2.0):
     """Fetch and parse a single RSS/Atom feed with optional retry on 429/403/timeouts.
 
@@ -290,6 +449,17 @@ def fetch_feed(name, url, proxy=None, limit=25, max_retries=0, base_backoff=2.0)
             attempt += 1
 
     if data is None:
+        return []
+
+    if "apnews.com" in url and _looks_like_html_page(data):
+        items = _parse_ap_html_fallback(data, name, limit)
+        if items:
+            tag = f"OK {name}: {len(items)} items (AP HTML fallback)"
+            if attempt > 0:
+                tag += f" (recovered after {attempt} retries)"
+            print(tag, file=sys.stderr)
+            return items
+        print(f"FAIL {name}: AP returned HTML page without parseable article cards", file=sys.stderr)
         return []
 
     items = []

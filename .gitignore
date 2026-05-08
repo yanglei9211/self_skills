@@ -40,6 +40,8 @@ secrets/
 credentials.json
 
 # ===== 项目产物 =====
+/output/
+
 # divination: 数据库由脚本自动生成，不纳入版本控制（如需共享可手动去掉这行）
 self_skills/divination/data/divination.db
 divination/data/*.db

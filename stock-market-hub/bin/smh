@@ -60,7 +60,7 @@ cmd="${1:-}"; shift || true
 
 case "$cmd" in
     company|c)
-        exec "$VPY" "$SCRIPTS/analyze_company.py" --symbol "$@"
+        exec "$VPY" "$SCRIPTS/company_api.py" --symbol "$@"
         ;;
     sector|s)
         exec "$VPY" "$SCRIPTS/scan_sector.py" "$@"

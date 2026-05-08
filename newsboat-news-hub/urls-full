@@ -60,3 +60,19 @@ https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml "~BBC - 美国与加�
 https://feeds.skynews.com/feeds/rss/us.xml "~Sky News - 美国" intl
 https://feeds.skynews.com/feeds/rss/world.xml "~Sky News - 国际" intl world
 https://www.france24.com/en/rss "~France 24 法国24" intl
+
+# ── 中国/亚太（直连）──────────────────────────
+# 注意：CGTN RSS 自 2026.4 中旬起疑似停更
+https://www.cgtn.com/subscribe/rss/section/china.xml "~CGTN - 中国" china
+https://www.cgtn.com/subscribe/rss/section/world.xml "~CGTN - 世界" china world
+https://www.cgtn.com/subscribe/rss/section/business.xml "~CGTN - 财经" china finance
+https://api.sixthtone.com/cont/output/rssApi "~Sixth Tone" china social
+https://pandaily.com/feed/ "~Pandaily 英文版" china tech
+https://technode.com/feed/ "~TechNode" china tech
+
+# ── 中国/亚太（需代理）───────────────────────
+https://www.scmp.com/rss/91/feed "~SCMP 南华早报" hk china
+https://www.scmp.com/rss/4/feed "~SCMP - 中国" hk china
+https://asia.nikkei.com/rss/feed/nar "~Nikkei Asia" japan asia
+https://thediplomat.com/feed/ "~The Diplomat" asia politics
+https://feeds.bbci.co.uk/news/world/asia/rss.xml "~BBC - 亚洲" intl asia

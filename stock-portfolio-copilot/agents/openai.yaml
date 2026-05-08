@@ -1,0 +1,5 @@
+interface:
+  display_name: "Stock Portfolio Copilot"
+  short_description: "Track holdings, trades, watchlists, and live stock decisions"
+  brand_color: "#0F766E"
+  default_prompt: "Use $stock-portfolio-copilot to sync my holdings, record trades, and tell me what to do now."
