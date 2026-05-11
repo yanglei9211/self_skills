@@ -197,7 +197,7 @@ def latest_snapshots(conn, market: str | None = None) -> list[dict]:
     params = []
     filter_sql = ""
     if market:
-        filter_sql = " WHERE market = ?"
+        filter_sql = " WHERE s.market = ?"
         params.append(normalize_market(market))
     rows = conn.execute(
         f"""
