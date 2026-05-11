@@ -42,10 +42,13 @@ credentials.json
 # ===== 项目产物 =====
 /output/
 
-# divination: 数据库由脚本自动生成，不纳入版本控制（如需共享可手动去掉这行）
-self_skills/divination/data/divination.db
-divination/data/*.db
-divination/data/*.db-journal
+# SQLite 数据库：各 skill 的本地数据库一律不入库
+# - divination/data/divination.db  脚本首次运行自动构建
+# - stock-portfolio-copilot/portfolio.db  本地持仓流水
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
 
 # newsboat-news-hub: 抓取结果、生成的卡片
 news_cn.json
