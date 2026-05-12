@@ -33,18 +33,16 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from core.http import fetch  # type: ignore
-from core.cache import cached  # type: ignore
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
-
-
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+from stock_core.cache import cached  # noqa: E402
+from stock_core.http import fetch  # noqa: E402
+from stock_core.tz import CN_TZ  # noqa: E402
 
 
 # ============ 巨潮（A股） ============ #

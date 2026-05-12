@@ -10,7 +10,7 @@
   - 失败的请求不缓存（return None / [] / {}）
 
 用法：
-    from core.cache import cached
+    from stock_core.cache import cached
 
     @cached(ttl=3600, key_prefix="quote")
     def get_quote(symbol: str) -> dict:
@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -57,17 +58,44 @@ def _path(key: str) -> Path:
     return CACHE_DIR / f"{key}.json"
 
 
+def _call_dynamic_ttl(ttl_func: Callable[..., float], args: tuple, kwargs: dict, cached_data: Any | None) -> float:
+    """调用动态 TTL 函数。
+
+    兼容两类签名：
+      - ``ttl(*args, **kwargs)``
+      - ``ttl(*args, **kwargs, cached_data=...)``
+    """
+    try:
+        sig = inspect.signature(ttl_func)
+        params = sig.parameters.values()
+        accepts_cached_data = (
+            "cached_data" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        )
+        if accepts_cached_data:
+            return float(ttl_func(*args, **kwargs, cached_data=cached_data))
+        return float(ttl_func(*args, **kwargs))
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[cache] dynamic ttl callable failed for {getattr(ttl_func, '__name__', ttl_func)}: {e}",
+            file=sys.stderr,
+        )
+        return 0.0
+
+
 def cached(
-    ttl: float = 3600,
+    ttl: float | Callable[..., float] = 3600,
     key_prefix: str = "",
     skip_if: Callable[[Any], bool] | None = None,
 ):
     """缓存装饰器。
 
     参数：
-        ttl: 过期秒数，0 = 永久缓存
-        key_prefix: 缓存 key 前缀（便于按业务清理）
-        skip_if: 函数 (result) -> bool；为 True 时不写缓存（如返回空 list 时不缓存）
+        ttl: 过期秒数；0 = 永久缓存。
+             也可以传入 callable ``(*args, **kwargs) -> float``，根据**调用参数**
+             动态计算 TTL。典型用途：盘中 60s / 盘后 4h（按 market 区分）。
+        key_prefix: 缓存 key 前缀（便于按业务清理）。
+        skip_if: 函数 (result) -> bool；为 True 时不写缓存（如返回空 list 时不缓存）。
 
     默认 skip_if：返回 None / [] / {} / "" 时不写缓存。
     """
@@ -88,9 +116,14 @@ def cached(
                 try:
                     payload = json.loads(p.read_text(encoding="utf-8"))
                     cached_at = payload.get("_cached_at", 0)
+                    cached_data = payload.get("data")
+                    if callable(ttl):
+                        effective_ttl = _call_dynamic_ttl(ttl, args, kwargs, cached_data)
+                    else:
+                        effective_ttl = float(ttl)
                     age = time.time() - cached_at
-                    if ttl == 0 or age < ttl:
-                        return payload.get("data")
+                    if effective_ttl == 0 or age < effective_ttl:
+                        return cached_data
                 except Exception:
                     pass  # 损坏的缓存忽略
 

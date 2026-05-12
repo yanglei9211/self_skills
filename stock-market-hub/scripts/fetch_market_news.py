@@ -31,17 +31,15 @@ import json
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-from core.http import fetch_json, fetch_text  # type: ignore
-
-
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+from stock_core.http import fetch_json, fetch_text  # noqa: E402
+from stock_core.tz import CN_TZ  # noqa: E402
 
 
 # ---------- 各源抓取函数 ---------- #
@@ -200,7 +198,7 @@ def fetch_xueqiu_hot(limit: int = 30) -> list[dict]:
       - 有 cookie：调 XueqiuClient.hot_topics
       - 无 cookie：返回空 + stderr 提示
     """
-    from core.xueqiu import XueqiuClient  # type: ignore
+    from stock_core.xueqiu import XueqiuClient
     cli = XueqiuClient()
     if not cli.is_logged_in:
         print(

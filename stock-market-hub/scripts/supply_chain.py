@@ -24,18 +24,16 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
 
-from core.http import fetch  # type: ignore
-from core.xueqiu import XueqiuClient  # type: ignore
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
-
-
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+from stock_core.http import fetch  # noqa: E402
+from stock_core.tz import CN_TZ  # noqa: E402
+from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
 
 # ============ 找最新年报 ============ #
@@ -155,7 +153,7 @@ def _get_board_constituents_em(board_code: str, top: int = 30) -> list[str]:
         "fs": f"b:{board_code}",
     }
     try:
-        from core.http import fetch as _fetch  # type: ignore
+        from stock_core.http import fetch as _fetch
         r = _fetch(url, params=params, timeout=10, retries=1)
         data = r.json()
     except Exception as e:  # noqa: BLE001
@@ -188,7 +186,7 @@ def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
     else:
         em_code = f"SZ{code}"
     try:
-        from core.http import fetch as _fetch  # type: ignore
+        from stock_core.http import fetch as _fetch
         r = _fetch(
             f"https://emweb.securities.eastmoney.com/PC_HSF10/CoreConception/PageAjax?code={em_code}",
             timeout=10, retries=1,

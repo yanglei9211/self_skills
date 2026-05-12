@@ -26,6 +26,9 @@
 #   smh pdf URL                        PDF 关键章节抽取
 #   smh supply SZ300750                上下游图谱
 #
+#   smh flow SZ300750                  主力资金流（A 股 + 港股；北交所/美股不支持）
+#   smh flow HK01810 --format json
+#
 #   smh cache stats                    缓存统计
 #   smh cache clear --prefix kline    清理缓存
 #
@@ -39,6 +42,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPTS="$SKILL_DIR/scripts"
+SHARED="$SKILL_DIR/../shared"
 VPY="$SKILL_DIR/../.venv/bin/python3"
 
 # 如果 venv 不在父目录（比如直接调用 ~/.cursor/skills/stock-market-hub/bin/smh），
@@ -48,6 +52,7 @@ if [ ! -x "$VPY" ]; then
     REAL_SKILL="$(cd "$REAL_DIR/.." && pwd)"
     VPY="$REAL_SKILL/../.venv/bin/python3"
     SCRIPTS="$REAL_SKILL/scripts"
+    SHARED="$REAL_SKILL/../shared"
 fi
 
 if [ ! -x "$VPY" ]; then
@@ -55,6 +60,10 @@ if [ ! -x "$VPY" ]; then
     echo "请确认 self_skills/.venv 已建立" >&2
     exit 1
 fi
+
+# 让 hub scripts 直接 `from stock_core.xxx import` 时无需自己注入路径；
+# 即便被调脚本是早期版本不带自身 bootstrap 也能跑。
+export PYTHONPATH="$SHARED:$SCRIPTS:${PYTHONPATH:-}"
 
 cmd="${1:-}"; shift || true
 
@@ -107,8 +116,17 @@ case "$cmd" in
             exec "$VPY" "$SCRIPTS/supply_chain.py" "$@"
         fi
         ;;
+    flow|ff)
+        # 第一个位置参数若非 -- 开头，视为 --symbol
+        if [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            sym="$1"; shift
+            exec "$VPY" -m stock_core.fund_flow --symbol "$sym" "$@"
+        else
+            exec "$VPY" -m stock_core.fund_flow "$@"
+        fi
+        ;;
     cache)
-        exec "$VPY" "$SCRIPTS/core/cache.py" "$@"
+        exec "$VPY" -m stock_core.cache "$@"
         ;;
     help|--help|-h|"")
         sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//'

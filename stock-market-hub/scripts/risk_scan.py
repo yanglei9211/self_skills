@@ -35,17 +35,15 @@ import argparse
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
 
-from core.xueqiu import XueqiuClient  # type: ignore
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
-
-
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+from stock_core.tz import CN_TZ  # noqa: E402
+from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
 
 # ============ 各规则实现 ============ #

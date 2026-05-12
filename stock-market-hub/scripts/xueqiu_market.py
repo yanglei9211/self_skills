@@ -28,26 +28,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
 
-from core.xueqiu import XueqiuClient  # type: ignore
+# 让本脚本无论是通过 bin/smh 还是直接 `python3 scripts/xueqiu_market.py` 执行，
+# 都能 import 到 ``shared/stock_core``。
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
+from stock_core.market_snapshot import BOARDS, enrich, fmt_amount  # noqa: E402,F401
+from stock_core.tz import CN_TZ  # noqa: E402
+from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
-
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
-
-BOARDS = {
-    "gainers": ("涨幅榜", "percent", "desc", "{percent:+.2f}%"),
-    "losers": ("跌幅榜", "percent", "asc", "{percent:+.2f}%"),
-    "amount": ("成交额榜", "amount", "desc", "{amount_yi:.1f}亿"),
-    "turnover": ("换手率榜", "turnover_rate", "desc", "{turnover_rate:.1f}%"),
-    "main_inflow": ("主力净流入榜", "main_net_inflows", "desc", "{main_yi:+.2f}亿"),
-    "followers": ("雪球关注度榜", "followers", "desc", "{followers}人关注"),
-}
 
 MARKET_LABEL = {
     "all_a": "全 A 股",
@@ -58,18 +51,6 @@ MARKET_LABEL = {
     "hk": "港股",
     "us": "美股",
 }
-
-
-def fmt_amount(v: float | None) -> float:
-    return (v or 0) / 1e8  # 元 → 亿
-
-
-def enrich(item: dict) -> dict:
-    """补 amount_yi / main_yi / market_cap_yi 等便利字段。"""
-    item["amount_yi"] = fmt_amount(item.get("amount"))
-    item["main_yi"] = fmt_amount(item.get("main_net_inflows"))
-    item["market_cap_yi"] = fmt_amount(item.get("market_capital"))
-    return item
 
 
 def render_table(title: str, items: list[dict], value_fmt: str) -> str:

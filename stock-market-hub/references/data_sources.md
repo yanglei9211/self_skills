@@ -19,6 +19,7 @@
 | **新浪财经** | `hq.sinajs.cn`        | `GET /list=sh600519,sz000001,hk00700,gb_baba` | A股+港股+美股一把抓，**首选**。返回 JS 字符串 `var hq_str_xxx="..."`，逗号分隔字段 |
 | **腾讯财经** | `qt.gtimg.cn`         | `GET /q=sh600519,sz000001,hk00700,usBABA`     | 备份。返回 GBK 编码 `v_xxx="...";`                                |
 | ❌ 东方财富   | `push2.eastmoney.com` | `/api/qt/clist/get`                           | **不可用**：服务端立即断开（IP 段被反爬封禁）。所有 akshare 中走 push2 的接口都受影响     |
+| ✅ 东方财富资金流 | `push2his.eastmoney.com` | `/api/qt/stock/fflow/daykline/get` | **可用**（与上面被封的 push2 是不同 host）。`secid={1\|0\|116}.{code}`，返回逗号分隔的 ~120 个交易日逐日资金流。详见下方"主力资金流"小节 |
 
 
 #### 新浪行情字段（A股，从 0 索引）
@@ -111,6 +112,60 @@ neeq = 新三板
 | 公司基本信息   | `https://money.finance.sina.com.cn/corp/go.php/vCI_CorpInfo/stockid/<code>.phtml`    | 新浪 HTML                |
 | 概念归属     | 同花顺 `https://basic.10jqka.com.cn/<code>/concept.html`                                | 新浪也有但不全                |
 | 港股公司资料   | `https://stock.finance.sina.com.cn/hkstock/finance/<code>.html`                      | 港股需 5 位补零代码（如 `00700`） |
+
+
+### 6.5 主力资金流（个股）✅
+
+封装在 `shared/stock_core/fund_flow.py` 的 `fetch_daily_fund_flow(market, code)`。
+
+**接口**：
+
+```
+GET https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get
+    ?secid={market_id}.{code}
+    &lmt=0
+    &klt=101
+    &fields1=f1,f2,f3,f7
+    &fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63
+    &ut=b2884a393a59ad64002292a3e90d46a5
+```
+
+| 项 | 说明 |
+|---|---|
+| 是否需登录 | 否，无 cookie 也能访问 |
+| 反爬状态 | ✅ 稳定（与被封的 `push2.eastmoney.com` 是不同 host，2026-05 实测可用） |
+| 返回 | 最近约 120 个交易日的逐日资金流（按日期升序） |
+| 单位 | 金额：元；占比：% |
+
+**`secid` 规则**：
+
+| 市场 | 规则 | 例 |
+|---|---|---|
+| 上交所 A 股（6 开头）| `1.<6 位代码>` | `1.600519` |
+| 深交所 A 股（0/3 开头）| `0.<6 位代码>` | `0.300750` |
+| 港股 | `116.<5 位补零代码>` | `116.00700` |
+| 北交所（4/8 开头）| **不支持**：fund_flow 调用方应自行跳过 | — |
+| 美股 | **不适用**："主力资金"非美股标准市场指标 | — |
+
+**返回字段**（`klines` 是逗号分隔字符串数组）：
+
+| 索引 | 字段 | 含义 |
+|---|---|---|
+| 0 | f51 | 日期 (YYYY-MM-DD) |
+| 1 | f52 | 主力净额（元）|
+| 2 | f53 | 小单净额（元）|
+| 3 | f54 | 中单净额（元）|
+| 4 | f55 | 大单净额（元）|
+| 5 | f56 | 超大单净额（元）|
+| 6 | f57 | 主力净占比（%）|
+| 7~10 | f58~f61 | 小/中/大/超大 净占比（%）|
+| 11 | f62 | 收盘价 |
+| 12 | f63 | 涨跌幅（%）|
+
+**使用约定**：
+- 缓存策略：盘中 60s / 盘后 4h（`is_market_open(market)` 判定，`A 股 09:30-11:30 + 13:00-15:00`，`港股 09:30-12:00 + 13:00-16:00`）
+- 港股资金分级是东财根据成交单笔大小推算，不如 A 股可靠，对外渲染时必须标注「仅供参考」
+- 与雪球 `screener.main_net_inflows` 互补：雪球给"全市场榜单 + 当日累计"，东财 fflow 给"单只 120 日逐日序列 + 五档细分"
 
 
 ### 7. 风险信号源

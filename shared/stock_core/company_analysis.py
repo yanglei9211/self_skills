@@ -36,11 +36,18 @@ import json
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 
-def _ensure_stock_market_hub_path() -> None:
+def _ensure_hub_scripts_path() -> None:
+    """让本模块能 ``from fetch_announcements import ...`` / ``from supply_chain import ...``。
+
+    这两个脚本仍住在 ``stock-market-hub/scripts/`` 下，shared 层暂未把它们抽过来；
+    所以共享层调用业务脚本时，需要把 hub scripts 路径加进 ``sys.path``。
+    底层基础设施（http/xueqiu/cache/kline/sec_edgar）已经搬到 ``shared/stock_core/``，
+    所以这里**只**为 import hub 业务脚本服务。
+    """
     current = Path(__file__).resolve()
     repo_root = current.parents[2]
     hub_scripts = repo_root / "stock-market-hub" / "scripts"
@@ -48,63 +55,19 @@ def _ensure_stock_market_hub_path() -> None:
         sys.path.insert(0, str(hub_scripts))
 
 
-_ensure_stock_market_hub_path()
+_ensure_hub_scripts_path()
 
-from core.http import fetch  # type: ignore
-from core.xueqiu import XueqiuClient  # type: ignore
-from core.kline import fetch_daily_kline, summarize_price_history  # type: ignore
-from core.cache import cached  # type: ignore
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
+from stock_core.cache import cached
+from stock_core.fund_flow import get_fund_flow_summary
+from stock_core.http import fetch
+from stock_core.kline import fetch_daily_kline, summarize_price_history
+from stock_core.symbols import normalize_symbol  # re-exported below for backward compat
+from stock_core.tz import CN_TZ
+from stock_core.xueqiu import XueqiuClient
 
 
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+__all__ = ["analyze", "render_text", "main", "normalize_symbol"]
 
-
-# ============ 标准化 symbol ============ #
-
-def normalize_symbol(symbol: str) -> tuple[str, str, str]:
-    """
-    返回 (market, code, xueqiu_symbol)
-        market: 'a' / 'hk' / 'us'
-        code:   纯数字代码（A股、港股）或 ticker（美股）
-        xueqiu_symbol: 雪球 API 用的标识
-
-    例：
-        SZ300750 → ('a', '300750', 'SZ300750')
-        SH600519 → ('a', '600519', 'SH600519')
-        HK00700  → ('hk','00700', '00700')
-        BABA     → ('us','BABA',  'BABA')
-    """
-    s = symbol.upper().strip()
-    if s.startswith("SZ") and s[2:].isdigit():
-        return "a", s[2:], s
-    if s.startswith("SH") and s[2:].isdigit():
-        return "a", s[2:], s
-    if s.startswith("BJ") and s[2:].isdigit():
-        return "a", s[2:], s
-    if s.startswith("HK") and s[2:].isdigit():
-        code = s[2:].zfill(5)
-        return "hk", code, code
-    if s.isdigit():
-        # 6 开头 sh, 0/3 开头 sz, 4/8 开头 bj, 5 位 hk
-        if len(s) == 6:
-            if s.startswith("6"):
-                return "a", s, "SH" + s
-            if s.startswith(("0", "3")):
-                return "a", s, "SZ" + s
-            if s.startswith(("4", "8")):
-                return "a", s, "BJ" + s
-        if len(s) == 5:
-            return "hk", s, s
-        if len(s) <= 4:
-            return "hk", s.zfill(5), s.zfill(5)
-    if re.match(r"^[A-Z]{1,5}$", s):
-        return "us", s, s
-    raise ValueError(f"无法识别的代码：{symbol}")
 
 
 # ============ 行情 / 估值 ============ #
@@ -174,6 +137,13 @@ def _get_price_history(market: str, code: str, xq_sym: str, args) -> dict:
     if not kline:
         return {"error": "K 线获取失败"}
     return summarize_price_history(kline, current_price=kline[-1]["close"])
+
+
+# ============ 主力资金流 ============ #
+
+def _get_fund_flow(market: str, code: str) -> dict:
+    """薄包装：交给 :func:`stock_core.fund_flow.get_fund_flow_summary` 处理具体抓取与摘要。"""
+    return get_fund_flow_summary(market, code)
 
 
 # ============ A股 公司基本信息 / 高管 / 股东 ============ #
@@ -341,7 +311,7 @@ def get_hk_company_info(code: str) -> dict:
 def get_us_company_info(ticker: str) -> dict:
     """从 SEC EDGAR 拿美股公司基本信息。"""
     try:
-        from core.sec_edgar import ticker_to_cik, get_submissions  # type: ignore
+        from stock_core.sec_edgar import ticker_to_cik, get_submissions
     except ImportError:
         return {}
     cik = ticker_to_cik(ticker)
@@ -383,7 +353,7 @@ def get_us_company_info(ticker: str) -> dict:
 def get_us_filings(ticker: str, limit: int = 20) -> list[dict]:
     """SEC 最近 N 份 filings。"""
     try:
-        from core.sec_edgar import ticker_to_cik, get_recent_filings  # type: ignore
+        from stock_core.sec_edgar import ticker_to_cik, get_recent_filings
     except ImportError:
         return []
     cik = ticker_to_cik(ticker)
@@ -411,7 +381,7 @@ def get_us_filings(ticker: str, limit: int = 20) -> list[dict]:
 def get_us_financial_summary(ticker: str) -> dict:
     """SEC XBRL 拿历年财务指标摘要。"""
     try:
-        from core.sec_edgar import ticker_to_cik, get_company_summary  # type: ignore
+        from stock_core.sec_edgar import ticker_to_cik, get_company_summary
     except ImportError:
         return {}
     cik = ticker_to_cik(ticker)
@@ -570,6 +540,10 @@ def analyze(symbol: str, args: argparse.Namespace) -> dict:
         tasks["announcements"] = lambda: get_recent_announcements(market, code, xq_sym, args.ann_days, args.ann_limit)
     if "peers" not in skip and getattr(args, "with_peers", False) and market == "a":
         tasks["peers"] = lambda: _get_peers(xq_sym)
+    # fund_flow（主力资金流）：A 股沪深主板/创业板/科创板 + 港股；北交所、美股自动跳过
+    _ff_eligible = (market == "hk") or (market == "a" and not code.startswith(("4", "8")))
+    if "fund_flow" not in skip and _ff_eligible:
+        tasks["fund_flow"] = lambda: _get_fund_flow(market, code)
 
     with ThreadPoolExecutor(max_workers=min(6, len(tasks))) as ex:
         future_map = {ex.submit(fn): name for name, fn in tasks.items()}
@@ -703,9 +677,67 @@ def render_text(data: dict) -> str:
             lines.append(f"> 🚀 **重要提示**：今日已盘中**创出{level}**，处于强势突破阶段。")
         lines.append("")
 
+    # 主力资金动向（仅 A 股沪深 + 港股有数据；北交所 / 美股自动跳过本章节）
+    ff = data.get("fund_flow") or {}
+    if ff and not ff.get("error") and ff.get("today"):
+        today_ff = ff.get("today") or {}
+        rolling = ff.get("rolling") or {}
+        regime = ff.get("regime")
+        regime_label = {
+            "PERSISTENT_INFLOW": "🟢 持续净流入",
+            "PERSISTENT_OUTFLOW": "🔴 持续净流出",
+            "OSCILLATING": "⚪️ 震荡 / 进出反复",
+        }.get(regime, regime or "-")
+        reversal = ff.get("reversal")
+        reversal_label = {
+            "INFLOW_TO_OUTFLOW": "⚠️ 近 5 日由流入转为流出",
+            "OUTFLOW_TO_INFLOW": "🟡 近 5 日由流出转为流入",
+        }.get(reversal) if reversal else None
+
+        lines.append(f"## 三、主力资金动向（截至 {ff.get('as_of')}，东方财富 fflow）")
+        lines.append(f"- **regime**：{regime_label}")
+        if reversal_label:
+            lines.append(f"- **reversal**：{reversal_label}")
+        if market == "hk":
+            lines.append("- _港股资金分级为东财根据成交单笔大小推算，仅供参考。_")
+        lines.append("")
+        lines.append("### 累计窗口")
+        lines.append("| 周期 | 主力净额 | 净流入 / 流出天数 |")
+        lines.append("|---|---|---|")
+        for win in ("1d", "5d", "10d", "20d"):
+            w = rolling.get(win) or {}
+            amt = w.get("main_yi")
+            amt_str = "-" if amt is None else f"{amt:+.2f} 亿"
+            lines.append(
+                f"| {win} | {amt_str} | "
+                f"{w.get('inflow_days', 0)} / {w.get('outflow_days', 0)} (共 {w.get('days', 0)} 天) |"
+            )
+        lines.append("")
+        lines.append(
+            f"### 当日资金分层（收盘 {today_ff.get('close')}，"
+            f"涨跌 {today_ff.get('change_pct')}%）"
+        )
+        lines.append("| 档位 | 净额 | 占成交比例 |")
+        lines.append("|---|---|---|")
+        for label, amt_key, pct_key in (
+            ("超大单", "super_big_yi", "super_big_pct"),
+            ("大单", "big_yi", "big_pct"),
+            ("中单", "mid_yi", "mid_pct"),
+            ("小单", "small_yi", "small_pct"),
+            ("**主力合计**", "main_yi", "main_pct"),
+        ):
+            amt = today_ff.get(amt_key)
+            pct = today_ff.get(pct_key)
+            amt_str = "-" if amt is None else f"{amt:+.2f} 亿"
+            pct_str = "-" if pct is None else f"{pct:+.2f}%"
+            lines.append(f"| {label} | {amt_str} | {pct_str} |")
+        lines.append("")
+    elif ff and ff.get("error"):
+        lines.append(f"## 三、主力资金动向\n\n（暂无数据：{ff['error']}）\n")
+
     # 公司基本信息
     if isinstance(info, dict) and info:
-        lines.append("## 三、公司基本信息")  # noqa: 编号紧跟"二、历史价位"
+        lines.append("## 四、公司基本信息")
         # 关键字段优先
         priority = ["公司名称", "公司英文名称", "上市市场", "成立日期", "上市日期",
                     "发行价格", "公司网址", "董事长", "总经理", "董事会秘书",
@@ -724,14 +756,14 @@ def render_text(data: dict) -> str:
     # 概念归属
     concepts = data.get("concepts") or []
     if concepts:
-        lines.append("## 四、所属板块 / 概念题材（东方财富）")
+        lines.append("## 五、所属板块 / 概念题材（东方财富）")
         lines.append("`" + "` / `".join(concepts[:15]) + "`")
         lines.append("")
 
     # 高管
     mgrs = data.get("managers") or []
     if mgrs:
-        lines.append("## 五、核心高管")
+        lines.append("## 六、核心高管")
         lines.append("| 姓名 | 职务 | 起始日期 | 终止日期 |")
         lines.append("|---|---|---|---|")
         for m in mgrs:
@@ -741,7 +773,7 @@ def render_text(data: dict) -> str:
     # 主要股东
     shs = data.get("shareholders") or []
     if shs:
-        lines.append("## 六、主要股东")
+        lines.append("## 七、主要股东")
         lines.append("| 股东名称 | 持股数 | 比例 | 类型 |")
         lines.append("|---|---|---|---|")
         for s in shs:
@@ -777,7 +809,7 @@ def render_text(data: dict) -> str:
     # 同业横向对比
     peers = data.get("peers") or []
     if peers:
-        lines.append("## 七、同业横向对比（同概念公司）")
+        lines.append("## 八、同业横向对比（同概念公司）")
         lines.append("| 代码 | 名称 | 现价 | 涨跌 | 市值(亿) | PE-TTM | PB | ROE-TTM | 营收增速 | 净利增速 | 主力(亿) | YTD |")
         lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
         def _fmt(v, suffix=""):
@@ -807,7 +839,7 @@ def render_text(data: dict) -> str:
     # 公告
     anns = data.get("announcements") or []
     if anns:
-        lines.append(f"## 八、近 {data.get('ann_days', 30)} 天关键公告（{len(anns)} 条）")
+        lines.append(f"## 九、近 {data.get('ann_days', 30)} 天关键公告（{len(anns)} 条）")
         for a in anns[:20]:
             lines.append(f"- `{a.get('date')}` **{a.get('title')}** [PDF]({a.get('pdf_url')})")
         lines.append("")

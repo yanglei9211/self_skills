@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from typing import Iterable
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover
-    ZoneInfo = None
+# 让 spc_core 在被 main.py / tests 直接调用时也能 import 到 ``shared/stock_core``。
+_SHARED = Path(__file__).resolve().parents[3] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-
-LOCAL_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+from stock_core.symbols import parts_to_symbol  # noqa: E402
+from stock_core.tz import LOCAL_TZ  # noqa: E402
 QTY_PREC = Decimal("0.0001")
 PRICE_PREC = Decimal("0.0001")
 MONEY_PREC = Decimal("0.01")
@@ -145,13 +146,11 @@ def default_currency(market: str) -> str:
 
 
 def build_analysis_symbol(market: str, code: str) -> str:
-    if market == "hk":
-        return f"HK{code}"
-    if code.startswith("6"):
-        return f"SH{code}"
-    if code.startswith(("4", "8")):
-        return f"BJ{code}"
-    return f"SZ{code}"
+    """从 (market, code) 组装 hub 接受的 symbol，规则与 hub 的 normalize_symbol 反向对称。
+
+    具体规则统一维护在 ``shared.stock_core.symbols.parts_to_symbol``。
+    """
+    return parts_to_symbol(market, code)
 
 
 def format_percent(value: Decimal | None) -> str:

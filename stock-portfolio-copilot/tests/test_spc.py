@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -32,24 +33,36 @@ from spc_core.ledger import (  # noqa: E402
 from spc_core.portfolio import pnl_summary, sync_portfolio  # noqa: E402
 from spc_core.settings import capital_settings, set_capital  # noqa: E402
 from spc_core.market_bridge import StockMarketHubProvider  # noqa: E402
+from stock_core.fund_flow import _ttl_for_call, _ttl_for_moment  # noqa: E402
 from stock_core.stock_market_hub import analyze_symbol, render_analysis_text  # noqa: E402
+from stock_core.tz import CN_TZ  # noqa: E402
 
 
 class FakeProvider:
-    def __init__(self):
+    def __init__(self, fund_flow_overrides: dict | None = None):
         self.quote_map = {
             ("a", "300750"): {"current": "260.00", "fetched_at": "2026-05-08T14:31:00+08:00"},
+            ("a", "300308"): {"current": "935.00", "fetched_at": "2026-05-08T14:31:00+08:00"},
             ("hk", "01810"): {"current": "19.24", "fetched_at": "2026-05-08T14:31:00+08:00"},
             ("hk", "00700"): {"current": "410.20", "fetched_at": "2026-05-08T14:31:00+08:00"},
         }
+        # 通过这个字典可以为某只标的注入 fund_flow 摘要；
+        # 默认不注入，相当于 analyze_company 拿不到主力资金流（North Stock / 美股 / 接口失败的情形）
+        self.fund_flow_overrides = fund_flow_overrides or {}
 
     def fetch_quote(self, market, code):
         return self.quote_map.get((market, code), {"current": "10.00", "fetched_at": "2026-05-08T14:31:00+08:00"})
 
+    def _attach_fund_flow(self, market: str, code: str, payload: dict) -> dict:
+        ff = self.fund_flow_overrides.get((market, code))
+        if ff is not None:
+            payload["fund_flow"] = ff
+        return payload
+
     def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
         quote = self.fetch_quote(market, code)
         if (market, code) == ("a", "300750"):
-            return {
+            return self._attach_fund_flow(market, code, {
                 "fetched_at": quote["fetched_at"],
                 "quote": {"current": quote["current"], "percent": 1.23},
                 "price_history": {"regime": "IN_RANGE"},
@@ -60,9 +73,9 @@ class FakeProvider:
                 "announcements": [
                     {"date": "2026-05-01", "title": "签订合作协议", "pdf_url": "https://example.com/a1.pdf"},
                 ],
-            }
+            })
         if (market, code) == ("hk", "01810"):
-            return {
+            return self._attach_fund_flow(market, code, {
                 "fetched_at": quote["fetched_at"],
                 "quote": {"current": quote["current"], "percent": -3.5},
                 "price_history": {"regime": "NEW_YTD_LOW"},
@@ -70,8 +83,19 @@ class FakeProvider:
                     {"date": "2026-05-02", "title": "收到监管问询函", "pdf_url": "https://example.com/h1.pdf"},
                     {"date": "2026-05-03", "title": "主要股东减持公告", "pdf_url": "https://example.com/h2.pdf"},
                 ],
-            }
-        return {
+            })
+        if (market, code) == ("a", "300308"):
+            return self._attach_fund_flow(market, code, {
+                "fetched_at": quote["fetched_at"],
+                "quote": {"current": quote["current"], "percent": 3.2},
+                "price_history": {"regime": "NEW_ALL_TIME_HIGH"},
+                "concepts": ["通信", "光模块"],
+                "peers": [],
+                "announcements": [
+                    {"date": "2026-05-03", "title": "新品合作公告", "pdf_url": "https://example.com/b1.pdf"},
+                ],
+            })
+        return self._attach_fund_flow(market, code, {
             "fetched_at": quote["fetched_at"],
             "quote": {"current": quote["current"], "percent": 0.8},
             "price_history": {"regime": "IN_RANGE"},
@@ -80,7 +104,7 @@ class FakeProvider:
             "announcements": [
                 {"date": "2026-05-03", "title": "回购股份公告", "pdf_url": "https://example.com/w1.pdf"},
             ],
-        }
+        })
 
     def market_board(self, market="all_a", board="gainers", top=10):
         if market == "all_a" and board == "gainers":
@@ -92,6 +116,32 @@ class FakeProvider:
         else:
             items = []
         return {"market": market, "board": board, "items": items}
+
+
+def _ff(regime: str, *, reversal: str | None = None, m3: float = 0.0, m5: float = 0.0, m20: float = 0.0,
+        main_today_yi: float = 0.0, super_big_yi: float = 0.0, big_yi: float = 0.0) -> dict:
+    """构造 fund_flow 摘要的小工具（仅含 decision.py 实际用到的字段）。"""
+    return {
+        "as_of": "2026-05-08",
+        "today": {
+            "main_yi": main_today_yi,
+            "super_big_yi": super_big_yi,
+            "big_yi": big_yi,
+            "mid_yi": 0.0, "small_yi": 0.0,
+            "main_pct": 0.0, "super_big_pct": 0.0, "big_pct": 0.0,
+            "mid_pct": 0.0, "small_pct": 0.0,
+            "close": 100.0, "change_pct": 0.0,
+        },
+        "rolling": {
+            "1d": {"main_yi": main_today_yi, "inflow_days": 0, "outflow_days": 0, "days": 1},
+            "3d": {"main_yi": m3, "inflow_days": 0, "outflow_days": 0, "days": 3},
+            "5d": {"main_yi": m5, "inflow_days": 0, "outflow_days": 0, "days": 5},
+            "10d": {"main_yi": m5, "inflow_days": 0, "outflow_days": 0, "days": 10},
+            "20d": {"main_yi": m20, "inflow_days": 0, "outflow_days": 0, "days": 20},
+        },
+        "regime": regime,
+        "reversal": reversal,
+    }
 
 
 class FakeFXProvider:
@@ -187,7 +237,7 @@ class SPCTestCase(unittest.TestCase):
         actions = {(item["market"], item["code"]): item["decision"]["action"] for item in payload["results"]}
         self.assertEqual(actions[("a", "300750")], "trim")
         self.assertEqual(actions[("hk", "01810")], "trim")
-        self.assertEqual(actions[("hk", "00700")], "buy")
+        self.assertEqual(actions[("hk", "00700")], "focus")
         opp_codes = {(item["market"], item["code"]) for item in payload["opportunities"]}
         self.assertIn(("a", "300308"), opp_codes)
         self.assertIn(("a", "300762"), opp_codes)
@@ -197,12 +247,100 @@ class SPCTestCase(unittest.TestCase):
         self.assertEqual(capital_settings(self.conn)["total_cny"], "500000")
         self.assertEqual(len(list_watch(self.conn)), 1)
 
+    def test_strict_buy_requires_strong_setup(self):
+        add_watch(self.conn, "a", "300308", "")
+
+        payload = analyze_now(self.conn, "watchlist", analysis_provider=self.provider)
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "buy")
+        self.assertEqual(decision["action_label"], "买入候选")
+        self.assertTrue(any("强趋势" in reason for reason in decision["reasoning"]))
+
+    def test_fund_flow_blocks_buy_on_recent_outflow(self):
+        """自选 + 强趋势 + 正向公告，但近 5 日主力反向流出 → buy 候选被否，回退到 focus。"""
+        add_watch(self.conn, "a", "300308", "")
+        provider = FakeProvider(fund_flow_overrides={
+            ("a", "300308"): _ff(
+                regime="PERSISTENT_INFLOW", reversal="INFLOW_TO_OUTFLOW",
+                m3=-1.5, m5=-3.0, m20=15.0, main_today_yi=-1.2,
+            ),
+        })
+
+        payload = analyze_now(self.conn, "watchlist", analysis_provider=provider)
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "focus")
+        self.assertTrue(
+            any("近 5 日主力资金由流入转为流出" in r for r in decision["risks"]),
+            f"reasoning={decision['reasoning']}, risks={decision['risks']}",
+        )
+        self.assertTrue(
+            any("fund_flow.regime=PERSISTENT_INFLOW" in s for s in decision["sources"]),
+            f"sources={decision['sources']}",
+        )
+
+    def test_fund_flow_persistent_outflow_forces_avoid(self):
+        """自选 + 强趋势 + 正向公告，但主力 20 日持续净流出 → 直接 avoid，不能 buy/focus。"""
+        add_watch(self.conn, "a", "300308", "")
+        provider = FakeProvider(fund_flow_overrides={
+            ("a", "300308"): _ff(
+                regime="PERSISTENT_OUTFLOW",
+                m3=-4.0, m5=-8.0, m20=-22.0, main_today_yi=-2.5, super_big_yi=-1.8, big_yi=-0.7,
+            ),
+        })
+
+        payload = analyze_now(self.conn, "watchlist", analysis_provider=provider)
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "avoid")
+        self.assertTrue(
+            any("主力 20 日持续净流出" in r for r in decision["risks"]),
+            f"risks={decision['risks']}",
+        )
+
+    def test_fund_flow_background_weak_but_3d_5d_repair_keeps_focus_not_avoid(self):
+        """20 日背景偏弱，但近 3/5 日修复时，不应直接按 avoid 处理。"""
+        add_watch(self.conn, "a", "300308", "")
+        provider = FakeProvider(fund_flow_overrides={
+            ("a", "300308"): _ff(
+                regime="PERSISTENT_OUTFLOW",
+                reversal="OUTFLOW_TO_INFLOW",
+                m3=2.0, m5=6.0, m20=-18.0, main_today_yi=1.1,
+            ),
+        })
+
+        payload = analyze_now(self.conn, "watchlist", analysis_provider=provider)
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "focus")
+        self.assertTrue(
+            any("近 5 日主力资金由流出转为流入" in r for r in decision["reasoning"]),
+            f"reasoning={decision['reasoning']}",
+        )
+
     def test_pnl_summary(self):
         add_position_seed(self.conn, "a", "300750", "1000", "245.30", None, "2026-05-01 09:30:00", "")
         sync_portfolio(self.conn, analysis_provider=self.provider, fx_rate_provider=self.fx_provider)
         summary = pnl_summary(self.conn)
         self.assertEqual(summary["positions"], 1)
         self.assertEqual(summary["total_position_value_cny"], "260000.00")
+
+    def test_fund_flow_post_close_refresh_window_keeps_short_ttl(self):
+        a_after_close = datetime(2026, 5, 12, 15, 30, tzinfo=CN_TZ)
+        a_after_window = datetime(2026, 5, 12, 17, 1, tzinfo=CN_TZ)
+        hk_after_close = datetime(2026, 5, 12, 16, 30, tzinfo=CN_TZ)
+        hk_after_window = datetime(2026, 5, 12, 18, 1, tzinfo=CN_TZ)
+
+        self.assertEqual(_ttl_for_moment("a", a_after_close), 60.0)
+        self.assertEqual(_ttl_for_moment("a", a_after_window), 4 * 3600.0)
+        self.assertEqual(_ttl_for_moment("hk", hk_after_close), 60.0)
+        self.assertEqual(_ttl_for_moment("hk", hk_after_window), 4 * 3600.0)
+
+    def test_fund_flow_historical_cache_can_use_long_ttl(self):
+        cached_rows = [{"date": "2026-05-11"}]
+        ttl = _ttl_for_call("a", "600276", cached_data=cached_rows)
+        self.assertEqual(ttl, 4 * 3600.0)
 
     def test_cli_smoke(self):
         cmd = [sys.executable, str(SKILL_DIR / "scripts" / "main.py")]

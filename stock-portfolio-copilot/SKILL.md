@@ -18,7 +18,9 @@ description: >-
 - 同步持仓：根据初始持仓 + 交易流水重算当前仓位、均价、盈亏
 - 管理自选：新增 / 删除 / 查看关注标的
 - 设置约束：总资金上限、单票仓位上限
-- 实时分析：结合 `stock-market-hub` 的分析结果，输出 `buy / add / hold / trim / sell / avoid / watch`
+- 实时分析：结合 `stock-market-hub` 的分析结果，输出 `buy / focus / add / hold / trim / sell / avoid / watch`
+  - `focus` 表示重点关注：宽松信号较好，适合加入盯盘清单，但不等同于直接买入
+  - `buy` 表示买入候选：需要满足更严格的强趋势、低风险与不过热条件
 
 ## CLI 入口
 

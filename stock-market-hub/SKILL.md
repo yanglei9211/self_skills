@@ -51,11 +51,13 @@ $SMH sector "AI PC"
 $SMH market --board gainers --top 10
 $SMH risk --rules R1,R2,R5
 
-# 公告 / 时间轴 / PDF / 上下游
+# 公告 / 时间轴 / PDF / 上下游 / 主力资金流
 $SMH ann SZ300750 --days 60
 $SMH timeline HK01810 --days 30 --news-keywords "小米,Xiaomi,SU7,YU7"
 $SMH pdf URL --sections business,risks
 $SMH supply SZ300750
+$SMH flow SZ300750                  # 单独看主力资金流（也会自动并入 smh company）
+$SMH flow HK01810 --format json
 
 # 缓存管理
 $SMH cache stats
@@ -270,6 +272,32 @@ $VPY scripts/analyze_company.py --symbol SZ300750 --deep
 > 截至 2026-04-30，小米港股盘中触及 HK$ 28.80，**创 2026 年新低 + 52 周新低**（regime=NEW_YTD_LOW）。
 > 上一次盘中跌到 HK$ 28 是 **2024-12-02**（514 天前），意味着今天突破了过去 1 年半的运行区间，
 > 技术上属**破位下行**而非支撑位震荡。
+
+
+
+### ⚠️ 主力资金硬约束（fflow 驱动，禁止凭印象）
+
+任何涉及"主力流入/流出/资金抢筹/资金撤离/机构进出"的判断，**必须**基于 `analyze_company.py` 输出里的 `fund_flow` 字段（数据源：东方财富 push2his fflow daykline，约 120 个交易日，**A 股沪深 + 港股**）：
+
+1. **必须列出 `rolling` 表**：1d / 5d / 10d / 20d 的主力累计净额（亿）+ 净流入天数 / 流出天数。不能只丢一个"今日主力净流出 X 亿"的孤立数字
+2. **必须用 `regime` 字段定语境**：
+   - `PERSISTENT_INFLOW`（20 日累计为正 + 流入天数 ≥ 12）→ 用"主力**持续净流入**"
+   - `PERSISTENT_OUTFLOW`（20 日累计为负 + 流出天数 ≥ 12）→ 用"主力**持续净流出**"
+   - `OSCILLATING` → 用"震荡 / 进出反复"，**不要**用"持续 X"措辞
+3. **`reversal` 字段必须明确提示转向**：
+   - `INFLOW_TO_OUTFLOW`（近 5 日反向流出）→ 必须写"近 5 日资金转向流出，趋势可能正在切换"
+   - `OUTFLOW_TO_INFLOW`（近 5 日反向流入）→ 必须写"近 5 日资金转向流入，下跌动能可能在衰竭"
+4. **当日描述必须给出"机构档位"**（超大单 + 大单的净额与占比），不能只说总主力数字。例：「今日主力净流出 11 亿，**其中超大单 -7 亿、大单 -4 亿**，机构在抛货，散户（中小单）在接」
+5. **港股**：必须加注「港股资金分级为东财根据成交单笔大小推算，仅供参考」字样
+6. **北交所 / 美股 / 缺失**：`fund_flow` 字段为空或带 `error` 时，**直接说"无主力资金流数据，本节略过"**，禁止杜撰
+
+**反例**：
+> 主力资金近期持续撤离这只股票。
+
+**正例**：
+> 截至 2026-05-11，宁德时代（SZ300750）`fund_flow.regime=PERSISTENT_INFLOW`：20 日主力累计净流入 +23.65 亿（流入 12 天 / 流出 8 天）。
+> 但 `reversal=INFLOW_TO_OUTFLOW`：近 5 日主力反向净流出，**说明此前的多头资金正在退潮**，需要关注趋势是否切换。
+> 当日主力净流入 +7.25 亿，**其中超大单 +5.1 亿，大单 +2.1 亿**，仍是机构主导买入。
 
 
 

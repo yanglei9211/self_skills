@@ -2,24 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from decimal import Decimal
 from pathlib import Path
 
+# 注：``spc_core.utils`` 已经把 shared 路径加入 sys.path，所以这里可以直接 import。
 from spc_core.settings import get_setting
 from spc_core.utils import build_analysis_symbol, q_ratio
-
-
-def _ensure_shared_path() -> None:
-    current = Path(__file__).resolve()
-    shared_dir = current.parents[3] / "shared"
-    if str(shared_dir) not in sys.path:
-        sys.path.insert(0, str(shared_dir))
-
-
-_ensure_shared_path()
-
-from stock_core.stock_market_hub import analyze_symbol, fetch_market_board  # noqa: E402
+from stock_core.stock_market_hub import analyze_symbol, fetch_market_board
 
 
 class StockMarketHubProvider:

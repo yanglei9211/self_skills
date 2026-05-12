@@ -40,7 +40,11 @@ import re
 import sys
 from pathlib import Path
 
-from core.http import fetch  # type: ignore
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
+
+from stock_core.http import fetch  # noqa: E402
 
 
 CACHE_DIR = Path.home() / ".cache" / "stock-market-hub" / "pdfs"

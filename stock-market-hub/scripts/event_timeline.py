@@ -22,24 +22,23 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-from core.http import fetch  # type: ignore
-from core.kline import fetch_daily_kline  # type: ignore
+_SHARED = Path(__file__).resolve().parents[2] / "shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
-
-CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone.utc
+from stock_core.http import fetch  # noqa: E402
+from stock_core.kline import fetch_daily_kline  # noqa: E402
+from stock_core.symbols import normalize_symbol as _normalize_symbol_impl  # noqa: E402
+from stock_core.tz import CN_TZ  # noqa: E402
 
 
 def _normalize_symbol(symbol: str) -> tuple[str, str, str]:
-    """复用 analyze_company.normalize_symbol。"""
-    from analyze_company import normalize_symbol  # type: ignore
-    return normalize_symbol(symbol)
+    """共享 symbol 解析。"""
+    return _normalize_symbol_impl(symbol)
 
 
 # ============ 1. K 线大涨大跌事件 ============ #
@@ -275,7 +274,7 @@ def main() -> None:
     # 拿公司名（用于新闻关键词）
     company_name = ""
     try:
-        from core.xueqiu import XueqiuClient  # type: ignore
+        from stock_core.xueqiu import XueqiuClient
         cli = XueqiuClient()
         qs = cli.quotes([kline_sym])
         if qs:
