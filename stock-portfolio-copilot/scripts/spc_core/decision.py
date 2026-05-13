@@ -229,17 +229,72 @@ _SIGNAL_COLLECTORS = (
 )
 
 
+# ── confidence_trace 工具 ────────────────────────────────────────
+# 让 0.78 这个数字不再是黑盒：每次 confidence 变化都记一行
+# {step, action, value, delta, rule}，让 caller / Agent / 人类可以反查
+# "0.78 是哪几条规则叠加出来的"。供 `spc explain` 子命令展开渲染。
+
+
+def _new_trace(base: Decimal, base_action: str, base_rule: str) -> list[dict]:
+    """初始化 trace。base step 的 delta 等同 value（从 0 起点贡献了 base）。"""
+    return [{
+        "step": "base",
+        "action": base_action,
+        "value": float(base),
+        "delta": float(base),
+        "rule": base_rule,
+    }]
+
+
+def _make_recorder(trace: list[dict]):
+    """返回两个闭包：``record(name, action, new_value, rule)`` 用于无条件改 confidence；
+    ``raise_to(name, action, candidate, rule)`` 用于 ``max(old, candidate)`` 升档场景。
+
+    后者特殊处理：candidate <= 当前置信度时仍写一条 trace 记 "规则触发但被前序更高
+    置信度封顶"，delta=0，便于审计"为什么这条规则没影响最终值"。
+    """
+    state = {"value": Decimal(str(trace[-1]["value"])), "action": trace[-1]["action"]}
+
+    def record(name: str, action: str, new_value: Decimal, rule: str) -> None:
+        delta = new_value - state["value"]
+        state["value"] = new_value
+        state["action"] = action
+        trace.append({
+            "step": name, "action": action,
+            "value": float(new_value), "delta": float(delta), "rule": rule,
+        })
+
+    def raise_to(name: str, action: str, candidate: Decimal, rule: str) -> None:
+        if candidate > state["value"]:
+            record(name, action, candidate, rule)
+        else:
+            # 规则触发了，但被前序更高置信度封顶
+            state["action"] = action  # action 标签更新，confidence 不变
+            trace.append({
+                "step": name, "action": action,
+                "value": float(state["value"]), "delta": 0.0,
+                "rule": rule + "（被前序更高置信度封顶，confidence 未变）",
+            })
+
+    def current() -> tuple[str, Decimal]:
+        return state["action"], state["value"]
+
+    return record, raise_to, current
+
+
 # ── 决策分支：持仓 vs 自选 ───────────────────────────────────────
 
-def _decide_for_holding(f: Features, max_single_pct: Decimal) -> tuple[str, Decimal, list[str]]:
+def _decide_for_holding(
+    f: Features, max_single_pct: Decimal,
+) -> tuple[str, Decimal, list[str], list[dict]]:
     """qty > 0：从 hold 出发，按风险 / 资金 / 现价亏损 / 仓位超限四类信号升降级。"""
     extra_reasons: list[str] = []
-    action = "hold"
-    confidence = Decimal("0.55")
+    trace = _new_trace(Decimal("0.55"), "hold", "持仓默认起点 hold @ 0.55")
+    record, raise_to, current = _make_recorder(trace)
 
     if f.risk_hits >= 2 or f.regime in LOW_REGIMES:
-        action = "trim"
-        confidence = Decimal("0.72")
+        record("risk_or_low_regime", "trim", Decimal("0.72"),
+               f"risk_hits={f.risk_hits} or regime={f.regime} → trim")
 
     # 主力资金分层使用：
     #   - 20d 定背景（偏强 / 偏弱）
@@ -247,39 +302,46 @@ def _decide_for_holding(f: Features, max_single_pct: Decimal) -> tuple[str, Deci
     #   - 1d 只做提示，不单独触发动作
     if f.ff_regime == FUND_PERSISTENT_OUTFLOW:
         if f.regime in LOW_REGIMES and _ff_negative(f.ff_5d):
-            action = "sell"
-            confidence = max(confidence, Decimal("0.78"))
+            raise_to("ff_outflow+low+5d_neg", "sell", Decimal("0.78"),
+                     f"20d 资金弱 + 5d 续出({f.ff_5d:+.2f}yi) + 价格破位({f.regime}) → 升 sell")
             extra_reasons.append("20 日资金背景偏弱，且近 5 日继续流出并叠加价格破位，建议优先退出")
-        elif action == "hold" and _ff_negative(f.ff_5d) and _ff_negative(f.ff_3d):
-            action = "trim"
-            confidence = max(confidence, Decimal("0.65"))
+        elif current()[0] == "hold" and _ff_negative(f.ff_5d) and _ff_negative(f.ff_3d):
+            raise_to("ff_outflow+5d+3d_neg", "trim", Decimal("0.65"),
+                     f"20d 资金弱 + 5d({f.ff_5d:+.2f}) + 3d({f.ff_3d:+.2f}) 续出 → 升 trim")
             extra_reasons.append("20 日资金背景偏弱，且近 5/3 日继续流出，建议先减仓")
 
     if f.current is not None and f.avg_cost > 0:
         cur_price = to_decimal(f.current, "current")
         if cur_price < f.avg_cost * Decimal("0.92") and f.risk_hits:
-            action = "sell"
-            confidence = Decimal("0.78")
+            record("price_loss+risk_announce", "sell", Decimal("0.78"),
+                   f"现价 {cur_price} < 92% 成本 {f.avg_cost} 且有风险公告 → 强制 sell")
             extra_reasons.append("现价明显低于持仓成本且伴随风险公告")
         elif f.weight_pct > max_single_pct and cur_price > f.avg_cost:
-            action = "trim"
-            confidence = Decimal("0.70")
+            record("weight_over_cap", "trim", Decimal("0.70"),
+                   f"持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
             extra_reasons.append("当前仓位超过单票上限且已有浮盈")
 
-    return action, confidence, extra_reasons
+    action, confidence = current()
+    return action, confidence, extra_reasons, trace
 
 
-def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str]]:
+def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str], list[dict]]:
     """qty == 0：自选侧从 watch 出发，按风险 / 资金 / buy 候选 / focus 升降级。"""
     extra_reasons: list[str] = []
     extra_risks: list[str] = []
+    trace = _new_trace(Decimal("0.55"), "watch", "自选默认起点 watch @ 0.55")
+    record, _raise_to, _current = _make_recorder(trace)
 
     if f.risk_hits >= 2 or f.regime in LOW_REGIMES:
-        return "avoid", Decimal("0.72"), extra_reasons, extra_risks
+        record("risk_or_low_regime", "avoid", Decimal("0.72"),
+               f"risk_hits={f.risk_hits} or regime={f.regime} → avoid")
+        return "avoid", Decimal("0.72"), extra_reasons, extra_risks, trace
 
     if f.ff_regime == FUND_PERSISTENT_OUTFLOW and _ff_negative(f.ff_5d) and _ff_negative(f.ff_3d):
         # 20 日资金背景偏弱，且近 5/3 日继续流出，才直接回避
-        return "avoid", Decimal("0.68"), extra_reasons, extra_risks
+        record("ff_outflow+5d+3d_neg", "avoid", Decimal("0.68"),
+               f"20d 资金弱 + 5d({f.ff_5d:+.2f}) + 3d({f.ff_3d:+.2f}) 续出 → avoid")
+        return "avoid", Decimal("0.68"), extra_reasons, extra_risks, trace
 
     buy_eval = _evaluate_self_select_buy(
         f.regime, f.risk_hits, f.positive_hits, f.change_pct,
@@ -287,19 +349,25 @@ def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str
     )
     if buy_eval is not None:
         action, confidence, buy_reason = buy_eval
+        # buy_reason 文案里已经标了 trend / reversal / RISK_OFF 降级路径，
+        # 直接拿来当 rule，trace 不再细拆 trend/reversal 内部
+        record("self_select_buy_path", action, confidence, buy_reason[:120])
         extra_reasons.append(buy_reason)
-        return action, confidence, extra_reasons, extra_risks
+        return action, confidence, extra_reasons, extra_risks, trace
 
     if f.positive_hits > f.risk_hits and f.regime not in LOW_REGIMES:
+        record("positive_over_risk_no_low", "focus", Decimal("0.62"),
+               f"positive_hits={f.positive_hits} > risk_hits={f.risk_hits}, regime={f.regime} → focus")
         extra_reasons.append("正向信号多于风险信号，优先纳入重点盯盘")
         if f.regime not in HIGH_REGIMES:
             extra_risks.append("价格结构尚未达到强趋势买入候选条件")
         if _is_extended_intraday_gain(f.change_pct):
             extra_risks.append("当日涨幅较高，次日不宜直接追高")
-        return "focus", Decimal("0.62"), extra_reasons, extra_risks
+        return "focus", Decimal("0.62"), extra_reasons, extra_risks, trace
 
+    # 无任何信号触发，留在 watch；trace 不增加新 step
     extra_reasons.append("建议继续跟踪，等待更清晰的触发条件")
-    return "watch", Decimal("0.55"), extra_reasons, extra_risks
+    return "watch", Decimal("0.55"), extra_reasons, extra_risks, trace
 
 
 def _build_sources(analysis: dict, f: Features) -> list[str]:
@@ -352,18 +420,30 @@ def _decision_from_analysis(
 
     # 2. 决策分支：持仓侧 vs 自选侧
     if f.qty > 0:
-        action, confidence, more_reasons = _decide_for_holding(f, max_single_pct)
+        action, confidence, more_reasons, trace = _decide_for_holding(f, max_single_pct)
         reasons.extend(more_reasons)
         if action == "hold" and not reasons:
             reasons.append("当前没有触发明显的减仓或卖出信号")
     else:
-        action, confidence, more_reasons, more_risks = _decide_for_watching(f)
+        action, confidence, more_reasons, more_risks, trace = _decide_for_watching(f)
         reasons.extend(more_reasons)
         risks.extend(more_risks)
 
     # 3. RISK_OFF 给 trim / sell 升一点 confidence（防御动作得到宏观背书）
     if f.market_regime == MARKET_REGIME_RISK_OFF and action in ("trim", "sell"):
-        confidence = min(Decimal("0.95"), confidence + Decimal("0.05"))
+        new_conf = min(Decimal("0.95"), confidence + Decimal("0.05"))
+        delta = new_conf - confidence
+        trace.append({
+            "step": "macro_risk_off_boost",
+            "action": action,
+            "value": float(new_conf),
+            "delta": float(delta),
+            "rule": (
+                "大盘 RISK_OFF 给防御动作 (trim/sell) +0.05"
+                + ("" if delta > 0 else "（被 0.95 上限封顶，confidence 未变）")
+            ),
+        })
+        confidence = new_conf
 
     # 4. fallback
     if not reasons and f.current is not None:
@@ -381,6 +461,7 @@ def _decision_from_analysis(
         "risks": risks,
         "sources": sources,
         "weight_pct": decimal_str(f.weight_pct),
+        "confidence_trace": trace,
     }
 
 

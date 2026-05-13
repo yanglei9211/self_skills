@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from spc_core.audit import render_diff, render_explain, render_log, render_show
 from spc_core.db import connect
 from spc_core.decision import analyze_now, render_analysis_text
 from spc_core.ledger import (
@@ -350,6 +351,52 @@ def cmd_report_decision(args, conn) -> None:
     print(pretty_json(row))
 
 
+# ── audit commands（spc explain / log / show / diff） ───────────────
+
+def cmd_explain(args, conn) -> None:
+    acct = _resolve(conn, args)
+    text = render_explain(
+        conn, acct["id"], acct["slug"],
+        analysis_id=args.analysis_id,
+        market=args.market,
+        code=args.code,
+    )
+    print(text)
+
+
+def cmd_log(args, conn) -> None:
+    acct = _resolve(conn, args)
+    text = render_log(
+        conn, acct["id"], acct["slug"],
+        market=args.market, code=args.code,
+        since=args.since, until=args.until,
+        limit=args.limit,
+    )
+    print(text)
+
+
+def cmd_show(args, conn) -> None:
+    acct = _resolve(conn, args)
+    text = render_show(conn, acct["id"], acct["slug"], args.analysis_id)
+    print(text)
+
+
+def cmd_diff(args, conn) -> None:
+    acct = _resolve(conn, args)
+    between: tuple[str, str] | None = None
+    if args.between:
+        if len(args.between) != 2:
+            raise ValueError("--between 需要两个日期，例：--between 2026-05-06 2026-05-13")
+        between = (args.between[0], args.between[1])
+    text = render_diff(
+        conn, acct["id"], acct["slug"],
+        market=args.market, code=args.code,
+        since=args.since, until=args.until,
+        between=between,
+    )
+    print(text)
+
+
 # ── parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -511,6 +558,55 @@ def build_parser() -> argparse.ArgumentParser:
     p_report_decision = p_report_sub.add_parser("decision")
     _add_account_arg(p_report_decision)
     p_report_decision.set_defaults(func=cmd_report_decision)
+
+    # ── audit: explain / log / show / diff ────────────────────────
+    p_explain = sub.add_parser(
+        "explain",
+        help="展开某次 analyze 的 confidence_trace（'为什么 0.78'）",
+    )
+    _add_account_arg(p_explain)
+    p_explain.add_argument(
+        "--analysis-id", type=int,
+        help="目标 analysis_run id；不传则取该账户最新一次",
+    )
+    p_explain.add_argument("--market", help="只展开 results 里指定 market 的标的")
+    p_explain.add_argument("--code", help="配合 --market 锁定单只标的")
+    p_explain.set_defaults(func=cmd_explain)
+
+    p_log = sub.add_parser(
+        "log",
+        help="列出最近 N 次 analyze_now（可按 symbol / 时间窗口过滤）",
+    )
+    _add_account_arg(p_log)
+    p_log.add_argument("--market", help="按 market 过滤")
+    p_log.add_argument("--code", help="按 code 过滤（必须配合 --market）")
+    p_log.add_argument("--since", help="起点；支持 '7d'/'12h'/'2w'/'2026-05-06'")
+    p_log.add_argument("--until", help="终点（不含）")
+    p_log.add_argument("--limit", type=int, default=20)
+    p_log.set_defaults(func=cmd_log)
+
+    p_show = sub.add_parser(
+        "show",
+        help="按 analysis-id 显示某次 analyze 的完整结构化输出",
+    )
+    _add_account_arg(p_show)
+    p_show.add_argument("--analysis-id", type=int, required=True)
+    p_show.set_defaults(func=cmd_show)
+
+    p_diff = sub.add_parser(
+        "diff",
+        help="对比同一只标的在两个时点的决策（默认窗口内首尾两次）",
+    )
+    _add_account_arg(p_diff)
+    p_diff.add_argument("--market", required=True)
+    p_diff.add_argument("--code", required=True)
+    p_diff.add_argument("--since", help="窗口起点；支持 '7d'/'2026-05-06' 等")
+    p_diff.add_argument("--until", help="窗口终点（不含）")
+    p_diff.add_argument(
+        "--between", nargs=2, metavar=("FROM", "TO"),
+        help="显式指定两个时点附近的 run 对比，覆盖 --since/--until",
+    )
+    p_diff.set_defaults(func=cmd_diff)
 
     return ap
 

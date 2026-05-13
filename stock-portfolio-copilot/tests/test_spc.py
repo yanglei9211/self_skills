@@ -764,6 +764,163 @@ def render_text(data):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--symbol", proc.stdout)
 
+    # ── audit: confidence_trace + spc explain/log/show/diff ───────────
+
+    def _make_analysis_history(self, count: int = 2) -> list[int]:
+        """跑 count 次 analyze_now，模拟一段时间复盘历史。返回 analysis_run id 列表。"""
+        from spc_core.ledger import list_analysis_runs as _list_runs
+        add_position_seed(self.conn, self.acct_id, "a", "300750", "1000", "245.30",
+                          None, "2026-05-01 09:30:00", "")
+        add_watch(self.conn, self.acct_id, "hk", "01810", "")
+        for _ in range(count):
+            analyze_now(self.conn, self.acct_id, self.acct_slug, self.acct_name,
+                        "all", analysis_provider=self.provider)
+        rows = _list_runs(self.conn, self.acct_id, limit=count + 5)
+        return [r["id"] for r in rows[:count]]
+
+    def test_decision_has_confidence_trace(self):
+        """每个 decision 都应该附带 confidence_trace 字段，且至少包含 base 起点。"""
+        add_position_seed(self.conn, self.acct_id, "a", "300750", "1000", "245.30",
+                          None, "2026-05-01 09:30:00", "")
+        payload = analyze_now(self.conn, self.acct_id, self.acct_slug, self.acct_name,
+                              "holdings", analysis_provider=self.provider)
+        self.assertEqual(len(payload["results"]), 1)
+        decision = payload["results"][0]["decision"]
+        trace = decision.get("confidence_trace")
+        self.assertIsNotNone(trace, "decision 应该有 confidence_trace 字段")
+        self.assertGreaterEqual(len(trace), 1)
+        self.assertEqual(trace[0]["step"], "base")
+        self.assertIn("rule", trace[0])
+        # confidence_trace 的最后一步 value 应该跟最终 confidence 一致
+        final = float(decision["confidence"])
+        self.assertAlmostEqual(trace[-1]["value"], final, places=3)
+
+    def test_confidence_trace_records_promotion(self):
+        """带风险公告 + 破位 regime → trace 应记录从 0.55 → 0.72 那一跳的 trigger。"""
+        provider = FakeProvider()
+        add_position_seed(self.conn, self.acct_id, "hk", "01810", "2000", "18.62",
+                          None, "2026-05-01 09:30:00", "")
+        payload = analyze_now(self.conn, self.acct_id, self.acct_slug, self.acct_name,
+                              "holdings", market="hk", code="01810",
+                              analysis_provider=provider)
+        trace = payload["results"][0]["decision"]["confidence_trace"]
+        steps = [s["step"] for s in trace]
+        # 小米 01810 在 FakeProvider 里 regime=NEW_YTD_LOW + 风险公告 2 条
+        # 应该至少触发 risk_or_low_regime 这步
+        self.assertIn("risk_or_low_regime", steps, f"trace={trace}")
+        # 该步的 delta 应该为正（升 confidence）
+        promo = [s for s in trace if s["step"] == "risk_or_low_regime"][0]
+        self.assertGreater(promo["delta"], 0)
+
+    def test_audit_list_analysis_runs(self):
+        from spc_core.ledger import list_analysis_runs
+        ids = self._make_analysis_history(count=3)
+        self.assertEqual(len(ids), 3)
+        # 倒序：最新的 id 应该最大
+        self.assertEqual(ids, sorted(ids, reverse=True))
+        # 限制条数
+        partial = list_analysis_runs(self.conn, self.acct_id, limit=2)
+        self.assertEqual(len(partial), 2)
+
+    def test_audit_find_runs_covering_symbol(self):
+        from spc_core.ledger import find_analysis_runs_covering_symbol
+        self._make_analysis_history(count=2)
+        runs = find_analysis_runs_covering_symbol(
+            self.conn, self.acct_id, "a", "300750", limit=10,
+        )
+        # FakeProvider 里 300750 是持仓，每次 analyze 都该被 results 包含
+        self.assertGreaterEqual(len(runs), 2)
+        for r in runs:
+            results = r["payload"]["results"]
+            self.assertTrue(any(it["market"] == "a" and it["code"] == "300750" for it in results))
+
+    def test_audit_render_explain(self):
+        from spc_core.audit import render_explain
+        ids = self._make_analysis_history(count=1)
+        text = render_explain(self.conn, self.acct_id, self.acct_slug,
+                              analysis_id=ids[0], market=None, code=None)
+        self.assertIn("置信度构成", text)
+        self.assertIn(f"analysis_run id={ids[0]}", text)
+        self.assertIn("[1]", text)  # 至少渲染了 base step
+
+    def test_audit_render_explain_filter_symbol(self):
+        from spc_core.audit import render_explain
+        ids = self._make_analysis_history(count=1)
+        text = render_explain(self.conn, self.acct_id, self.acct_slug,
+                              analysis_id=ids[0], market="a", code="300750")
+        self.assertIn("A 300750", text)
+        # 不该出现其它标的的标识
+        self.assertNotIn("HK 01810", text)
+
+    def test_audit_render_log(self):
+        from spc_core.audit import render_log
+        self._make_analysis_history(count=3)
+        text = render_log(self.conn, self.acct_id, self.acct_slug,
+                          market=None, code=None,
+                          since=None, until=None, limit=10)
+        self.assertIn("最近", text)
+        # 3 次 analyze 应该都出现在列表里（每行至少一个 ID）
+        id_lines = [ln for ln in text.splitlines() if ln.strip() and ln.strip()[0].isdigit()]
+        self.assertGreaterEqual(len(id_lines), 3)
+
+    def test_audit_render_log_filter_symbol(self):
+        from spc_core.audit import render_log
+        self._make_analysis_history(count=2)
+        text = render_log(self.conn, self.acct_id, self.acct_slug,
+                          market="a", code="300750",
+                          since=None, until=None, limit=10)
+        # symbol 过滤后应该显示该票的 action_label
+        self.assertIn("A 300750", text)
+
+    def test_audit_render_show(self):
+        from spc_core.audit import render_show
+        ids = self._make_analysis_history(count=1)
+        text = render_show(self.conn, self.acct_id, self.acct_slug, ids[0])
+        self.assertIn("置信度构成", text)
+        self.assertIn(f"analysis_run id={ids[0]}", text)
+        self.assertIn("资金上限", text)
+
+    def test_audit_render_diff(self):
+        from spc_core.audit import render_diff
+        self._make_analysis_history(count=2)
+        text = render_diff(self.conn, self.acct_id, self.acct_slug,
+                           market="a", code="300750",
+                           since=None, until=None, between=None)
+        self.assertIn("决策 diff", text)
+        # 两次 analyze 用同一个 FakeProvider，决策应该完全一样，diff 应说明"无变化"
+        self.assertIn("无变化", text)
+
+    def test_audit_render_diff_insufficient_data(self):
+        from spc_core.audit import render_diff
+        self._make_analysis_history(count=1)
+        text = render_diff(self.conn, self.acct_id, self.acct_slug,
+                           market="a", code="300750",
+                           since=None, until=None, between=None)
+        # 只有 1 条记录无法 diff
+        self.assertIn("无法 diff", text)
+
+    def test_audit_parse_since(self):
+        from spc_core.audit import parse_since
+        from datetime import datetime, timezone
+        # 相对时长
+        seven_days = parse_since("7d")
+        self.assertIsNotNone(seven_days)
+        dt = datetime.fromisoformat(seven_days)
+        diff = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+        self.assertAlmostEqual(diff, 7, delta=0.1)
+        # 日期格式
+        d = parse_since("2026-05-06")
+        self.assertEqual(d, "2026-05-06T00:00:00+00:00")
+        # ISO 完整
+        iso = parse_since("2026-05-06T10:30:00+00:00")
+        self.assertEqual(iso, "2026-05-06T10:30:00+00:00")
+        # 空
+        self.assertIsNone(parse_since(None))
+        self.assertIsNone(parse_since(""))
+        # 非法格式
+        with self.assertRaises(ValueError):
+            parse_since("not a date")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,25 @@ def _path(key: str) -> Path:
     return CACHE_DIR / f"{key}.json"
 
 
+def _atomic_write_text(p: Path, content: str) -> None:
+    """原子写文件：先写 ``<p>.tmp.<pid>`` 再 ``os.replace`` 到目标。
+
+    避免进程被 kill / 断电 / 磁盘满时留下 partial JSON 污染缓存。POSIX 上
+    ``os.replace`` 对同一文件系统内的 rename 是原子操作；Windows 上 Python
+    标准库也实现成原子。``pid`` 后缀防止同一 key 并发写时互踩。
+    """
+    tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
+
 def _call_dynamic_ttl(ttl_func: Callable[..., float], args: tuple, kwargs: dict, cached_data: Any | None) -> float:
     """调用动态 TTL 函数。
 
@@ -151,15 +170,15 @@ def cached(
             # 调用原函数
             result = func(*args, **kwargs)
 
-            # 写缓存（除非 skip_if 命中）
+            # 写缓存（除非 skip_if 命中）—— 原子写入，避免 partial JSON 污染
             if not skip_if(result):
                 try:
-                    p.write_text(
+                    _atomic_write_text(
+                        p,
                         json.dumps(
                             {"_cached_at": time.time(), "_func": func.__name__, "data": result},
                             ensure_ascii=False, default=str,
                         ),
-                        encoding="utf-8",
                     )
                 except Exception as e:  # noqa: BLE001
                     print(f"[cache] write failed for {key}: {e}", file=sys.stderr)

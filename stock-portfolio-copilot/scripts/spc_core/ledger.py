@@ -202,6 +202,133 @@ def latest_analysis_run(conn, account_id: int) -> dict | None:
     return out
 
 
+def list_analysis_runs(
+    conn,
+    account_id: int,
+    market: str | None = None,
+    code: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """列出 analyze_now 历史记录（按 run_time 倒序）。
+
+    返回**不带 payload_json**的轻量列表（仅 id / scope / market / code / run_time），
+    用于 ``spc log`` 这种概览。要拿完整负载请用 ``get_analysis_run_by_id``。
+
+    Args:
+        market / code: 可选过滤。注意 ``analysis_run.market`` 是该次 ``analyze_now``
+            的 ``--market`` 参数（可能为 None），不是结果里某只标的的 market。
+            按 symbol 过滤实际要靠 payload 里的 results 数组——这里只过滤外层。
+        since / until: ISO 8601 字符串（如 '2026-05-06' 或 '2026-05-06T10:00:00+00:00'），
+            包含 since、不含 until。
+        limit: 上限，0 表示不限制。
+    """
+    clauses = ["account_id = ?"]
+    params: list = [account_id]
+    if market:
+        norm_market = normalize_market(market)
+        clauses.append("market = ?")
+        params.append(norm_market)
+        if code:
+            clauses.append("code = ?")
+            params.append(normalize_code(norm_market, code))
+    elif code:
+        raise ValueError("只传 code 时必须同时传 market")
+    if since:
+        clauses.append("run_time >= ?")
+        params.append(since)
+    if until:
+        clauses.append("run_time < ?")
+        params.append(until)
+    sql = (
+        "SELECT id, scope, market, code, run_time FROM analysis_run "
+        f"WHERE {' AND '.join(clauses)} ORDER BY id DESC"
+    )
+    if limit and limit > 0:
+        sql += f" LIMIT {int(limit)}"
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_analysis_run_by_id(conn, account_id: int, run_id: int) -> dict | None:
+    """按 id 拉单次 analyze_now 的完整负载（含 payload）。"""
+    row = conn.execute(
+        "SELECT id, scope, market, code, run_time, payload_json "
+        "FROM analysis_run WHERE id = ? AND account_id = ?",
+        (run_id, account_id),
+    ).fetchone()
+    if not row:
+        return None
+    out = dict(row)
+    out["payload"] = json.loads(out.pop("payload_json"))
+    return out
+
+
+def find_analysis_runs_covering_symbol(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """找到所有"results 数组里包含指定 symbol"的 analyze_now 记录。
+
+    ``analyze_now`` 既可能传 ``--market/--code`` 锁定单只（外层 market/code 字段就是它），
+    也可能 ``--scope holdings`` 不传外层 market/code，让 results 内含多只标的。
+    单只标的的复盘场景要查"曾经分析过 SZ300750 的所有 run"，必须同时扫这两种情况。
+
+    实现：先按外层 market/code 精确匹配召回；再扫"外层无过滤"的 run，
+    检查 payload_json LIKE 匹配（廉价的 substring 检查，结果再精确反序列化验证）。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    clauses = ["account_id = ?"]
+    params: list = [account_id]
+    if since:
+        clauses.append("run_time >= ?")
+        params.append(since)
+    if until:
+        clauses.append("run_time < ?")
+        params.append(until)
+    where = " AND ".join(clauses)
+    # 精确召回 + 粗 LIKE 召回，最后在 Python 侧验证
+    needle = f'"market": "{norm_market}", "code": "{norm_code}"'
+    sql = (
+        "SELECT id, scope, market, code, run_time, payload_json FROM analysis_run "
+        f"WHERE {where} AND "
+        "  ((market = ? AND code = ?) OR payload_json LIKE ?) "
+        "ORDER BY id DESC"
+    )
+    if limit and limit > 0:
+        sql += f" LIMIT {int(limit * 2)}"  # LIKE 召回多一倍，过滤后裁剪
+    rows = conn.execute(
+        sql, params + [norm_market, norm_code, f"%{needle}%"]
+    ).fetchall()
+
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            payload = json.loads(d.pop("payload_json"))
+        except Exception:
+            continue
+        # 精确验证 results 里确实有这个 symbol（避免 LIKE 误命中）
+        if (d.get("market") == norm_market and d.get("code") == norm_code):
+            d["payload"] = payload
+            out.append(d)
+            continue
+        results = payload.get("results") or []
+        if any(it.get("market") == norm_market and it.get("code") == norm_code for it in results):
+            d["payload"] = payload
+            out.append(d)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
 def latest_snapshots(conn, account_id: int, market: str | None = None) -> list[dict]:
     params = [account_id]
     filter_sql = ""
