@@ -29,10 +29,11 @@ ENV/
 *~
 
 # ===== Secrets / tokens =====
-# 防止意外提交 GitHub token、API key 等
+# 防止意外提交 GitHub token、API key、登录态 cookie 等
 *.token
 *.key
 *.pem
+*.cookie
 .env
 .env.*
 !.env.example

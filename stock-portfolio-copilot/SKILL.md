@@ -24,22 +24,39 @@ description: >-
 
 ## CLI 入口
 
+skill 在多台机器上部署时，请按下面任一方式定位 `spc` 入口（**不要写死绝对路径**）：
+
 ```bash
-/Users/yanglei/Documents/project/self_skills/stock-portfolio-copilot/bin/spc
+# 方式 A：通过 Cursor / Claude skills 软链入口（推荐）
+SPC=$(python3 -c "import os; print(os.path.realpath(os.path.expanduser('~/.cursor/skills/stock-portfolio-copilot/bin/spc')))")
+# Claude 用户把 ~/.cursor 换成 ~/.claude 即可
+
+# 方式 B：已经 cd 到仓库根目录
+SPC=./stock-portfolio-copilot/bin/spc
+
+# 方式 C：用环境变量指向仓库根
+export SELF_SKILLS_HOME=/path/to/self_skills
+SPC="$SELF_SKILLS_HOME/stock-portfolio-copilot/bin/spc"
 ```
+
+`bin/spc` 内部已经做了"先在父目录找 .venv，找不到再解析软链回真身找 .venv"的兜底，所以同一台机器上软链路径或真身路径调用结果一致。
 
 ## 常用命令
 
+下面示例都假设你已经按上文设好了 `$SPC` 变量。
+
 ```bash
-spc position init --market a --code 300750 --qty 1000 --cost 245.30
-spc trade add --market hk --code 01810 --side buy --qty 500 --price 19.10 --time "2026-05-08 10:32:00"
-spc portfolio sync
-spc portfolio show
-spc watch add --market hk --code 01810
-spc capital set --total 500000 --max-single-pct 20
-spc analyze now --scope holdings
-spc report pnl
+$SPC position init --account default --market a --code 300750 --qty 1000 --cost 245.30
+$SPC trade add --account default --market hk --code 01810 --side buy --qty 500 --price 19.10 --time "2026-05-08 10:32:00"
+$SPC portfolio sync --account default
+$SPC portfolio show --account default
+$SPC watch add --account default --market hk --code 01810
+$SPC capital set --account default --total 500000 --max-single-pct 20
+$SPC analyze now --account default --scope holdings
+$SPC report pnl --account default
 ```
+
+> 注意：v2 引入了多账户结构，几乎所有命令都需要 `--account <slug>`。首次使用先 `$SPC account create --slug default --name "默认账户" --set-default`，旧版数据库会自动迁移到 `default` 账户。
 
 ## buy 候选双路径
 

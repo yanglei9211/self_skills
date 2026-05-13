@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from spc_core.ledger import latest_snapshots, list_watch, save_analysis_run
@@ -73,6 +74,259 @@ def _select_targets(conn, account_id: int, scope: str, market: str | None, code:
     return targets
 
 
+# ─────────────────────────────────────────────────────────────────
+# 决策特征 + 信号收集 + 分支处理
+#
+# 重构思路：把"特征量提取 / 各维度 reasons-risks 收集 / 持仓 vs 自选两条决策分支"
+# 拆成独立 helper，让 ``_decision_from_analysis`` 只剩"调度 + 组装"的骨架。
+# 这样未来加新维度（券商研报、行业 regime、做 T 节奏 等）只需新增一个 collect_xxx，
+# 不需要再去碰那段 200 行的决策树。
+#
+# 测试用例都通过 ``analyze_now`` 端到端断言公开字段，没有依赖私有函数 / reasons
+# 的具体顺序，所以这种拆分可以"零行为变化"完成。
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Features:
+    """从 ``(snapshot, analysis, capital_total, market_regime)`` 提取出的全部特征量。
+
+    决策树只读 ``Features``，不再直接碰原始 dict。这样：
+      - 测试可以构造一个 Features 单测某个分支
+      - 新加字段只改本类 + ``_extract_features`` 一处
+      - 决策树本身从 200 行降到 ~80 行，可读性显著上升
+    """
+    # 行情
+    current: object | None
+    change_pct: object | None
+    # 价格 regime
+    regime: str | None
+    # 公告关键词命中数
+    risk_hits: int
+    positive_hits: int
+    # 持仓
+    qty: Decimal
+    avg_cost: Decimal
+    weight_pct: Decimal
+    # 主力资金（缺数据时全部为 None / False）
+    ff_available: bool
+    ff_regime: str | None
+    ff_reversal: str | None
+    ff_1d: float | None
+    ff_3d: float | None
+    ff_5d: float | None
+    ff_20d: float | None
+    # 大盘
+    market_regime: str | None
+
+
+def _extract_features(
+    snapshot: dict | None,
+    analysis: dict,
+    capital_total: Decimal,
+    market_regime: str | None,
+) -> Features:
+    quote = analysis.get("quote") or {}
+    announcements = analysis.get("announcements") or []
+    price_history = analysis.get("price_history") or {}
+    fund_flow = analysis.get("fund_flow") or {}
+
+    titles = [item.get("title", "") for item in announcements]
+    risk_hits = sum(1 for t in titles if any(k in t for k in RISK_KEYWORDS))
+    positive_hits = sum(1 for t in titles if any(k in t for k in POSITIVE_KEYWORDS))
+
+    ff_available = bool(fund_flow) and not fund_flow.get("error") and fund_flow.get("today") is not None
+    rolling = fund_flow.get("rolling") or {}
+
+    def _ff_yi(window: str) -> float | None:
+        return (rolling.get(window) or {}).get("main_yi") if ff_available else None
+
+    qty = Decimal(snapshot["qty"]) if snapshot else Decimal("0")
+    avg_cost = to_decimal(snapshot["avg_cost_price"], "avg_cost_price") if snapshot else Decimal("0")
+    position_value_cny = (
+        to_decimal(snapshot["position_value_cny"] or "0", "position_value_cny") if snapshot else Decimal("0")
+    )
+    weight_pct = Decimal("0")
+    if capital_total > 0 and position_value_cny > 0:
+        weight_pct = q_money(position_value_cny / capital_total * Decimal("100"))
+
+    return Features(
+        current=quote.get("current"),
+        change_pct=quote.get("percent"),
+        regime=price_history.get("regime"),
+        risk_hits=risk_hits,
+        positive_hits=positive_hits,
+        qty=qty,
+        avg_cost=avg_cost,
+        weight_pct=weight_pct,
+        ff_available=ff_available,
+        ff_regime=fund_flow.get("regime") if ff_available else None,
+        ff_reversal=fund_flow.get("reversal") if ff_available else None,
+        ff_1d=_ff_yi("1d"),
+        ff_3d=_ff_yi("3d"),
+        ff_5d=_ff_yi("5d"),
+        ff_20d=_ff_yi("20d"),
+        market_regime=market_regime,
+    )
+
+
+# ── signal 收集 helpers ──────────────────────────────────────────
+# 每个 collect_xxx_signals 只负责从 Features 提取本维度的 reasons / risks 文案，
+# 不改 action / confidence；具体动作触发由 _decide_for_holding / _decide_for_watching
+# 集中决定。
+
+def _collect_macro_signals(f: Features) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.market_regime == MARKET_REGIME_RISK_OFF:
+        risks.append("所属市场大盘 RISK_OFF，整体风险偏好低，宏观防御为主")
+    elif f.market_regime == MARKET_REGIME_RISK_ON:
+        reasons.append("所属市场大盘 RISK_ON，整体风险偏好高，但不据此主动加仓")
+    return reasons, risks
+
+
+def _collect_price_signals(f: Features) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.regime in LOW_REGIMES:
+        risks.append("价格处于破位或创新低区间")
+    if f.regime in HIGH_REGIMES:
+        reasons.append("价格处于强势区间或突破状态")
+    return reasons, risks
+
+
+def _collect_announcement_signals(f: Features) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.risk_hits:
+        risks.append(f"近期待公告标题中命中 {f.risk_hits} 个风险关键词")
+    if f.positive_hits:
+        reasons.append(f"近期待公告标题中命中 {f.positive_hits} 个正向关键词")
+    return reasons, risks
+
+
+def _collect_fund_flow_signals(f: Features) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    risks: list[str] = []
+    if not f.ff_available:
+        return reasons, risks
+    if f.ff_regime == FUND_PERSISTENT_INFLOW:
+        reasons.append(f"主力 20 日持续净流入 {f.ff_20d:+.2f} 亿")
+    elif f.ff_regime == FUND_PERSISTENT_OUTFLOW:
+        risks.append(f"主力 20 日持续净流出 {f.ff_20d:+.2f} 亿")
+    if f.ff_reversal == FUND_REVERSAL_DOWN:
+        risks.append("近 5 日主力资金由流入转为流出，趋势可能在切换")
+    elif f.ff_reversal == FUND_REVERSAL_UP:
+        reasons.append("近 5 日主力资金由流出转为流入，下跌动能在衰竭")
+    return reasons, risks
+
+
+_SIGNAL_COLLECTORS = (
+    _collect_macro_signals,
+    _collect_price_signals,
+    _collect_announcement_signals,
+    _collect_fund_flow_signals,
+)
+
+
+# ── 决策分支：持仓 vs 自选 ───────────────────────────────────────
+
+def _decide_for_holding(f: Features, max_single_pct: Decimal) -> tuple[str, Decimal, list[str]]:
+    """qty > 0：从 hold 出发，按风险 / 资金 / 现价亏损 / 仓位超限四类信号升降级。"""
+    extra_reasons: list[str] = []
+    action = "hold"
+    confidence = Decimal("0.55")
+
+    if f.risk_hits >= 2 or f.regime in LOW_REGIMES:
+        action = "trim"
+        confidence = Decimal("0.72")
+
+    # 主力资金分层使用：
+    #   - 20d 定背景（偏强 / 偏弱）
+    #   - 5d/3d 定动作（是否真的要减仓 / 回避）
+    #   - 1d 只做提示，不单独触发动作
+    if f.ff_regime == FUND_PERSISTENT_OUTFLOW:
+        if f.regime in LOW_REGIMES and _ff_negative(f.ff_5d):
+            action = "sell"
+            confidence = max(confidence, Decimal("0.78"))
+            extra_reasons.append("20 日资金背景偏弱，且近 5 日继续流出并叠加价格破位，建议优先退出")
+        elif action == "hold" and _ff_negative(f.ff_5d) and _ff_negative(f.ff_3d):
+            action = "trim"
+            confidence = max(confidence, Decimal("0.65"))
+            extra_reasons.append("20 日资金背景偏弱，且近 5/3 日继续流出，建议先减仓")
+
+    if f.current is not None and f.avg_cost > 0:
+        cur_price = to_decimal(f.current, "current")
+        if cur_price < f.avg_cost * Decimal("0.92") and f.risk_hits:
+            action = "sell"
+            confidence = Decimal("0.78")
+            extra_reasons.append("现价明显低于持仓成本且伴随风险公告")
+        elif f.weight_pct > max_single_pct and cur_price > f.avg_cost:
+            action = "trim"
+            confidence = Decimal("0.70")
+            extra_reasons.append("当前仓位超过单票上限且已有浮盈")
+
+    return action, confidence, extra_reasons
+
+
+def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str]]:
+    """qty == 0：自选侧从 watch 出发，按风险 / 资金 / buy 候选 / focus 升降级。"""
+    extra_reasons: list[str] = []
+    extra_risks: list[str] = []
+
+    if f.risk_hits >= 2 or f.regime in LOW_REGIMES:
+        return "avoid", Decimal("0.72"), extra_reasons, extra_risks
+
+    if f.ff_regime == FUND_PERSISTENT_OUTFLOW and _ff_negative(f.ff_5d) and _ff_negative(f.ff_3d):
+        # 20 日资金背景偏弱，且近 5/3 日继续流出，才直接回避
+        return "avoid", Decimal("0.68"), extra_reasons, extra_risks
+
+    buy_eval = _evaluate_self_select_buy(
+        f.regime, f.risk_hits, f.positive_hits, f.change_pct,
+        f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.market_regime,
+    )
+    if buy_eval is not None:
+        action, confidence, buy_reason = buy_eval
+        extra_reasons.append(buy_reason)
+        return action, confidence, extra_reasons, extra_risks
+
+    if f.positive_hits > f.risk_hits and f.regime not in LOW_REGIMES:
+        extra_reasons.append("正向信号多于风险信号，优先纳入重点盯盘")
+        if f.regime not in HIGH_REGIMES:
+            extra_risks.append("价格结构尚未达到强趋势买入候选条件")
+        if _is_extended_intraday_gain(f.change_pct):
+            extra_risks.append("当日涨幅较高，次日不宜直接追高")
+        return "focus", Decimal("0.62"), extra_reasons, extra_risks
+
+    extra_reasons.append("建议继续跟踪，等待更清晰的触发条件")
+    return "watch", Decimal("0.55"), extra_reasons, extra_risks
+
+
+def _build_sources(analysis: dict, f: Features) -> list[str]:
+    """组装审计用 sources：最近 3 条公告 PDF + price_history.regime + fund_flow + market_regime。"""
+    sources: list[str] = []
+    announcements = analysis.get("announcements") or []
+    for item in announcements[:3]:
+        title = item.get("title") or "公告"
+        pdf = item.get("pdf_url") or "-"
+        sources.append(f"{item.get('date')}: {title} ({pdf})")
+    if not sources:
+        sources.append("analyze_company.quote")
+    sources.append(f"price_history.regime={f.regime or '-'}")
+    if f.ff_available:
+        def _fmt(v: float | None) -> str:
+            return "-" if v is None else f"{v:+.2f}yi"
+        sources.append(
+            f"fund_flow.regime={f.ff_regime} "
+            f"(1d={_fmt(f.ff_1d)}, 3d={_fmt(f.ff_3d)}, 5d={_fmt(f.ff_5d)}, 20d={_fmt(f.ff_20d)})"
+        )
+    if f.market_regime is not None:
+        sources.append(f"market_regime={f.market_regime}")
+    return sources
+
+
+# ── 主入口（调度器）──────────────────────────────────────────────
+
 def _decision_from_analysis(
     snapshot: dict | None,
     analysis: dict,
@@ -81,150 +335,42 @@ def _decision_from_analysis(
     market_regime: str | None = None,
 ) -> dict:
     """市场风险偏好软联动（``market_regime``）规则：
-    - RISK_OFF：自选侧 buy 候选自动降为 focus；持仓侧 hold 仅加风险提示，
-      不强制降仓；已经在 trim / sell 的 confidence + 0.05。
+    - RISK_OFF：自选侧 buy 候选自动降为 focus（在 ``_evaluate_self_select_buy`` 内处理）；
+      持仓侧 hold 仅加风险提示，不强制降仓；已经在 trim / sell 的 confidence + 0.05。
     - RISK_ON：在 reasons 头部加一句宏观正向提示，但不会主动加仓 / 升档。
     - NEUTRAL / 缺数据：完全不影响 action。
     """
-    quote = analysis.get("quote") or {}
-    announcements = analysis.get("announcements") or []
-    price_history = analysis.get("price_history") or {}
-    fund_flow = analysis.get("fund_flow") or {}
-    current = quote.get("current")
-    change_pct = quote.get("percent")
-    regime = price_history.get("regime")
-    titles = [item.get("title", "") for item in announcements]
-    risk_hits = sum(1 for title in titles if any(k in title for k in RISK_KEYWORDS))
-    positive_hits = sum(1 for title in titles if any(k in title for k in POSITIVE_KEYWORDS))
+    f = _extract_features(snapshot, analysis, capital_total, market_regime)
 
-    # 主力资金流（fund_flow.error 时视为缺失，逻辑全跳过）
-    ff_available = bool(fund_flow) and not fund_flow.get("error") and fund_flow.get("today") is not None
-    ff_regime = fund_flow.get("regime") if ff_available else None
-    ff_reversal = fund_flow.get("reversal") if ff_available else None
-    ff_1d = ((fund_flow.get("rolling") or {}).get("1d") or {}).get("main_yi") if ff_available else None
-    ff_3d = ((fund_flow.get("rolling") or {}).get("3d") or {}).get("main_yi") if ff_available else None
-    ff_5d = ((fund_flow.get("rolling") or {}).get("5d") or {}).get("main_yi") if ff_available else None
-    ff_20d = ((fund_flow.get("rolling") or {}).get("20d") or {}).get("main_yi") if ff_available else None
+    # 1. 各维度信号收集（只贡献 reasons / risks 文案，不触发 action）
+    reasons: list[str] = []
+    risks: list[str] = []
+    for collector in _SIGNAL_COLLECTORS:
+        r, k = collector(f)
+        reasons.extend(r)
+        risks.extend(k)
 
-    qty = Decimal(snapshot["qty"]) if snapshot else Decimal("0")
-    avg_cost = to_decimal(snapshot["avg_cost_price"], "avg_cost_price") if snapshot else Decimal("0")
-    position_value_cny = to_decimal(snapshot["position_value_cny"] or "0", "position_value_cny") if snapshot else Decimal("0")
-    weight_pct = Decimal("0")
-    if capital_total > 0 and position_value_cny > 0:
-        weight_pct = q_money(position_value_cny / capital_total * Decimal("100"))
-
-    action = "watch"
-    confidence = Decimal("0.55")
-    reasons = []
-    risks = []
-
-    # 大盘 regime 提示（在所有个股信号之前，作为宏观背景）
-    if market_regime == MARKET_REGIME_RISK_OFF:
-        risks.append("所属市场大盘 RISK_OFF，整体风险偏好低，宏观防御为主")
-    elif market_regime == MARKET_REGIME_RISK_ON:
-        reasons.append("所属市场大盘 RISK_ON，整体风险偏好高，但不据此主动加仓")
-
-    if regime in LOW_REGIMES:
-        risks.append("价格处于破位或创新低区间")
-    if regime in HIGH_REGIMES:
-        reasons.append("价格处于强势区间或突破状态")
-    if risk_hits:
-        risks.append(f"近期待公告标题中命中 {risk_hits} 个风险关键词")
-    if positive_hits:
-        reasons.append(f"近期待公告标题中命中 {positive_hits} 个正向关键词")
-
-    # —— 主力资金流 reasons / risks 提示（不影响 action 时也要出现在解释中）—— #
-    if ff_available:
-        if ff_regime == FUND_PERSISTENT_INFLOW:
-            reasons.append(f"主力 20 日持续净流入 {ff_20d:+.2f} 亿")
-        elif ff_regime == FUND_PERSISTENT_OUTFLOW:
-            risks.append(f"主力 20 日持续净流出 {ff_20d:+.2f} 亿")
-        if ff_reversal == FUND_REVERSAL_DOWN:
-            risks.append("近 5 日主力资金由流入转为流出，趋势可能在切换")
-        elif ff_reversal == FUND_REVERSAL_UP:
-            reasons.append("近 5 日主力资金由流出转为流入，下跌动能在衰竭")
-
-    if qty > 0:
-        action = "hold"
-        if risk_hits >= 2 or regime in LOW_REGIMES:
-            action = "trim" if qty > 0 else "avoid"
-            confidence = Decimal("0.72")
-        # 主力资金分层使用：
-        # - 20d 定背景（偏强/偏弱）
-        # - 5d/3d 定动作（是否真的要减仓/回避）
-        # - 1d 只做提示，不单独触发动作
-        if ff_regime == FUND_PERSISTENT_OUTFLOW:
-            if regime in LOW_REGIMES and _ff_negative(ff_5d):
-                action = "sell"
-                confidence = max(confidence, Decimal("0.78"))
-                reasons.append("20 日资金背景偏弱，且近 5 日继续流出并叠加价格破位，建议优先退出")
-            elif action == "hold" and _ff_negative(ff_5d) and _ff_negative(ff_3d):
-                action = "trim"
-                confidence = max(confidence, Decimal("0.65"))
-                reasons.append("20 日资金背景偏弱，且近 5/3 日继续流出，建议先减仓")
-        if current is not None and avg_cost > 0:
-            cur_price = to_decimal(current, "current")
-            if cur_price < avg_cost * Decimal("0.92") and risk_hits:
-                action = "sell"
-                confidence = Decimal("0.78")
-                reasons.append("现价明显低于持仓成本且伴随风险公告")
-            elif weight_pct > max_single_pct and cur_price > avg_cost:
-                action = "trim"
-                confidence = Decimal("0.70")
-                reasons.append("当前仓位超过单票上限且已有浮盈")
+    # 2. 决策分支：持仓侧 vs 自选侧
+    if f.qty > 0:
+        action, confidence, more_reasons = _decide_for_holding(f, max_single_pct)
+        reasons.extend(more_reasons)
         if action == "hold" and not reasons:
             reasons.append("当前没有触发明显的减仓或卖出信号")
     else:
-        action = "watch"
-        if risk_hits >= 2 or regime in LOW_REGIMES:
-            action = "avoid"
-            confidence = Decimal("0.72")
-        elif ff_regime == FUND_PERSISTENT_OUTFLOW and _ff_negative(ff_5d) and _ff_negative(ff_3d):
-            # 自选：20 日资金背景偏弱，且近 5/3 日继续流出，才直接回避
-            action = "avoid"
-            confidence = Decimal("0.68")
-        elif (buy_eval := _evaluate_self_select_buy(
-            regime, risk_hits, positive_hits, change_pct,
-            ff_regime, ff_3d, ff_5d, ff_reversal, market_regime,
-        )) is not None:
-            action, confidence, buy_reason = buy_eval
-            reasons.append(buy_reason)
-        elif positive_hits > risk_hits and regime not in LOW_REGIMES:
-            action = "focus"
-            confidence = Decimal("0.62")
-            reasons.append("正向信号多于风险信号，优先纳入重点盯盘")
-            if regime not in HIGH_REGIMES:
-                risks.append("价格结构尚未达到强趋势买入候选条件")
-            if _is_extended_intraday_gain(change_pct):
-                risks.append("当日涨幅较高，次日不宜直接追高")
-        else:
-            reasons.append("建议继续跟踪，等待更清晰的触发条件")
+        action, confidence, more_reasons, more_risks = _decide_for_watching(f)
+        reasons.extend(more_reasons)
+        risks.extend(more_risks)
 
-    # 大盘 RISK_OFF 时给 trim / sell 升一点 confidence（已经在线上的防御动作得到宏观背书）
-    if market_regime == MARKET_REGIME_RISK_OFF and action in ("trim", "sell"):
+    # 3. RISK_OFF 给 trim / sell 升一点 confidence（防御动作得到宏观背书）
+    if f.market_regime == MARKET_REGIME_RISK_OFF and action in ("trim", "sell"):
         confidence = min(Decimal("0.95"), confidence + Decimal("0.05"))
 
-    if not reasons and current is not None:
-        reasons.append(f"最新价为 {current}")
+    # 4. fallback
+    if not reasons and f.current is not None:
+        reasons.append(f"最新价为 {f.current}")
 
-    sources = []
-    for item in announcements[:3]:
-        title = item.get("title") or "公告"
-        pdf = item.get("pdf_url") or "-"
-        sources.append(f"{item.get('date')}: {title} ({pdf})")
-    if not sources:
-        sources.append("analyze_company.quote")
-    sources.append(f"price_history.regime={regime or '-'}")
-    if ff_available:
-        ff_1d_str = "-" if ff_1d is None else f"{ff_1d:+.2f}yi"
-        ff_3d_str = "-" if ff_3d is None else f"{ff_3d:+.2f}yi"
-        ff_5d_str = "-" if ff_5d is None else f"{ff_5d:+.2f}yi"
-        ff_20d_str = "-" if ff_20d is None else f"{ff_20d:+.2f}yi"
-        sources.append(
-            f"fund_flow.regime={ff_regime} (1d={ff_1d_str}, 3d={ff_3d_str}, 5d={ff_5d_str}, 20d={ff_20d_str})"
-        )
-    if market_regime is not None:
-        sources.append(f"market_regime={market_regime}")
+    # 5. 审计 sources
+    sources = _build_sources(analysis, f)
 
     return {
         "action": action,
@@ -234,7 +380,7 @@ def _decision_from_analysis(
         "reasoning": reasons,
         "risks": risks,
         "sources": sources,
-        "weight_pct": decimal_str(weight_pct),
+        "weight_pct": decimal_str(f.weight_pct),
     }
 
 

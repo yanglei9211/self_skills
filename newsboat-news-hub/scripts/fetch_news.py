@@ -538,7 +538,9 @@ def dedup_and_categorize(all_items, max_per_cat=8):
         title = item["title"]
         if not title or len(title) < 10:
             continue
-        key = re.sub(r"[^a-zA-Z0-9]", "", title.lower())[:60]
+        # 去重 key：保留 unicode 字母/数字（含中日韩文字），仅剥离空白与标点。
+        # 之前用 [^a-zA-Z0-9] 会把中文标题全部剥光，导致所有中文新闻被误判为同一条。
+        key = re.sub(r"[\W_]+", "", title.lower(), flags=re.UNICODE)[:60]
         if key in seen:
             continue
         seen.add(key)

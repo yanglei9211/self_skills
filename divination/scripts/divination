@@ -20,6 +20,17 @@ if SCRIPT_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
+# 当前数据库**只承载只读经典数据**（周易 / 推背图 / 穷通宝鉴 / 滴天髓 / 子平真诠
+# 以及干支五行查找表），所以 schema 跳版本时直接 drop + 重建零成本。
+#
+# ⚠️ 未来扩展提醒：如果要加"我的占卜记录 / 八字收藏 / 用户标注"等用户数据表，
+#    必须把那些表跟经典数据表分开管理：
+#      - 经典数据表（trigrams/hexagrams/qiongtong/classics/fts_all/...）：
+#        仍可走当前的 drop+recreate 策略，因为它们随脚本一起发版、可重建。
+#      - 用户数据表（user_*）：
+#        改为 ALTER TABLE / 增量 migration 路径，绝不能因为升级 schema 删全库。
+#    一个推荐的过渡步骤：把 user_* 拆到一个独立的 sqlite 文件（如 user.db），
+#    经典数据保留在 divination.db，物理隔离避免误删。
 
 def _get_db_version(conn):
     try:
@@ -34,6 +45,8 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     if need_init or _get_db_version(conn) < DB_SCHEMA_VERSION:
         conn.close()
+        # 只读经典数据安全策略：直接删库重建。
+        # 若以后加入用户数据表，请在这里改为按表迁移，禁止整库 drop（见文件顶部注释）。
         if os.path.exists(DB_PATH):
             os.remove(DB_PATH)
         init_db()

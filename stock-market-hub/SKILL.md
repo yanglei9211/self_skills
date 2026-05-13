@@ -17,10 +17,10 @@ description: >-
 ## 0. 安装与依赖
 
 ```bash
-# Python 依赖
-cd /Users/dp/Documents/local2/self_skills
+# Python 依赖（推荐：用仓库根目录 self_skills/.venv 同时服务两个股票 skill）
+cd "$SELF_SKILLS_HOME"     # 或者你 clone 仓库的根目录
 python3 -m venv .venv
-.venv/bin/pip install akshare pdfplumber curl_cffi pandas lxml pytesseract pdf2image
+.venv/bin/pip install -r requirements.txt
 
 # 系统依赖（用于港股年报 OCR fallback）
 brew install tesseract tesseract-lang poppler
@@ -30,16 +30,29 @@ export SEC_USER_AGENT="your-name your-email@example.com"
 
 # 可选：雪球登录 cookie（启用热门帖 / 个股新闻流）
 mkdir -p ~/.config/stock-market-hub
-cat data/xueqiu.cookie.example
-# 按说明复制粘贴你浏览器的雪球 cookie 到 ~/.config/stock-market-hub/xueqiu.cookie
+# 把浏览器登录后的雪球 cookie 字符串写到 ~/.config/stock-market-hub/xueqiu.cookie
 ```
 
 ## 0.1 统一 CLI 入口（推荐）
 
-所有功能都可以通过 `bin/smh` 调用：
+所有功能都可以通过 `bin/smh` 调用。多机部署请用下面任一方式定位入口，**不要写死绝对路径**：
 
 ```bash
-SMH=/Users/dp/Documents/local2/self_skills/stock-market-hub/bin/smh
+# 方式 A：通过 Cursor / Claude skills 软链入口（推荐）
+SMH=$(python3 -c "import os; print(os.path.realpath(os.path.expanduser('~/.cursor/skills/stock-market-hub/bin/smh')))")
+# Claude 用户把 ~/.cursor 换成 ~/.claude 即可
+
+# 方式 B：已经 cd 到仓库根目录
+SMH=./stock-market-hub/bin/smh
+
+# 方式 C：用环境变量指向仓库根
+export SELF_SKILLS_HOME=/path/to/self_skills
+SMH="$SELF_SKILLS_HOME/stock-market-hub/bin/smh"
+```
+
+下面示例都假设 `$SMH` 已设好：
+
+```bash
 
 # 公司深度卡片
 $SMH company SZ300750               # A 股
@@ -71,10 +84,10 @@ $SMH cache stats
 $SMH cache clear --prefix kline
 ```
 
-直接调脚本也可以（每个脚本独立 `argparse --help`）：
+直接调脚本也可以（每个脚本独立 `argparse --help`）。venv 解释器走仓库根目录：
 
 ```bash
-VPY=/Users/dp/Documents/local2/self_skills/.venv/bin/python3
+VPY="$SELF_SKILLS_HOME/.venv/bin/python3"   # 或：./.venv/bin/python3
 $VPY scripts/analyze_company.py --symbol SZ300750 --with-peers
 ```
 
@@ -197,157 +210,45 @@ $VPY scripts/analyze_company.py --symbol SZ300750 --deep
 {同板块 5 家公司的 PE/PB/营收增速/净利润增速对比}
 ```
 
-## 3. Agent 行为约束
+## 3. Agent 行为约束（核心摘要）
+
+> 📜 **完整行为约束、反例 / 正例、强制工作流见 [references/agent-constraints.md](references/agent-constraints.md)。**
+> 任何涉及个股归因、技术位、主力资金、大盘 regime、财务数字、产品时间线、宏观数据
+> 的具体分析**必须**先读那份文件。本节只列出最关键的索引，避免在主 SKILL.md 里
+> 反复加载完整 prompt。
 
 ### 输出语言
+
 - **默认中文输出**，公司名 / 人名 / 产品名保留英文（Tencent / NVIDIA / GPT-5 等）
 - **每条数据都要给来源链接**（巨潮公告 PDF / 披露易公告 / 雪球行情 / 财联社电报）
 
-### 🔴 核心约束：充分利用已配置的工具，所有结论必须有数据溯源
+### 六条核心硬约束（一句话索引）
 
-本 skill 已配置了大量数据源（财联社、披露易公告、巨潮、雪球 K 线、年报 PDF 解析、SEC EDGAR 等）。
-**既然工具已经配好，就必须充分使用，不得用训练集里的记忆代替真实抓取。**
+1. **数据溯源** —— 每个事实都要说得清来源（哪条接口 / 哪个 PDF 第几页）；
+   不得用训练集记忆代替真实抓取。详见 [constraints §0–§1](references/agent-constraints.md)。
+2. **技术分析必须基于 K 线** —— `price_history.regime / thresholds / yearly`
+   没看过不准写"支撑位 / 压力位 / 破位 / 历史区间"。详见 [constraints §2](references/agent-constraints.md)。
+3. **主力资金必须基于 fflow** —— `fund_flow.regime + reversal + rolling + 当日机构档位`
+   没列出就不能写"持续流入 / 持续流出 / 机构进出"。详见 [constraints §3](references/agent-constraints.md)。
+4. **大盘判断必须分 A 股 / 港股** —— 用 `smh regime` 的 `market_regime`；
+   禁止跨市场套用，禁止凭"看着挺红"直觉。详见 [constraints §4](references/agent-constraints.md)。
+5. **格式硬约束** —— 中文 + 标准 Markdown + 末尾必带"数据覆盖说明"。详见 [constraints §5](references/agent-constraints.md)。
+6. **不要做的事** —— 不用付费源假数据、不把雪球关注度当机构观点、不预测未来股价、
+   不主动建议买卖、不凭印象写时间点 / 价格 / 宏观数据。详见 [constraints §6](references/agent-constraints.md)。
 
-**核心原则：每一个写进分析的事实，都必须能说出来源是哪条数据/哪个接口/哪个 PDF 第几页。**
+### 分析前的强制工作流
 
-#### 违规场景（必须避免，均来自 2026-04-30 实战翻车记录）
-
-| 违规行为 | 具体案例 | 正确做法 |
-|---|---|---|
-| 凭记忆写产品发布时间 | 写"6-7 月 YU7 发布（最大催化剂）"，但年报已明确 YU7 已连续销售 7 个月 | **先读年报/公告 PDF**，再说产品时间线 |
-| 凭记忆写价格区间 | 写"HK$ 28（年内多次震荡的支撑位）"，实际 28 是今天才第一次跌破 | **先调 `price_history.thresholds`**，再说价位 |
-| 归因错误（事实方向反了）| 写"原油涨价→小米上游成本压力"，实际原油涨价对电动车是利好 | 先把因果链想清楚，有疑问的不写 |
-| 混淆两份文件 | 把"全年業績公告（3-24）"和"年度報告（4-28）"当同一件事 | 公告标题+日期都要核实 |
-| 未抓取就推断 | 在没有读年报的情况下写"业绩消化期是下跌原因" | 先用 `pdf_extract.py` 读原文，再分析 |
-
-#### 强制工作流：分析前必须做的动作
-
-在写任何归因 / 时间节点 / 产品线信息之前，**必须按优先级依次执行**：
+写任何归因 / 时间节点 / 产品线信息**之前**，按顺序执行：
 
 ```
-1. fetch_announcements → 看最近公告标题 + 日期，确认事件时间线
-2. pdf_extract（业绩公告）→ 从原文抽取数字，不从脑子里"记"
-3. fetch_market_news → 确认今日宏观新闻，对每条因果逻辑给出新闻链接
-4. price_history（K 线） → 所有价位描述必须基于此，不基于感觉
-5. analyze_company → 整合上述，产出卡片
+1. fetch_announcements  → 公告时间线
+2. pdf_extract          → 从原文抽数字
+3. fetch_market_news    → 当日宏观新闻 + 因果链来源
+4. analyze_company      → price_history + fund_flow 一站式
+5. smh regime           → A 股 / 港股各自的大盘背景
 ```
 
-**如果没有运行上述工具就直接开始写分析 → 违规**。
-
-#### 数据溯源格式（每条关键结论后面必须标注来源）
-
-```
-✅ 正确：
-"YU7 已于 2025 年 7 月上市，截至 2026 年 2 月连续 7 个月中大型 SUV 销量第一
-（来源：全年業績公告 p.7，2026-03-24，URL: hkexnews...）"
-
-❌ 违规：
-"6-7 月 YU7 正式发布（市场预期）🔴 最大催化剂"
-↑ 没有来源、与公告原文矛盾、方向完全错误
-```
-
-#### "我不确定"优于"凭印象填空"
-
-- 如果某个信息（如下一款新车型的时间表）在已拿到的数据里找不到 → **明确说"当前没有公告确认"**，不要猜
-- 如果某个宏观数据（如原油价格）拿不到实时数字 → **先跑 `fetch_market_news` 找对应新闻**，或明确标注"无法核实，暂不引用"
-
-### 数据准确性硬约束
-
-1. **任何财务数字必须从抓取的原始 JSON / PDF 中取**，不要"凭印象"或"约等于"
-2. **如果某个数据源失败**（stderr 有 FAIL 提示），必须在汇总末尾的"数据覆盖说明"小节里告诉用户哪些维度缺失，**不要假装数据完整**
-3. **公告链接**必须用真实抓到的 PDF URL，不要用首页 URL 或 `...` 省略号代替
-4. **股价/财报时点**：必须明确写出"截至 YYYY-MM-DD HH:MM (CST)"，不要含糊"目前"
-5. **宏观数据（汇率/大宗商品价格）**：必须从 `fetch_market_news` 实际抓到的新闻里引用，并附上财联社/CNBC 等来源链接。没有实时数据不得引用。
-
-### ⚠️ 技术分析硬约束（K 线驱动，禁止凭印象）
-
-任何涉及"支撑位/压力位/破位/历史区间"的判断，**必须**：
-
-1. **必须先调用 `analyze_company.py`** 拿到 `price_history` 字段（包含 YTD 高低/52w 高低/历史最高最低/历年高低段/关键价位倒查/regime/breakout）
-2. **任何"X 港元/X 元"作为支撑位/压力位的描述，必须给出"上一次盘中触及该价位的日期"作为证据**——这个日期来自 `price_history.thresholds[].last_touched_below`，**不要自己脑补**
-3. **regime 字段决定语境**：
-   - `NEW_YTD_LOW / NEW_52W_LOW / NEW_ALL_TIME_LOW` → 必须用"破位下行 / 创新低"，**不能**说"在支撑位震荡"
-   - `NEW_YTD_HIGH / NEW_52W_HIGH / NEW_ALL_TIME_HIGH` → 必须用"突破/创新高"
-   - `NEAR_YTD_HIGH / NEAR_YTD_LOW` → 用"接近年内高/低位"
-4. **历年高低段必须列出原始数据**（取自 `price_history.yearly`），让读者自己验证
-5. **如果 K 线数据获取失败**（`price_history.error` 存在或为空），**必须明确告诉用户"无 K 线数据，无法做技术分析"**，禁止继续编写技术段落
-
-**反例**（4-30 已发生的真实翻车）：
-> 技术位：HK$ 28（年内多次震荡的支撑位）。
-
-**正例**：
-> 截至 2026-04-30，小米港股盘中触及 HK$ 28.80，**创 2026 年新低 + 52 周新低**（regime=NEW_YTD_LOW）。
-> 上一次盘中跌到 HK$ 28 是 **2024-12-02**（514 天前），意味着今天突破了过去 1 年半的运行区间，
-> 技术上属**破位下行**而非支撑位震荡。
-
-
-
-### ⚠️ 主力资金硬约束（fflow 驱动，禁止凭印象）
-
-任何涉及"主力流入/流出/资金抢筹/资金撤离/机构进出"的判断，**必须**基于 `analyze_company.py` 输出里的 `fund_flow` 字段（数据源：东方财富 push2his fflow daykline，约 120 个交易日，**A 股沪深 + 港股**）：
-
-1. **必须列出 `rolling` 表**：1d / 5d / 10d / 20d 的主力累计净额（亿）+ 净流入天数 / 流出天数。不能只丢一个"今日主力净流出 X 亿"的孤立数字
-2. **必须用 `regime` 字段定语境**：
-   - `PERSISTENT_INFLOW`（20 日累计为正 + 流入天数 ≥ 12）→ 用"主力**持续净流入**"
-   - `PERSISTENT_OUTFLOW`（20 日累计为负 + 流出天数 ≥ 12）→ 用"主力**持续净流出**"
-   - `OSCILLATING` → 用"震荡 / 进出反复"，**不要**用"持续 X"措辞
-3. **`reversal` 字段必须明确提示转向**：
-   - `INFLOW_TO_OUTFLOW`（近 5 日反向流出）→ 必须写"近 5 日资金转向流出，趋势可能正在切换"
-   - `OUTFLOW_TO_INFLOW`（近 5 日反向流入）→ 必须写"近 5 日资金转向流入，下跌动能可能在衰竭"
-4. **当日描述必须给出"机构档位"**（超大单 + 大单的净额与占比），不能只说总主力数字。例：「今日主力净流出 11 亿，**其中超大单 -7 亿、大单 -4 亿**，机构在抛货，散户（中小单）在接」
-5. **港股**：必须加注「港股资金分级为东财根据成交单笔大小推算，仅供参考」字样
-6. **北交所 / 美股 / 缺失**：`fund_flow` 字段为空或带 `error` 时，**直接说"无主力资金流数据，本节略过"**，禁止杜撰
-
-**反例**：
-> 主力资金近期持续撤离这只股票。
-
-**正例**：
-> 截至 2026-05-11，宁德时代（SZ300750）`fund_flow.regime=PERSISTENT_INFLOW`：20 日主力累计净流入 +23.65 亿（流入 12 天 / 流出 8 天）。
-> 但 `reversal=INFLOW_TO_OUTFLOW`：近 5 日主力反向净流出，**说明此前的多头资金正在退潮**，需要关注趋势是否切换。
-> 当日主力净流入 +7.25 亿，**其中超大单 +5.1 亿，大单 +2.1 亿**，仍是机构主导买入。
-
-
-
-### ⚠️ 大盘风险偏好硬约束（A 股 / 港股 regime）
-
-任何涉及「大盘走强 / 走弱 / 风险偏好上升 / 下降 / 整体风险」的判断，**必须**基于 `smh regime` 输出的 `market_regime` 字段，而**不是**凭"今天大盘看着挺红"这种直觉：
-
-1. **必须分别评估 A 股与港股**（两个市场常常分化）：
-   - A 股代表指数：沪深300（`sh000300`）+ 创业板指（`sz399006`）
-   - 港股代表指数：恒生（`hkHSI`）+ 恒生科技（`hkHSTECH`）
-2. **regime 三档定语境**（仅看「距 52w 高位置」+「是否站上 200MA 年线」两个维度，越简单越稳）：
-   - `RISK_OFF`：任一代表指数 距 52w 高 ≤ -15% **且**跌破年线 → 用「大盘进入避险区间」
-   - `RISK_ON` ：所有代表指数 距 52w 高 ≥ -3% **且**站上年线 → 用「大盘强势 / 高位」
-   - `NEUTRAL` ：其他一切情形 → 用「大盘震荡 / 区间内运行」
-3. **报告里必须列出每个代表指数的具体读数**：当日收盘 + 距 52w 高 % + YTD % + MA200 偏离 %，禁止只丢一个 `RISK_OFF` 标签
-4. **禁止跨市场套用**：不要把 A 股 RISK_ON 套到港股标的上反之亦然
-5. **缺数据**：`indices[].error` 存在或拉空时，明确说"指数 K 线获取失败，本节略过大盘判断"，不要瞎编
-
-**反例**：
-> 大盘最近行情还可以，对持仓有支撑。
-
-**正例**：
-> 截至 2026-05-13：
-> - **A 股 RISK_ON**：沪深300 距 52w 高 -0.39%、创业板指 距 52w 高 -0.21%，均站上年线（MA200 偏离 +8.7% / +26.9%）。两个代表指数均在年内高位附近，宏观风险偏好高
-> - **港股 RISK_OFF**：恒生 距 52w 高 -6.31%（站上年线），但**恒生科技 距 52w 高 -24.9% 且跌破年线**（close 5043 < MA200 5544），触发 RISK_OFF
-> - 操作含义：A 股自选侧仍可用严格 buy 候选；**港股自选侧 buy 候选自动降级为 focus**，等大盘修复再考虑新买入
-
-
-
-### 输出格式硬约束（参考 newsboat-news-hub）
-- 标题用 `# / ## / ###`
-- 列表用 `-` 或 `1.`
-- 财务表格用 Markdown 表格
-- 链接用 `[文字](url)` 完整格式
-- 末尾追加"数据覆盖说明"，列出脚本 stderr 的统计
-
-### 不要做的事
-1. **不要**使用付费源（Wind / iFinD）的"假装数据"——本 skill 完全免费源驱动
-2. **不要**把雪球关注度数字当作"机构看好"——这是散户情绪指标，要标明
-3. **不要**对未来股价做预测，可以引用券商研报观点但要注明来源和日期
-4. **不要**主动建议买卖——本 skill 是信息整合工具，不是投资建议
-5. **不要**在没有数据来源的情况下写出具体时间节点（如"X 月发布"）、具体价格（如"X 元是支撑位"）、宏观数据（如"原油 X 美元"）——必须先用工具确认，无来源就明说"暂无数据"
-6. **不要**在已有 PDF / 公告可以查的情况下凭记忆写公司的产品线、发布时间、财务数字——凡公告/年报/财报能查到的，必须查，不能估
+跳过这些步骤直接开写就违规。
 
 ## 4. 限频与稳定性
 

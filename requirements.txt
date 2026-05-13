@@ -20,3 +20,22 @@ python-docx>=1.0.0
 
 # ---- newsboat-news-hub / fetch_news.py ----
 # 仅使用 Python 3.8+ 标准库，无第三方依赖
+
+# ---- stock-market-hub/** + stock-portfolio-copilot/**（通过 shared/stock_core 复用）----
+# 行情 / 财报 / 板块 / 公告 / K 线 / 主力资金等几乎所有抓取脚本都依赖这一组：
+#   akshare       —— 板块成分 / 财务数据 / 概念库
+#   pdfplumber    —— 巨潮 / 披露易 PDF 公告抽取
+#   curl_cffi     —— Chrome TLS 指纹，绕开新浪 / 雪球 / 同花顺反爬（shared/stock_core/http.py 强依赖）
+#   pandas        —— akshare 返回 DataFrame；K 线 / 历年高低段计算
+#   lxml          —— 新浪 corp 页 / 东财 emweb / 同花顺 HTML 解析
+akshare>=1.13
+pdfplumber>=0.10
+curl_cffi>=0.6
+pandas>=2.0
+lxml>=5.0
+
+# 港股年报 OCR fallback（可选，仅当遇到 CID 编码乱码 PDF 时需要）
+# 系统层另需：brew install tesseract tesseract-lang poppler  (macOS)
+#             sudo apt install tesseract-ocr poppler-utils  (Debian/Ubuntu)
+pytesseract>=0.3
+pdf2image>=1.16

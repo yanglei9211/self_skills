@@ -45,9 +45,24 @@ CACHE_DIR = Path(os.environ.get(
 DISABLED = os.environ.get("STOCK_HUB_CACHE_DISABLE") == "1"
 
 
-def _make_key(func_name: str, args: tuple, kwargs: dict, key_prefix: str) -> str:
-    """对 (函数名, 参数) 做稳定 hash 作为缓存 key。"""
-    sig = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str)
+def _make_key(
+    func_name: str,
+    args: tuple,
+    kwargs: dict,
+    key_prefix: str,
+    schema_version: int = 1,
+) -> str:
+    """对 (函数名, 参数, schema_version) 做稳定 hash 作为缓存 key。
+
+    schema_version 参与 hash：调用方在数据源 schema 变化时（比如雪球新加字段、
+    SEC EDGAR 调整返回结构）只需把版本号 +1，旧缓存就会自然失效，不需要手动
+    `smh cache clear --prefix xxx`。版本号本身不直接写进文件名，保持 prefix 干净。
+    """
+    sig = json.dumps(
+        {"args": args, "kwargs": kwargs, "_schema": schema_version},
+        sort_keys=True,
+        default=str,
+    )
     h = hashlib.sha256(sig.encode()).hexdigest()[:16]
     prefix = f"{key_prefix}_" if key_prefix else ""
     return f"{prefix}{func_name}_{h}"
@@ -87,6 +102,7 @@ def cached(
     ttl: float | Callable[..., float] = 3600,
     key_prefix: str = "",
     skip_if: Callable[[Any], bool] | None = None,
+    schema_version: int = 1,
 ):
     """缓存装饰器。
 
@@ -96,6 +112,11 @@ def cached(
              动态计算 TTL。典型用途：盘中 60s / 盘后 4h（按 market 区分）。
         key_prefix: 缓存 key 前缀（便于按业务清理）。
         skip_if: 函数 (result) -> bool；为 True 时不写缓存（如返回空 list 时不缓存）。
+        schema_version: 返回值 schema 版本号，参与缓存 key 哈希。当上游 API
+            字段调整或解析逻辑变化导致 schema 不兼容时把它 +1，旧缓存自动失效，
+            避免线上读到旧 schema 拿不到字段。约定：
+              - 1: 初始版本（默认）
+              - 2/3/...：每次破坏性 schema 调整后递增
 
     默认 skip_if：返回 None / [] / {} / "" 时不写缓存。
     """
@@ -108,7 +129,7 @@ def cached(
             if DISABLED:
                 return func(*args, **kwargs)
 
-            key = _make_key(func.__name__, args, kwargs, key_prefix)
+            key = _make_key(func.__name__, args, kwargs, key_prefix, schema_version)
             p = _path(key)
 
             # 尝试读缓存
@@ -147,6 +168,7 @@ def cached(
 
         wrapper._cache_func_name = func.__name__  # type: ignore
         wrapper._cache_ttl = ttl  # type: ignore
+        wrapper._cache_schema_version = schema_version  # type: ignore
         return wrapper
 
     return decorator

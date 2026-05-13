@@ -41,12 +41,15 @@ from pathlib import Path
 
 
 def _ensure_hub_scripts_path() -> None:
-    """让本模块能 ``from fetch_announcements import ...`` / ``from supply_chain import ...``。
+    """让本模块在需要时能 ``from supply_chain import get_peers_from_concept``。
 
-    这两个脚本仍住在 ``stock-market-hub/scripts/`` 下，shared 层暂未把它们抽过来；
-    所以共享层调用业务脚本时，需要把 hub scripts 路径加进 ``sys.path``。
-    底层基础设施（http/xueqiu/cache/kline/sec_edgar）已经搬到 ``shared/stock_core/``，
-    所以这里**只**为 import hub 业务脚本服务。
+    历史包袱：`supply_chain.get_peers_from_concept` 内部跟 `scan_sector` 私有函数
+    （`code_to_xueqiu` / `_get_board_constituents_em` / `_format_peers`）耦合，
+    现阶段保留在 ``stock-market-hub/scripts/`` 下，shared 层暂未拆。等 supply_chain
+    重构时一并搬过来，这个 sys.path 注入就可以删了。
+
+    底层基础设施（announcements / http / xueqiu / cache / kline / sec_edgar / ...）
+    已经全部搬到 ``shared/stock_core/``，无需再走 hub scripts 路径。
     """
     current = Path(__file__).resolve()
     repo_root = current.parents[2]
@@ -57,6 +60,11 @@ def _ensure_hub_scripts_path() -> None:
 
 _ensure_hub_scripts_path()
 
+from stock_core.announcements import (
+    cninfo_announcements,
+    hkex_announcements,
+    _parse_a_share_symbol,
+)
 from stock_core.cache import cached
 from stock_core.fund_flow import get_fund_flow_summary
 from stock_core.http import fetch
@@ -107,11 +115,19 @@ def get_quote(symbol: str, market: str, xq_sym: str) -> dict:
 # ============ 同业横向对比 ============ #
 
 def _get_peers(xq_sym: str, top: int = 8) -> list[dict]:
-    """同业（同概念）公司横向对比：含 PE/PB/ROE/营收增速 等。"""
+    """同业（同概念）公司横向对比：含 PE/PB/ROE/营收增速 等。
+
+    ⚠️ 历史包袱：``get_peers_from_concept`` 内部跟 hub 私有模块
+       （scan_sector.code_to_xueqiu / supply_chain._get_board_constituents_em / _format_peers）
+       耦合，暂不搬到 shared。这里通过 ``_ensure_hub_scripts_path`` 注入
+       hub scripts 路径后 try-import，拿不到就静默退化（peers 字段为空，
+       不会阻塞 analyze_company 主流程）。下一轮 supply_chain 重构时把
+       peers 抽到 shared/stock_core/peers.py，这段就可以删了。
+    """
     try:
         from supply_chain import get_peers_from_concept  # type: ignore
     except ImportError as e:
-        print(f"[peers] import failed: {e}", file=sys.stderr)
+        print(f"[peers] import failed (peers 字段将为空，不影响主分析): {e}", file=sys.stderr)
         return []
     try:
         return get_peers_from_concept(xq_sym, top=top)
@@ -473,17 +489,7 @@ def get_a_company_info_em(code: str) -> dict:
 # ============ 公告 ============ #
 
 def get_recent_announcements(market: str, code: str, xq_sym: str, days: int = 30, limit: int = 15) -> list[dict]:
-    """调用 fetch_announcements.py 的核心函数"""
-    try:
-        from fetch_announcements import (
-            cninfo_announcements,
-            hkex_announcements,
-            _parse_a_share_symbol,
-        )
-    except ImportError as e:
-        print(f"[announcements] import failed: {e}", file=sys.stderr)
-        return []
-
+    """统一公告入口：直接走 shared 层 announcements 模块（不再反向依赖 hub）。"""
     if market == "a":
         try:
             stock_code, column = _parse_a_share_symbol(xq_sym)
