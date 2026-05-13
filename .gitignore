@@ -58,5 +58,13 @@ cards/
 *.png
 !references/**/*.png
 
+# stock-portfolio-copilot/docs: 个股分析报告 / 持仓退出计划 / 多账户 spec 等
+# 含真实持仓 / 个股名 / 止损价等敏感信息，**永远不入库**
+stock-portfolio-copilot/docs/
+# 仓库根目录 / 任意子目录里 LLM 生成的 docx 产物（持仓分析等）
+*.docx
+!references/**/*.docx
+!**/agents/**/*.docx
+
 # ===== Playwright 浏览器缓存 =====
 .playwright/
