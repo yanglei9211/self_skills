@@ -11,6 +11,7 @@
   R6. 立案调查 / 风险提示公告（巨潮关键词搜索）
   R7. 退市预警：searchkey 包含 "终止上市" "退市风险警示"
   R8. 大股东高比例减持：searchkey "减持" 且时间窗口 7 天
+	  R9. 重大诉讼：searchkey "重大诉讼" 且时间窗口 30 天
 
 Usage:
   # 全市场扫描（默认走 R1+R2，最快）
@@ -185,7 +186,7 @@ def rule_announcement_keyword(keyword: str, days: int = 7) -> list[dict]:
     severity_map = {
         "立案调查": 5, "终止上市": 5, "退市": 5,
         "风险提示": 4, "实际控制人变更": 3,
-        "业绩预亏": 3, "商誉减值": 3, "减持": 2,
+        "业绩预亏": 3, "商誉减值": 3, "重大诉讼": 3, "减持": 2,
     }
     out = []
     for sym, item in by_stock.items():
@@ -206,6 +207,7 @@ RULES = {
     "R6": ("公告:立案调查", lambda m="": rule_announcement_keyword("立案调查", 30)),
     "R7": ("公告:退市风险警示", lambda m="": rule_announcement_keyword("终止上市", 30)),
     "R8": ("公告:风险提示", lambda m="": rule_announcement_keyword("风险提示", 14)),
+    "R9": ("公告:重大诉讼", lambda m="": rule_announcement_keyword("重大诉讼", 30)),
 }
 
 

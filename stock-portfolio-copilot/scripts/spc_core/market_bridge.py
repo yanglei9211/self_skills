@@ -8,6 +8,7 @@ from pathlib import Path
 # 注：``spc_core.utils`` 已经把 shared 路径加入 sys.path，所以这里可以直接 import。
 from spc_core.settings import get_setting
 from spc_core.utils import build_analysis_symbol, q_ratio
+from stock_core.market_regime import classify_market_regime
 from stock_core.stock_market_hub import analyze_symbol, fetch_market_board
 
 
@@ -56,6 +57,14 @@ class StockMarketHubProvider:
 
     def market_board(self, market: str = "all_a", board: str = "gainers", top: int = 10) -> dict:
         return fetch_market_board(market=market, board=board, top=top)
+
+    def get_market_regime(self, market: str) -> dict:
+        """评估指定市场（``a`` / ``hk``）的整体 regime（RISK_OFF/NEUTRAL/RISK_ON）。
+
+        失败时返回带 ``error`` 字段的占位字典；调用方应当只读 ``regime`` 字段就好，
+        看不到该字段时按 NEUTRAL 处理。
+        """
+        return classify_market_regime(market)
 
 
 class FXRateProvider:

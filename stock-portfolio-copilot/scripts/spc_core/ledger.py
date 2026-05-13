@@ -18,7 +18,7 @@ from spc_core.utils import (
 )
 
 
-def add_position_seed(conn, market: str, code: str, qty: str, cost: str, currency: str | None, time_text: str | None, note: str) -> None:
+def add_position_seed(conn, account_id: int, market: str, code: str, qty: str, cost: str, currency: str | None, time_text: str | None, note: str) -> None:
     ensure_defaults(conn)
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
@@ -28,10 +28,11 @@ def add_position_seed(conn, market: str, code: str, qty: str, cost: str, currenc
     now = utc_now_iso()
     conn.execute(
         """
-        INSERT INTO position_seed(market, code, qty, cost_price, currency, seed_time, note, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO position_seed(account_id, market, code, qty, cost_price, currency, seed_time, note, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            account_id,
             norm_market,
             norm_code,
             decimal_str(qty_d),
@@ -46,19 +47,19 @@ def add_position_seed(conn, market: str, code: str, qty: str, cost: str, currenc
     conn.commit()
 
 
-def list_position_seed(conn, market: str | None = None) -> list[dict]:
+def list_position_seed(conn, account_id: int, market: str | None = None) -> list[dict]:
     ensure_defaults(conn)
-    params = []
-    sql = "SELECT market, code, qty, cost_price, currency, seed_time, note FROM position_seed"
+    params = [account_id]
+    sql = "SELECT market, code, qty, cost_price, currency, seed_time, note FROM position_seed WHERE account_id = ?"
     if market:
-        sql += " WHERE market = ?"
+        sql += " AND market = ?"
         params.append(normalize_market(market))
     sql += " ORDER BY market, code"
     rows = conn.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
 
 
-def add_trade(conn, market: str, code: str, side: str, qty: str, price: str, time_text: str, currency: str | None, fx_rate: str | None, fee_commission: str | None, fee_platform: str | None, fee_transfer: str | None, tax_stamp: str | None, note: str) -> int:
+def add_trade(conn, account_id: int, market: str, code: str, side: str, qty: str, price: str, time_text: str, currency: str | None, fx_rate: str | None, fee_commission: str | None, fee_platform: str | None, fee_transfer: str | None, tax_stamp: str | None, note: str) -> int:
     ensure_defaults(conn)
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
@@ -73,12 +74,13 @@ def add_trade(conn, market: str, code: str, side: str, qty: str, price: str, tim
     cur = conn.execute(
         """
         INSERT INTO trade_ledger(
-          market, code, side, qty, price, currency, trade_time,
+          account_id, market, code, side, qty, price, currency, trade_time,
           fee_commission, fee_platform, fee_transfer, tax_stamp,
           fx_rate, note, is_deleted, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """,
         (
+            account_id,
             norm_market,
             norm_code,
             side_norm,
@@ -100,10 +102,10 @@ def add_trade(conn, market: str, code: str, side: str, qty: str, price: str, tim
     return int(cur.lastrowid)
 
 
-def list_trades(conn, market: str | None = None, code: str | None = None, include_deleted: bool = False) -> list[dict]:
+def list_trades(conn, account_id: int, market: str | None = None, code: str | None = None, include_deleted: bool = False) -> list[dict]:
     ensure_defaults(conn)
-    clauses = []
-    params = []
+    clauses = ["account_id = ?"]
+    params = [account_id]
     if market:
         norm_market = normalize_market(market)
         clauses.append("market = ?")
@@ -116,7 +118,7 @@ def list_trades(conn, market: str | None = None, code: str | None = None, includ
     if not include_deleted:
         clauses.append("is_deleted = 0")
     sql = """
-    SELECT id, market, code, side, qty, price, currency, trade_time, fee_commission,
+    SELECT id, account_id, market, code, side, qty, price, currency, trade_time, fee_commission,
            fee_platform, fee_transfer, tax_stamp, fx_rate, note, is_deleted
       FROM trade_ledger
     """
@@ -127,64 +129,71 @@ def list_trades(conn, market: str | None = None, code: str | None = None, includ
     return [dict(row) for row in rows]
 
 
-def delete_trade(conn, trade_id: int) -> None:
+def delete_trade(conn, account_id: int, trade_id: int) -> None:
     now = utc_now_iso()
     cur = conn.execute(
-        "UPDATE trade_ledger SET is_deleted = 1, updated_at = ? WHERE id = ? AND is_deleted = 0",
-        (now, trade_id),
+        "UPDATE trade_ledger SET is_deleted = 1, updated_at = ? WHERE id = ? AND account_id = ? AND is_deleted = 0",
+        (now, trade_id, account_id),
     )
     conn.commit()
     if cur.rowcount == 0:
-        raise ValueError(f"找不到可删除的 trade id={trade_id}")
+        raise ValueError(f"找不到可删除的 trade id={trade_id}（可能不属于该账户或已被删除）")
 
 
-def add_watch(conn, market: str, code: str, note: str) -> None:
+def add_watch(conn, account_id: int, market: str, code: str, note: str) -> None:
     ensure_defaults(conn)
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
     now = utc_now_iso()
     conn.execute(
         """
-        INSERT INTO watchlist(market, code, note, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?)
-        ON CONFLICT(market, code) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
+        INSERT INTO watchlist(account_id, market, code, note, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account_id, market, code) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
         """,
-        (norm_market, norm_code, note or "", now, now),
+        (account_id, norm_market, norm_code, note or "", now, now),
     )
     conn.commit()
 
 
-def delete_watch(conn, market: str, code: str) -> None:
+def delete_watch(conn, account_id: int, market: str, code: str) -> None:
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
-    cur = conn.execute("DELETE FROM watchlist WHERE market = ? AND code = ?", (norm_market, norm_code))
+    cur = conn.execute(
+        "DELETE FROM watchlist WHERE account_id = ? AND market = ? AND code = ?",
+        (account_id, norm_market, norm_code),
+    )
     conn.commit()
     if cur.rowcount == 0:
         raise ValueError(f"自选股不存在: {norm_market} {norm_code}")
 
 
-def list_watch(conn) -> list[dict]:
+def list_watch(conn, account_id: int) -> list[dict]:
     ensure_defaults(conn)
-    rows = conn.execute("SELECT market, code, note, created_at FROM watchlist ORDER BY market, code").fetchall()
+    rows = conn.execute(
+        "SELECT market, code, note, created_at FROM watchlist WHERE account_id = ? ORDER BY market, code",
+        (account_id,),
+    ).fetchall()
     return [dict(row) for row in rows]
 
 
-def save_analysis_run(conn, scope: str, market: str | None, code: str | None, payload: dict) -> int:
+def save_analysis_run(conn, account_id: int, scope: str, market: str | None, code: str | None, payload: dict) -> int:
     now = utc_now_iso()
     cur = conn.execute(
         """
-        INSERT INTO analysis_run(scope, market, code, run_time, payload_json)
-        VALUES(?, ?, ?, ?, ?)
+        INSERT INTO analysis_run(account_id, scope, market, code, run_time, payload_json)
+        VALUES(?, ?, ?, ?, ?, ?)
         """,
-        (scope, market, code, now, json.dumps(payload, ensure_ascii=False, default=str)),
+        (account_id, scope, market, code, now, json.dumps(payload, ensure_ascii=False, default=str)),
     )
     conn.commit()
     return int(cur.lastrowid)
 
 
-def latest_analysis_run(conn) -> dict | None:
+def latest_analysis_run(conn, account_id: int) -> dict | None:
     row = conn.execute(
-        "SELECT id, scope, market, code, run_time, payload_json FROM analysis_run ORDER BY id DESC LIMIT 1"
+        "SELECT id, scope, market, code, run_time, payload_json FROM analysis_run WHERE account_id = ? ORDER BY id DESC LIMIT 1",
+        (account_id,),
     ).fetchone()
     if not row:
         return None
@@ -193,21 +202,23 @@ def latest_analysis_run(conn) -> dict | None:
     return out
 
 
-def latest_snapshots(conn, market: str | None = None) -> list[dict]:
-    params = []
+def latest_snapshots(conn, account_id: int, market: str | None = None) -> list[dict]:
+    params = [account_id]
     filter_sql = ""
     if market:
-        filter_sql = " WHERE s.market = ?"
+        filter_sql = " AND s.market = ?"
         params.append(normalize_market(market))
     rows = conn.execute(
         f"""
         SELECT s.*
           FROM portfolio_snapshot s
           JOIN (
-            SELECT market, code, MAX(id) AS max_id
+            SELECT account_id, market, code, MAX(id) AS max_id
               FROM portfolio_snapshot
-             GROUP BY market, code
+             WHERE account_id = ?
+             GROUP BY account_id, market, code
           ) latest ON latest.max_id = s.id
+         WHERE 1=1
         {filter_sql}
          ORDER BY s.market, s.code
         """,
@@ -216,17 +227,17 @@ def latest_snapshots(conn, market: str | None = None) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def latest_snapshot_for_symbol(conn, market: str, code: str) -> dict | None:
+def latest_snapshot_for_symbol(conn, account_id: int, market: str, code: str) -> dict | None:
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
     row = conn.execute(
         """
         SELECT *
           FROM portfolio_snapshot
-         WHERE market = ? AND code = ?
+         WHERE account_id = ? AND market = ? AND code = ?
          ORDER BY id DESC
          LIMIT 1
         """,
-        (norm_market, norm_code),
+        (account_id, norm_market, norm_code),
     ).fetchone()
     return dict(row) if row else None

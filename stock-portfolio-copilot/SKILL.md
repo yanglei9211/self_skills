@@ -20,7 +20,7 @@ description: >-
 - 设置约束：总资金上限、单票仓位上限
 - 实时分析：结合 `stock-market-hub` 的分析结果，输出 `buy / focus / add / hold / trim / sell / avoid / watch`
   - `focus` 表示重点关注：宽松信号较好，适合加入盯盘清单，但不等同于直接买入
-  - `buy` 表示买入候选：需要满足更严格的强趋势、低风险与不过热条件
+  - `buy` 表示买入候选：可由两条独立路径触发（详见下文「buy 候选双路径」），任一满足即可
 
 ## CLI 入口
 
@@ -40,6 +40,66 @@ spc capital set --total 500000 --max-single-pct 20
 spc analyze now --scope holdings
 spc report pnl
 ```
+
+## buy 候选双路径
+
+自选侧 `buy` 候选**不再唯一要求"创新高"**，而是两条独立路径**任一满足**即可被触发；
+两条路径在 reasoning 里会显式标注为 `【趋势跟随路径】` 或 `【反转买入路径】`，
+让人 / LLM 一眼区分两种风险性质。
+
+| 维度 | 趋势跟随路径（trend） | 反转买入路径（reversal） |
+|---|---|---|
+| 价格 regime | 必须 ∈ `{NEW_YTD_HIGH, NEW_52W_HIGH, NEW_ALL_TIME_HIGH}`（创新高） | 必须 ∈ `{NEAR_YTD_LOW, IN_RANGE, NEAR_YTD_HIGH}`（非破位非新高） |
+| 公告正向 | ≥ 1 条 | ≥ 2 条（更严） |
+| 公告风险 | 0 条 | 0 条 |
+| 主力资金 regime | ≠ `PERSISTENT_OUTFLOW`（缺数据视为 OK） | ≠ `PERSISTENT_OUTFLOW`，且**必须**有数据 |
+| 主力资金方向 | 近 3/5 日累计 ≥ 0（None 视为 OK） | 必须有"掉头"硬证据：`reversal == OUTFLOW_TO_INFLOW` 或 `regime == PERSISTENT_INFLOW`，且**近 3/5 日累计 > 0** |
+| 当日涨幅 | 不过热（< 8%） | 不过热（< 8%） |
+| 默认 confidence | 0.72 | 0.68（左侧反转风险更高，置信度低于趋势型） |
+| LOW_REGIMES（创新低） | ❌ 不允许 | ❌ 不允许（**永远禁止**，再强反转信号也压不过破位） |
+
+**为什么要两条路径**：
+- 单一"必须创新高"会把"接近年内低位 + 资金已掉头 + 多重正向公告"这种典型反转好买点
+  永远卡在 focus，无法升档为 buy
+- 但反转路径对资金证据要求更严（必须有"已经掉头"证据，且近 3/5 日累计**严格 > 0**），
+  避免变成"系统主动建议抄底"
+- 大盘 RISK_OFF 时**两条路径都自动降级为 focus**（仅 reasoning 里说明降级原因），与现有大盘联动一致
+
+**输出审计**：决策的 `sources` 末尾会带上 `market_regime=...` 与 `fund_flow.regime=... (1d=..., 3d=..., 5d=..., 20d=...)`，
+任何 buy / focus 升档都能反查到具体路径与触发数据。
+
+参考实现位置：`spc_core/decision.py` 的 `_is_trend_buy_candidate` / `_is_reversal_buy_candidate` / `_evaluate_self_select_buy`。
+
+
+## 大盘风险偏好软联动
+
+`spc analyze now` 在分析每只标的之前，会先按**目标涉及的市场**评估"大盘 regime"
+（来自 `stock-market-hub` 的 `smh regime`，数据源：腾讯指数日 K）：
+
+| regime | 含义 | A 股代表指数 | 港股代表指数 |
+|---|---|---|---|
+| `RISK_ON` | 全部代表指数距 52w 高 ≥ -3% **且**站上 200MA（年线） | 沪深300 + 创业板指 | 恒生 + 恒生科技 |
+| `RISK_OFF` | 任一代表指数距 52w 高 ≤ -15% **且**跌破 200MA | 同上 | 同上 |
+| `NEUTRAL` | 其它一切情形 | — | — |
+
+**联动规则**（软联动，不强制改仓）：
+
+1. **市场隔离**：A 股标的只看 A 股 regime，港股标的只看港股 regime（两者常常分化）
+2. **RISK_OFF + 自选侧**：本应严格触发 buy 候选的标的，自动降级为 focus，
+   不进入"今日可买入清单"，理由会写明"等大盘修复"
+3. **RISK_OFF + 持仓侧**：hold **不会**自动降为 trim；只是给 risks 列表追加
+   "大盘 RISK_OFF，宏观防御为主"提示，最终是否减仓由人或 LLM 决定
+4. **RISK_OFF + 已 trim/sell**：confidence + 0.05（防御信号得到宏观背书）
+5. **RISK_ON / NEUTRAL**：reasons 里出现一句备注，但**不会**主动加仓 / 升档
+6. **缺数据**：完全不影响，与 `market_regime` 字段缺失等价
+
+**输出位置**：`render_analysis_text` 顶部会拼一段「大盘风险偏好」总览，
+列出 A 股 / 港股 各自的 regime + 代表指数读数（距 52w 高、YTD、年线状态），
+让人和 LLM 都能先看到再判断个股。
+
+`payload["market_regime"]` 字段保留每个市场的完整 regime 详情，
+`decision.sources` 里也会追加一行 `market_regime=<regime>` 作为审计痕迹。
+
 
 ## 默认盘中分析时间表
 
@@ -63,6 +123,12 @@ spc report pnl
 - 默认数据库：`~/.local/share/stock-portfolio-copilot/portfolio.db`
 - 可通过环境变量 `SPC_DATA_DIR` 覆盖数据目录
 - 港股汇率优先使用显式传入的 `fx_rate`；没有时使用配置或实时汇率 fallback
+
+## 输出约定
+
+- 在任何面向用户的分析、汇总、建议、清单输出中，只要出现股票代码，必须同时给出股票名称。
+- 推荐格式：`股票名称（代码）`，例如 `阿里巴巴-W（09988）`、`恒瑞医药（600276）`。
+- 如果当次数据源暂时无法解析名称，应明确说明“名称缺失”，不要只输出纯代码。
 
 ## 依赖关系
 

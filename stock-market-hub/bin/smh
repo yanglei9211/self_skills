@@ -29,6 +29,11 @@
 #   smh flow SZ300750                  主力资金流（A 股 + 港股；北交所/美股不支持）
 #   smh flow HK01810 --format json
 #
+#   smh regime                         A 股 + 港股大盘 regime 总览（RISK_OFF/NEUTRAL/RISK_ON）
+#   smh regime --market a              仅 A 股（沪深300 + 创业板指）
+#   smh regime --market hk             仅港股（恒生 + 恒生科技）
+#   smh regime --format json           机器可读
+#
 #   smh cache stats                    缓存统计
 #   smh cache clear --prefix kline    清理缓存
 #
@@ -124,6 +129,11 @@ case "$cmd" in
         else
             exec "$VPY" -m stock_core.fund_flow "$@"
         fi
+        ;;
+    regime|mkt-regime)
+        # 注意：`market`/`m` 已经被雪球涨跌榜（xueqiu_market.py）占用，
+        # 大盘风险偏好 regime 用 `regime` 子命令独立入口。
+        exec "$VPY" -m stock_core.market_regime "$@"
         ;;
     cache)
         exec "$VPY" -m stock_core.cache "$@"

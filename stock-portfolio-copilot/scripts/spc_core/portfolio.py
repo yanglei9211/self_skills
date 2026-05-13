@@ -51,11 +51,11 @@ def _derive_trade_fees(conn, trade: dict) -> tuple[Decimal, Decimal]:
     return total_fees, stamp
 
 
-def _symbol_universe(conn, market: str | None, code: str | None) -> list[tuple[str, str]]:
+def _symbol_universe(conn, account_id: int, market: str | None, code: str | None) -> list[tuple[str, str]]:
     if code and not market:
         raise ValueError("只传 code 时必须同时传 market")
-    clauses = []
-    params = []
+    clauses = ["account_id = ?"]
+    params: list = [account_id]
     if market:
         norm_market = normalize_market(market)
         clauses.append("market = ?")
@@ -63,39 +63,38 @@ def _symbol_universe(conn, market: str | None, code: str | None) -> list[tuple[s
         if code:
             clauses.append("code = ?")
             params.append(normalize_code(norm_market, code))
-    sql_where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    where = " AND ".join(clauses)
     rows = conn.execute(
         f"""
-        SELECT market, code FROM position_seed
-        {sql_where}
-        UNION
-        SELECT market, code FROM trade_ledger
-        {sql_where}
-        ORDER BY market, code
+        SELECT market, code FROM (
+            SELECT market, code FROM position_seed WHERE {where}
+            UNION
+            SELECT market, code FROM trade_ledger WHERE is_deleted = 0 AND {where}
+        ) ORDER BY market, code
         """,
-        params * 2 if clauses else [],
+        params * 2,
     ).fetchall()
     return [(row["market"], row["code"]) for row in rows]
 
 
-def sync_portfolio(conn, market: str | None = None, code: str | None = None, analysis_provider=None, fx_rate_provider=None) -> list[dict]:
+def sync_portfolio(conn, account_id: int, market: str | None = None, code: str | None = None, analysis_provider=None, fx_rate_provider=None) -> list[dict]:
     ensure_defaults(conn)
     provider = analysis_provider or StockMarketHubProvider()
     fx_provider = fx_rate_provider or FXRateProvider()
-    symbols = _symbol_universe(conn, market, code)
+    symbols = _symbol_universe(conn, account_id, market, code)
     snapshots = []
     for sym_market, sym_code in symbols:
         seed = conn.execute(
-            "SELECT * FROM position_seed WHERE market = ? AND code = ?",
-            (sym_market, sym_code),
+            "SELECT * FROM position_seed WHERE account_id = ? AND market = ? AND code = ?",
+            (account_id, sym_market, sym_code),
         ).fetchone()
         trades = conn.execute(
             """
             SELECT * FROM trade_ledger
-             WHERE market = ? AND code = ? AND is_deleted = 0
+             WHERE account_id = ? AND market = ? AND code = ? AND is_deleted = 0
              ORDER BY trade_time, id
             """,
-            (sym_market, sym_code),
+            (account_id, sym_market, sym_code),
         ).fetchall()
         qty = Decimal(seed["qty"]) if seed else Decimal("0")
         avg_cost = Decimal(seed["cost_price"]) if seed else Decimal("0")
@@ -120,8 +119,7 @@ def sync_portfolio(conn, market: str | None = None, code: str | None = None, ana
                     raise ValueError(
                         f"卖出数量 {decimal_str(t_qty)} 大于当前可用持仓 {decimal_str(qty)}: {sym_market} {sym_code}"
                     )
-                avg_before = avg_cost
-                removed_cost = q_money(avg_before * t_qty)
+                removed_cost = q_money(avg_cost * t_qty)
                 proceeds_net = q_money(amount - fees)
                 realized_pnl = q_money(realized_pnl + proceeds_net - removed_cost)
                 qty = q_qty(qty - t_qty)
@@ -157,6 +155,7 @@ def sync_portfolio(conn, market: str | None = None, code: str | None = None, ana
             position_value_cny = q_money(position_value * fx_rate_to_cny)
 
         snapshot = {
+            "account_id": account_id,
             "market": sym_market,
             "code": sym_code,
             "qty": decimal_str(qty),
@@ -176,12 +175,13 @@ def sync_portfolio(conn, market: str | None = None, code: str | None = None, ana
         conn.execute(
             """
             INSERT INTO portfolio_snapshot(
-              market, code, qty, avg_cost_price, currency, gross_cost_ccy, total_fees_ccy,
+              account_id, market, code, qty, avg_cost_price, currency, gross_cost_ccy, total_fees_ccy,
               realized_pnl_ccy, last_price, last_price_time, unrealized_pnl_ccy,
               fx_rate_to_cny, position_value_cny, snapshot_time, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                snapshot["account_id"],
                 snapshot["market"],
                 snapshot["code"],
                 snapshot["qty"],
@@ -204,8 +204,8 @@ def sync_portfolio(conn, market: str | None = None, code: str | None = None, ana
     return snapshots
 
 
-def pnl_summary(conn) -> dict:
-    snaps = latest_snapshots(conn)
+def pnl_summary(conn, account_id: int) -> dict:
+    snaps = latest_snapshots(conn, account_id)
     total_value = Decimal("0")
     total_realized = Decimal("0")
     total_unrealized = Decimal("0")
