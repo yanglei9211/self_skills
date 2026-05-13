@@ -1,10 +1,10 @@
-"""个股主力资金流：东方财富 fflow daykline 接口。
+"""个股主力资金流：东方财富 fflow kline 接口。
 
 为什么用东财而不是雪球？
   - 雪球 screener 的 ``main_net_inflows`` 只有"今日累计"一个数字，无分层、无历史
-  - 东财 ``push2his.eastmoney.com/api/qt/stock/fflow/daykline/get`` 提供：
-        近 ~120 个交易日的逐日「主力 / 超大单 / 大单 / 中单 / 小单」净额 + 占比
-    且无登录、无反爬封禁（与已知被封的 push2 实时行情接口是不同 host）。
+  - 东财 ``push2his.eastmoney.com/api/qt/stock/fflow/kline/get`` 提供：
+        近 ~120 个交易日的逐日「主力 / 超大单 / 大单 / 中单 / 小单」净额
+    且无登录（与已知被封的 push2 实时行情接口是不同 host）。
 
 支持范围
   - A 股沪深主板 / 创业板 / 科创板：✅
@@ -12,8 +12,17 @@
   - 北交所（4/8 开头）：❌（``eastmoney_secid`` 会抛 ValueError）
   - 美股：❌（"主力资金"不是美股的标准市场指标）
 
+接口路径迭代历史
+  - 2026-05 之前：``/api/qt/stock/fflow/daykline/get`` 返回 13 列（含占比 + 收盘价 + 涨跌幅）
+  - 2026-05 起：``/daykline/get`` 在 push2his 被反爬封禁（TLS 后服务端立刻 RST）；
+    切到 ``/api/qt/stock/fflow/kline/get`` 仍能拿到 ~120 天数据，但接口只返回前
+    6 列（日期 + 主力 / 小 / 中 / 大 / 超大 金额），占比 / 收盘价 / 涨跌幅都没了。
+    上层 ``_render_text`` 和决策树都已能容忍这些字段为 ``None``，因此切路径不破坏
+    任何 caller，只是 ``render_analysis_text`` 的 "当日资金分层占比" 表会显示 "-"。
+
 字段对应（接口返回 ``klines`` 的逗号分隔字符串）：
   f51 日期 / f52 主力净额(元) / f53 小单 / f54 中单 / f55 大单 / f56 超大单
+  ── 以下字段 2026-05 起新接口不再返回，旧 daykline 路径已被封禁 ──
   f57 主力净占比(%) / f58 小单占比 / f59 中单占比 / f60 大单占比 / f61 超大单占比
   f62 收盘价 / f63 涨跌幅(%)
 """
@@ -29,9 +38,11 @@ from .cache import cached
 from .http import fetch
 from .symbols import eastmoney_secid, normalize_symbol
 from .tz import CN_TZ, is_market_open
+from .xueqiu import XueqiuClient
 
 
-_FFLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+_FFLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
+# 仍按 13 列向后端要，新接口只返回前 6 列；解析层会容忍少列。
 _FFLOW_FIELDS1 = "f1,f2,f3,f7"
 _FFLOW_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 _FFLOW_UT = "b2884a393a59ad64002292a3e90d46a5"
@@ -91,27 +102,41 @@ def _to_float(s: str) -> float | None:
 
 
 def _parse_kline_row(row: str) -> dict[str, Any] | None:
+    """容忍 6-13 列两种返回。
+
+    - 2026-05 之前的 ``/daykline/get`` 返回 13 列（含占比 + 收盘价 + 涨跌幅）
+    - 2026-05 起的 ``/kline/get`` 只返回 6 列（日期 + 主力 + 4 个分层金额）
+
+    缺的列填 ``None``，上层 (``summarize_fund_flow`` / ``_render_text``) 已有
+    None 兜底；决策树只用 ``main`` 金额，不受影响。
+    """
     parts = row.split(",")
-    if len(parts) < 13:
+    if len(parts) < 6:
         return None
+
+    def at(i: int) -> float | None:
+        return _to_float(parts[i]) if i < len(parts) else None
+
     return {
         "date": parts[0],
-        "main": _to_float(parts[1]),
-        "small": _to_float(parts[2]),
-        "mid": _to_float(parts[3]),
-        "big": _to_float(parts[4]),
-        "super_big": _to_float(parts[5]),
-        "main_pct": _to_float(parts[6]),
-        "small_pct": _to_float(parts[7]),
-        "mid_pct": _to_float(parts[8]),
-        "big_pct": _to_float(parts[9]),
-        "super_big_pct": _to_float(parts[10]),
-        "close": _to_float(parts[11]),
-        "change_pct": _to_float(parts[12]),
+        "main": at(1),
+        "small": at(2),
+        "mid": at(3),
+        "big": at(4),
+        "super_big": at(5),
+        "main_pct": at(6),
+        "small_pct": at(7),
+        "mid_pct": at(8),
+        "big_pct": at(9),
+        "super_big_pct": at(10),
+        "close": at(11),
+        "change_pct": at(12),
     }
 
 
-@cached(ttl=_ttl_for_call, key_prefix="ff")
+# schema_version=2: 2026-05 接口从 /daykline/get 切到 /kline/get，行从 13 列变 6 列。
+# +1 让旧缓存（里面 close / change_pct / *_pct 都是历史值）自然失效。
+@cached(ttl=_ttl_for_call, key_prefix="ff", schema_version=2)
 def fetch_daily_fund_flow(market: str, code: str) -> list[dict]:
     """拉东财个股资金流日 K（约 120 个交易日）。
 
@@ -226,8 +251,105 @@ def summarize_fund_flow(rows: list[dict]) -> dict[str, Any]:
     }
 
 
+def _xueqiu_symbol(market: str, code: str) -> str | None:
+    """转换为雪球资金流接口接受的 symbol；港股 / 北交所雪球资金流无效，返回 None。"""
+    if market != "a":
+        return None  # 雪球 capital/assort 港股返回 data=None，没意义
+    if code.startswith("6"):
+        return f"SH{code}"
+    if code.startswith(("0", "3")):
+        return f"SZ{code}"
+    return None  # 北交所 4/8 也跳过
+
+
+def _enrich_with_xueqiu_assort(summary: dict[str, Any], market: str, code: str,
+                                xq: XueqiuClient | None = None) -> None:
+    """用雪球 capital/assort 补全 ``summary['today']`` 里东财新接口缺的占比 / 分层。
+
+    数据契约：
+      - 雪球 ``buy_*`` / ``sell_*`` 是当日累计买入 / 卖出金额（元）；净额 = buy - sell
+      - 主力 = xlarge + large（A 股的 ``xlarge`` 通常为 None，此时退化为只算 large）
+      - 占比分母 = buy_total + sell_total（即当日总成交额，与东财 main_pct 算法一致）
+      - cookie 失效 / 港股 / 北交所 时直接 no-op；如失效会把告警写到 summary['warnings']
+    """
+    today = summary.get("today")
+    if not today:
+        return  # 主源没数据，没什么可 enrich 的
+
+    xq_sym = _xueqiu_symbol(market, code)
+    if not xq_sym:
+        return  # 港股 / 北交所：雪球 assort 无效
+
+    cli = xq or XueqiuClient()
+    if not cli.is_logged_in and not cli.cookie_expired:
+        # 用户未配 cookie。这是"未配置"而不是"失效"，不打告警（避免对非雪球用户骚扰）
+        return
+
+    data = cli.capital_assort(xq_sym)
+    if data is None:
+        # 拿不到（cookie 过期 / WAF）；如果是 cookie 过期，cli 已经打过告警
+        if cli.cookie_expired:
+            warnings = summary.setdefault("warnings", [])
+            warnings.append(
+                "雪球登录 cookie 已过期，当日资金分层占比 / 收盘 / 涨跌幅 补全失败；"
+                "请按 SKILL.md §0 重新导出 cookie 到 ~/.config/stock-market-hub/xueqiu.cookie"
+            )
+        return
+
+    def net(k_buy: str, k_sell: str) -> float | None:
+        b = data.get(k_buy)
+        s = data.get(k_sell)
+        if b is None or s is None:
+            return None
+        return float(b) - float(s)
+
+    big = net("buy_large", "sell_large")
+    xlarge = net("buy_xlarge", "sell_xlarge")
+    mid = net("buy_medium", "sell_medium")
+    small = net("buy_small", "sell_small")
+    main = (big or 0) + (xlarge or 0)
+    buy_total = data.get("buy_total") or 0
+    sell_total = data.get("sell_total") or 0
+    grand_total = float(buy_total) + float(sell_total)  # 总成交（元）
+
+    def _pct(v: float | None) -> float | None:
+        if v is None or grand_total <= 0:
+            return None
+        return round(v / grand_total * 100, 2)
+
+    # 仅补"东财新接口缺失的字段"，不覆盖东财已有的非 None 值
+    enriched_keys = {
+        "super_big_yi": _to_yi(xlarge),
+        "big_yi": _to_yi(big),
+        "mid_yi": _to_yi(mid),
+        "small_yi": _to_yi(small),
+        "main_pct": _pct(main),
+        "super_big_pct": _pct(xlarge),
+        "big_pct": _pct(big),
+        "mid_pct": _pct(mid),
+        "small_pct": _pct(small),
+    }
+    for k, v in enriched_keys.items():
+        if v is not None and today.get(k) is None:
+            today[k] = v
+
+    # 标注来源，便于 audit
+    summary.setdefault("sources", {})
+    summary["sources"]["assort"] = "雪球 capital/assort"
+    summary["sources"].setdefault("kline_main", "东方财富 fflow/kline")
+
+
 def get_fund_flow_summary(market: str, code: str) -> dict[str, Any]:
-    """组合调用：拉日 K + 生成摘要。失败时返回带 ``error`` 字段的占位字典。"""
+    """组合调用：拉东财日 K + 生成摘要 + 雪球 assort 补全字段。
+
+    数据源分工：
+      - 东财 ``fflow/kline/get``：主源，提供 ~120 天主力净额 + 4 分层金额 → rolling/regime/reversal
+      - 雪球 ``capital/assort.json``：A 股 + 有 cookie 时补全当日的占比 + 4 分层档位金额
+      - 港股 / 北交所 / 无 cookie：只跑东财主源，summary['today'] 的占比和分层档位为 None
+
+    失败时返回带 ``error`` 字段的占位字典；雪球 cookie 过期会在 ``warnings`` 列出，
+    不阻塞主流程（决策树仍能正常工作）。
+    """
     try:
         rows = fetch_daily_fund_flow(market, code)
     except ValueError as e:
@@ -236,6 +358,15 @@ def get_fund_flow_summary(market: str, code: str) -> dict[str, Any]:
         return {"error": "fflow 接口返回空", "as_of": None, "today": None, "rolling": {}, "regime": None, "reversal": None}
     summary = summarize_fund_flow(rows)
     summary["fetched_at"] = datetime.now(CN_TZ).isoformat()
+
+    # 雪球 enrich（A 股有 cookie 时生效；港股 / 无 cookie 自动跳过）
+    try:
+        _enrich_with_xueqiu_assort(summary, market, code)
+    except Exception as e:  # noqa: BLE001
+        # enrich 失败不应影响主流程；记录但不抛
+        print(f"[fund_flow] xueqiu assort enrich 失败（不影响主源数据）: {type(e).__name__}: {e}",
+              file=sys.stderr)
+
     return summary
 
 
@@ -278,8 +409,14 @@ def _render_text(market: str, code: str, summary: dict[str, Any]) -> str:
         )
 
     today = summary.get("today") or {}
+    close = today.get("close")
+    chg = today.get("change_pct")
+    close_str = "-" if close is None else f"{close}"
+    chg_str = "-" if chg is None else f"{chg:+.2f}%"
     lines.append("")
-    lines.append(f"## 当日资金分层（{summary.get('as_of')}，收盘 {today.get('close')}，涨跌 {today.get('change_pct')}%）")
+    lines.append(
+        f"## 当日资金分层（{summary.get('as_of')}，收盘 {close_str}，涨跌 {chg_str}）"
+    )
     lines.append("| 档位 | 净额 | 占成交比例 |")
     lines.append("|---|---|---|")
     for label, amt_key, pct_key in (
@@ -294,6 +431,22 @@ def _render_text(market: str, code: str, summary: dict[str, Any]) -> str:
         amt_str = "-" if amt is None else f"{amt:+.2f} 亿"
         pct_str = "-" if pct is None else f"{pct:+.2f}%"
         lines.append(f"| {label} | {amt_str} | {pct_str} |")
+
+    # 数据源标注
+    sources = summary.get("sources") or {}
+    if sources:
+        lines.append("")
+        lines.append("> _数据来源：" + " + ".join(sorted(set(sources.values()))) + "_")
+
+    # ⚠️ warnings —— 雪球 cookie 过期等需要用户行动的情况
+    warnings = summary.get("warnings") or []
+    if warnings:
+        lines.append("")
+        lines.append("---")
+        lines.append("⚠️ **警告**")
+        for w in warnings:
+            lines.append(f"- {w}")
+
     return "\n".join(lines)
 
 

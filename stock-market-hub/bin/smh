@@ -29,6 +29,10 @@
 #   smh flow SZ300750                  主力资金流（A 股 + 港股；北交所/美股不支持）
 #   smh flow HK01810 --format json
 #
+#   smh capital SZ300750               雪球资金流三接口（仅 A 股 + 需 cookie）
+#   smh capital SZ300750 --view assort
+#   smh capital SZ300750 --view history --count 60
+#
 #   smh regime                         A 股 + 港股大盘 regime 总览（RISK_OFF/NEUTRAL/RISK_ON）
 #   smh regime --market a              仅 A 股（沪深300 + 创业板指）
 #   smh regime --market hk             仅港股（恒生 + 恒生科技）
@@ -128,6 +132,15 @@ case "$cmd" in
             exec "$VPY" -m stock_core.fund_flow --symbol "$sym" "$@"
         else
             exec "$VPY" -m stock_core.fund_flow "$@"
+        fi
+        ;;
+    capital|cap)
+        # 雪球 capital/* 三接口（仅 A 股 + 需 cookie）
+        if [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            sym="$1"; shift
+            exec "$VPY" "$SCRIPTS/capital.py" --symbol "$sym" "$@"
+        else
+            exec "$VPY" "$SCRIPTS/capital.py" "$@"
         fi
         ;;
     regime|mkt-regime)
