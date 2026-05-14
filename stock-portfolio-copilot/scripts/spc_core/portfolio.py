@@ -6,8 +6,11 @@ from spc_core.ledger import latest_snapshots
 from spc_core.market_bridge import FXRateProvider, StockMarketHubProvider
 from spc_core.settings import ensure_defaults, get_decimal_setting
 from spc_core.utils import (
+    ETF_CATEGORY_CROSS_BORDER,
     decimal_str,
     default_currency,
+    etf_category as etf_category_fn,
+    is_etf as is_etf_fn,
     normalize_code,
     normalize_market,
     q_money,
@@ -306,6 +309,17 @@ def check_portfolio_consistency(conn, account_id: int) -> list[dict]:
                 messages.append(
                     f"RESIDUAL_POSITION: 摊薄成本 {avg_cost} vs 现价 {last_price}，"
                     f"偏离 {float(deviation) * 100:.1f}%，疑似残股；分析侧的 trim/sell 信号对其操作意义有限"
+                )
+
+        # ETF 专属审计提示
+        if is_etf_fn(sym_market, sym_code):
+            cat = etf_category_fn(sym_code)
+            if cat:
+                messages.append(f"ETF_TYPE: {cat}（决策侧已用 ETF 专用规则）")
+            if cat == ETF_CATEGORY_CROSS_BORDER:
+                messages.append(
+                    "ETF_CROSS_BORDER: 跨境 QDII ETF，A 股主力资金面对其参考价值低，"
+                    "决策应结合外盘指数"
                 )
 
         reports.append({

@@ -21,6 +21,85 @@ MONEY_PREC = Decimal("0.01")
 RATIO_PREC = Decimal("0.000001")
 
 
+# ── ETF 识别 ───────────────────────────────────────────────────
+# 决策模块需要区分「个股」和「场内基金」，因为后者没有公告 / 管理层 / 股东等
+# 维度，但有跟踪指数 / 主题集中度 / 跨境溢价等独有维度。
+
+ETF_CATEGORY_CROSS_BORDER = "cross_border"        # QDII 跨境（513 / 164 等）
+ETF_CATEGORY_STAR_MARKET = "star_market"          # 科创板 ETF（588 开头）
+ETF_CATEGORY_CHINEXT = "chinext"                  # 创业板 ETF（159 开头部分）
+ETF_CATEGORY_BROAD_OR_SECTOR = "broad_or_sector"  # 主板宽基 / 行业 ETF
+ETF_CATEGORY_COMMODITY = "commodity"              # 商品 ETF（黄金 518 / 白银 / 原油等）
+ETF_CATEGORY_BOND = "bond"                        # 债券 ETF（511 / 152xxx 等）
+ETF_CATEGORY_OTHER = "other_fund"                 # 其它场内基金 / LOF / 货币 ETF
+
+
+def is_etf(market: str, code: str) -> bool:
+    """A 股场内基金（含 ETF / LOF）识别。
+
+    代码段规则：
+      - 上交所：``5xxxxx``（510-588）—— 含所有 ETF / 跨境 ETF / 黄金 ETF
+        以及部分 LOF（如 502 系列）；9 开头是 B 股不在内
+      - 深交所：``1xxxxx``（150-189）—— 含 159 ETF / 16x LOF / 18x 分级 LOF
+        以及部分 ETF；0/3 开头是股票不在内
+
+    本函数不细分 ETF / LOF / QDII：决策侧用 ``etf_category()`` 进一步分类。
+    """
+    if market != "a":
+        return False
+    if not code or not str(code).isdigit() or len(str(code)) != 6:
+        return False
+    return str(code).startswith(("5", "1"))
+
+
+def etf_category(code: str) -> str | None:
+    """识别 ETF 子类型（用于决策时给"跨境提示""商品 ETF 跳过资金面"等差异化处理）。
+
+    分类不追求 100% 精确（很多 ETF 既是行业 ETF 又是宽基的混合），
+    主要满足两类下游需求：
+      1. **跨境**（cross_border）：A 股主力资金面对它没意义，要在分析里加提示
+      2. **商品 / 债券**：资金面参考价值也不大，但风险性质不同
+
+    返回 None 表示不是 ETF（或代码非法）。
+    """
+    if not code or not str(code).isdigit() or len(str(code)) != 6:
+        return None
+    c = str(code)
+    # 跨境 QDII 系列
+    if c.startswith("513"):
+        return ETF_CATEGORY_CROSS_BORDER
+    if c.startswith("164"):  # 深交所跨境 LOF（如 164906 标普 500）
+        return ETF_CATEGORY_CROSS_BORDER
+    # 科创板 ETF
+    if c.startswith("588"):
+        return ETF_CATEGORY_STAR_MARKET
+    # 商品 ETF：黄金 518 / 白银 / 原油等也在 518-519 段
+    if c.startswith(("518", "159980", "159981", "159985")):  # 黄金/原油/有色商品
+        return ETF_CATEGORY_COMMODITY
+    # 债券 ETF：511（上交所国债 / 利率债）/ 152xxx 深交所部分债基
+    if c.startswith(("511", "152")):
+        return ETF_CATEGORY_BOND
+    # 创业板系列：159915 / 159949 / 159363 / 159381 / 159995 等
+    if c.startswith("159"):
+        return ETF_CATEGORY_CHINEXT
+    # 主板宽基 / 行业 ETF：510 / 512 / 515 / 516（深交所行业 LOF）
+    if c.startswith(("510", "512", "515", "516", "160", "161", "165")):
+        return ETF_CATEGORY_BROAD_OR_SECTOR
+    return ETF_CATEGORY_OTHER
+
+
+def is_cross_border_etf(market: str, code: str) -> bool:
+    """便利函数：是否跨境 QDII ETF（A 股主力资金面对它参考价值低）。"""
+    return is_etf(market, code) and etf_category(code) == ETF_CATEGORY_CROSS_BORDER
+
+
+def is_commodity_or_bond_etf(market: str, code: str) -> bool:
+    """便利函数：是否商品 / 债券 ETF（资金面 / 主题分析意义有限）。"""
+    if not is_etf(market, code):
+        return False
+    return etf_category(code) in (ETF_CATEGORY_COMMODITY, ETF_CATEGORY_BOND)
+
+
 def data_dir() -> Path:
     base = os.environ.get("SPC_DATA_DIR")
     if base:

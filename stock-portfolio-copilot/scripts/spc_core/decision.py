@@ -7,7 +7,18 @@ from spc_core.ledger import latest_snapshots, list_watch, save_analysis_run
 from spc_core.market_bridge import StockMarketHubProvider
 from spc_core.portfolio import sync_portfolio
 from spc_core.settings import capital_settings, ensure_defaults
-from spc_core.utils import decimal_str, normalize_code, normalize_market, q_money, to_decimal
+from spc_core.utils import (
+    ETF_CATEGORY_BOND,
+    ETF_CATEGORY_COMMODITY,
+    ETF_CATEGORY_CROSS_BORDER,
+    decimal_str,
+    etf_category as etf_category_fn,
+    is_etf as is_etf_fn,
+    normalize_code,
+    normalize_market,
+    q_money,
+    to_decimal,
+)
 
 
 RISK_KEYWORDS = ("立案", "处罚", "诉讼", "减持", "退市", "停牌", "风险", "问询", "亏损", "爆雷")
@@ -102,12 +113,17 @@ class Features:
     """
     # 标的元数据
     market: str
+    code: str
+    is_etf: bool
+    etf_category: str | None
     # 行情
     current: object | None
     change_pct: object | None
+    amount_yi: float | None       # 当日成交额（亿元），ETF 流动性判断用
+    market_cap_yi: float | None   # 总市值 / ETF 规模（亿元）
     # 价格 regime
     regime: str | None
-    # 公告关键词命中数
+    # 公告关键词命中数（ETF 永远为 0）
     risk_hits: int
     positive_hits: int
     # 持仓
@@ -156,10 +172,27 @@ def _extract_features(
     if capital_total > 0 and position_value_cny > 0:
         weight_pct = q_money(position_value_cny / capital_total * Decimal("100"))
 
+    # 标的市场 / 代码（ETF 识别用）
+    target_market = snapshot.get("market") if snapshot else str(analysis.get("market") or "")
+    target_code = snapshot.get("code") if snapshot else str(analysis.get("code") or "")
+    etf_flag = is_etf_fn(target_market, target_code)
+    etf_cat = etf_category_fn(target_code) if etf_flag else None
+
+    # 成交额 / 总市值（元 → 亿元，用于 ETF 流动性 / 规模判断）
+    amount = quote.get("amount")
+    market_cap = quote.get("market_capital")
+    amount_yi = (amount / 1e8) if isinstance(amount, (int, float)) and amount else None
+    market_cap_yi = (market_cap / 1e8) if isinstance(market_cap, (int, float)) and market_cap else None
+
     return Features(
-        market=snapshot.get("market") if snapshot else str(analysis.get("market") or ""),
+        market=target_market,
+        code=target_code,
+        is_etf=etf_flag,
+        etf_category=etf_cat,
         current=quote.get("current"),
         change_pct=quote.get("percent"),
+        amount_yi=amount_yi,
+        market_cap_yi=market_cap_yi,
         regime=price_history.get("regime"),
         risk_hits=risk_hits,
         positive_hits=positive_hits,
@@ -205,6 +238,9 @@ def _collect_price_signals(f: Features) -> tuple[list[str], list[str]]:
 def _collect_announcement_signals(f: Features) -> tuple[list[str], list[str]]:
     reasons: list[str] = []
     risks: list[str] = []
+    # ETF 没有上市公司公告，跳过这个维度
+    if f.is_etf:
+        return reasons, risks
     if f.risk_hits:
         risks.append(f"近期待公告标题中命中 {f.risk_hits} 个风险关键词")
     if f.positive_hits:
@@ -287,6 +323,222 @@ def _make_recorder(trace: list[dict]):
         return state["action"], state["value"]
 
     return record, raise_to, current
+
+
+# ── ETF 专用决策路径 ─────────────────────────────────────────────
+# ETF 没有公告 / 管理层 / 股东 / 同业等维度，沿用股票决策树会导致
+# positive_hits / risk_hits 永远为 0，所有 ETF 永远卡在 watch / hold。
+# 这里给 ETF 一套独立决策规则，只用：
+#   - 价格 regime（K 线驱动）
+#   - 主力资金（1d/3d/5d/20d + regime + reversal）
+#   - 大盘 regime（A 股 RISK_ON/OFF）
+#   - 成交额（流动性硬检查）
+#   - ETF 子类型（跨境 QDII 资金面参考价值低 / 商品 / 债券资金面无意义）
+
+# 流动性阈值：成交额低于此值时直接 avoid（流动性陷阱）
+_ETF_TURNOVER_AVOID_YI = 0.3       # 0.3 亿（3000 万）
+# 流动性阈值：成交额低于此值时给提示但不阻止决策
+_ETF_TURNOVER_WARN_YI = 1.0        # 1 亿
+# 残股识别：摊薄成本 > 现价 1.5 倍时打 RESIDUAL 标签
+_ETF_RESIDUAL_THRESHOLD = Decimal("1.5")
+
+
+def _evaluate_etf_self_select_buy(f: Features) -> tuple[str, Decimal, str] | None:
+    """ETF 自选侧 buy 决策。返回 (action, confidence, reason) 或 None。
+
+    None 表示不构成 buy 候选，调用方应继续走 focus / watch / avoid 分支。
+
+    决策树：
+      1. 流动性硬否决（成交额 < 0.3 亿）→ avoid（不会被这里返回，由 caller 处理）
+      2. LOW_REGIMES 创新低 → 永远禁止 buy（返回 None，让 caller 走 avoid）
+      3. HIGH_REGIMES + 资金齐声 → trend buy / 跨境只看趋势
+      4. MID_REGIMES + PERSISTENT_INFLOW + 3d/5d 正向 → reversal buy
+      5. 大盘 RISK_OFF 时 buy 自动降为 focus（同股票逻辑）
+    """
+    # LOW_REGIMES 永远禁止 buy
+    if f.regime in LOW_REGIMES:
+        return None
+
+    # 当日过热（≥ 8%）：降级 focus 等回调
+    if _is_extended_intraday_gain(f.change_pct):
+        return ("focus", Decimal("0.62"),
+                f"ETF 信号成立但日涨幅 {f.change_pct}% 过热，降级 focus 等回调")
+
+    cross_border = (f.etf_category == ETF_CATEGORY_CROSS_BORDER)
+    commodity_or_bond = (f.etf_category in (ETF_CATEGORY_COMMODITY, ETF_CATEGORY_BOND))
+
+    # ── 趋势 ETF buy（HIGH_REGIMES）──
+    if f.regime in HIGH_REGIMES:
+        if cross_border:
+            # 跨境 QDII：资金面参考价值低，仅看价格趋势 + 大盘
+            base_msg = (
+                "【ETF 趋势路径-跨境】跨境 QDII 价格创新高，A 股主力资金面参考价值低，"
+                "仅依据价格趋势 + 大盘判断"
+            )
+            if f.market_regime == MARKET_REGIME_RISK_OFF:
+                return ("focus", Decimal("0.62"),
+                        base_msg + "；大盘 RISK_OFF，降级为 focus 等大盘修复")
+            return ("buy", Decimal("0.68"), base_msg + "；跨境 ETF 置信度低于本地 ETF")
+
+        if commodity_or_bond:
+            # 商品 / 债券 ETF：资金面也无意义
+            base_msg = (
+                f"【ETF 趋势路径-{f.etf_category}】商品 / 债券 ETF 价格创新高，"
+                "资金面分析意义有限，主要看价格突破"
+            )
+            if f.market_regime == MARKET_REGIME_RISK_OFF:
+                return ("focus", Decimal("0.62"), base_msg + "；大盘 RISK_OFF，降级 focus")
+            return ("buy", Decimal("0.66"), base_msg)
+
+        # 本地主题 ETF（科创 / 创业 / 行业）：要求资金面齐声
+        if f.ff_regime == FUND_PERSISTENT_OUTFLOW:
+            return ("focus", Decimal("0.62"),
+                    "【ETF 趋势路径】价格创新高但主力 PERSISTENT_OUTFLOW，降级 focus")
+        # 1d/3d/5d 任一为负即降级（量级齐声）
+        ff_neg = [(name, v) for name, v in (("1d", f.ff_1d), ("3d", f.ff_3d), ("5d", f.ff_5d))
+                  if v is not None and v < 0]
+        if ff_neg:
+            details = ", ".join(f"{n}={v:+.2f}yi" for n, v in ff_neg)
+            return ("focus", Decimal("0.63"),
+                    f"【ETF 趋势路径】价格创新高但近期资金有反向迹象（{details}），降级 focus")
+        msg = (
+            f"【ETF 趋势路径】价格 {f.regime} + 1d/3d/5d 资金齐正"
+            f"（1d={f.ff_1d:+.2f}yi, 3d={f.ff_3d:+.2f}yi, 5d={f.ff_5d:+.2f}yi）→ 趋势买入"
+        )
+        if f.market_regime == MARKET_REGIME_RISK_OFF:
+            return ("focus", Decimal("0.65"), msg + "；大盘 RISK_OFF 降级 focus")
+        return ("buy", Decimal("0.72"), msg)
+
+    # ── 反转 ETF buy（MID_REGIMES）──
+    # 跨境 / 商品 / 债券：不做反转买入（资金面没意义）
+    if cross_border or commodity_or_bond:
+        return None
+    if f.ff_regime != FUND_PERSISTENT_INFLOW:
+        return None
+    if (f.ff_3d is None or f.ff_3d <= 0) or (f.ff_5d is None or f.ff_5d <= 0):
+        return None
+    msg = (
+        f"【ETF 反转路径】价格 {f.regime} + PERSISTENT_INFLOW + "
+        f"3d={f.ff_3d:+.2f}yi/5d={f.ff_5d:+.2f}yi 正向 → 反转买入"
+    )
+    if f.market_regime == MARKET_REGIME_RISK_OFF:
+        return ("focus", Decimal("0.62"), msg + "；大盘 RISK_OFF 降级 focus")
+    return ("buy", Decimal("0.68"), msg + "（左侧反转，置信度低于趋势）")
+
+
+def _decide_etf_for_watching(
+    f: Features,
+) -> tuple[str, Decimal, list[str], list[str], list[dict]]:
+    """ETF 自选侧主决策。"""
+    extra_reasons: list[str] = []
+    extra_risks: list[str] = []
+    trace = _new_trace(Decimal("0.55"), "watch", "ETF 自选默认起点 watch @ 0.55")
+    record, _raise_to, _current = _make_recorder(trace)
+
+    # 流动性硬检查（成交额过低 → avoid）
+    if f.amount_yi is not None and f.amount_yi < _ETF_TURNOVER_AVOID_YI:
+        record("etf_low_liquidity", "avoid", Decimal("0.70"),
+               f"ETF 成交额 {f.amount_yi:.2f} 亿过低（< {_ETF_TURNOVER_AVOID_YI}），流动性陷阱")
+        extra_risks.append(
+            f"ETF 当日成交额 {f.amount_yi:.2f} 亿过低，存在流动性陷阱，避免追买"
+        )
+        return "avoid", Decimal("0.70"), extra_reasons, extra_risks, trace
+    if f.amount_yi is not None and f.amount_yi < _ETF_TURNOVER_WARN_YI:
+        extra_risks.append(f"⚠️ ETF 当日成交额 {f.amount_yi:.2f} 亿偏低，注意滑点风险")
+
+    # LOW_REGIMES：avoid
+    if f.regime in LOW_REGIMES:
+        record("etf_low_regime", "avoid", Decimal("0.70"),
+               f"ETF 价格 {f.regime} 创新低 → avoid")
+        extra_risks.append(f"ETF 价格 {f.regime} 创新低，不追买")
+        return "avoid", Decimal("0.70"), extra_reasons, extra_risks, trace
+
+    # ETF buy 候选评估
+    buy_eval = _evaluate_etf_self_select_buy(f)
+    if buy_eval is not None:
+        action, confidence, reason = buy_eval
+        record("etf_buy_path", action, confidence, reason[:120])
+        extra_reasons.append(reason)
+        return action, confidence, extra_reasons, extra_risks, trace
+
+    # 跨境 ETF 加提示
+    if f.etf_category == ETF_CATEGORY_CROSS_BORDER:
+        extra_risks.append("跨境 QDII ETF：A 股主力资金面参考价值低，请结合外盘判断")
+
+    # 默认 watch
+    extra_reasons.append("ETF 信号不足，继续观察")
+    return "watch", Decimal("0.55"), extra_reasons, extra_risks, trace
+
+
+def _decide_etf_for_holding(
+    f: Features, max_single_pct: Decimal,
+) -> tuple[str, Decimal, list[str], list[dict]]:
+    """ETF 持仓侧主决策。"""
+    extra_reasons: list[str] = []
+    trace = _new_trace(Decimal("0.55"), "hold", "ETF 持仓默认起点 hold @ 0.55")
+    record, raise_to, current = _make_recorder(trace)
+
+    cross_border = (f.etf_category == ETF_CATEGORY_CROSS_BORDER)
+    commodity_or_bond = (f.etf_category in (ETF_CATEGORY_COMMODITY, ETF_CATEGORY_BOND))
+
+    # === sell：本地 ETF 破位 + 资金 PERSISTENT_OUTFLOW ===
+    if (not cross_border and not commodity_or_bond
+            and f.regime in LOW_REGIMES and f.ff_regime == FUND_PERSISTENT_OUTFLOW):
+        record("etf_low_regime+outflow", "sell", Decimal("0.78"),
+               f"ETF 创新低（{f.regime}）+ 主力 PERSISTENT_OUTFLOW → sell")
+        extra_reasons.append("ETF 创新低 + 主力持续流出，建议止损退出")
+
+    # === trim：本地 ETF 创新高但主力流出（顶部分歧）===
+    elif (not cross_border and not commodity_or_bond
+            and f.regime in HIGH_REGIMES and f.ff_regime == FUND_PERSISTENT_OUTFLOW):
+        record("etf_high+outflow", "trim", Decimal("0.68"),
+               f"ETF 创新高（{f.regime}）+ 主力 PERSISTENT_OUTFLOW → trim（顶部分歧）")
+        extra_reasons.append("ETF 价格创新高但主力持续流出，顶部分歧明显")
+
+    # === trim：本地 ETF 创新高 + 5 日资金反向（趋势末段）===
+    elif (not cross_border and not commodity_or_bond
+            and f.regime in HIGH_REGIMES and f.ff_reversal == FUND_REVERSAL_DOWN):
+        record("etf_high+reversal_down", "trim", Decimal("0.65"),
+               f"ETF 创新高 + 5 日资金转流出 → trim")
+        extra_reasons.append("ETF 创新高但 5 日资金已转流出，趋势可能末段")
+
+    # === 仓位超限（同股票）===
+    if f.weight_pct > max_single_pct and f.current is not None and f.avg_cost > 0:
+        cur = to_decimal(f.current, "current")
+        if cur > f.avg_cost:
+            record("etf_weight_over_cap", "trim", Decimal("0.70"),
+                   f"ETF 持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
+            extra_reasons.append("ETF 仓位超过单票上限且已有浮盈，建议减仓")
+
+    # === 残股识别（摊薄成本 >> 现价）===
+    if f.current is not None and f.avg_cost > 0:
+        cur = to_decimal(f.current, "current")
+        if f.avg_cost > cur * _ETF_RESIDUAL_THRESHOLD:
+            offset_pct = float((f.avg_cost - cur) / cur * 100)
+            extra_reasons.append(
+                f"⚠️ 残股识别：ETF 摊薄成本 {f.avg_cost} vs 现价 {cur}（偏离 +{offset_pct:.0f}%），"
+                "属于历史追涨杀跌后剩余仓位；trim/sell 信号对其操作意义有限，建议分批退出而非死守"
+            )
+
+    # === 流动性预警 ===
+    if f.amount_yi is not None and f.amount_yi < _ETF_TURNOVER_WARN_YI:
+        extra_reasons.append(
+            f"⚠️ ETF 当日成交额 {f.amount_yi:.2f} 亿偏低，减仓时分批避免冲击成本"
+        )
+
+    # === 跨境 / 商品 / 债券提示 ===
+    if cross_border:
+        extra_reasons.append(
+            "跨境 QDII ETF：A 股主力资金面参考价值低，请结合外盘（如纳指 / 标普）判断"
+        )
+    elif commodity_or_bond:
+        extra_reasons.append(
+            f"{f.etf_category} 类 ETF：资金面 / 主题分析意义有限，"
+            "决策应结合标的资产价格（黄金 / 国债收益率等）"
+        )
+
+    action, confidence = current()
+    return action, confidence, extra_reasons, trace
 
 
 # ── 决策分支：持仓 vs 自选 ───────────────────────────────────────
@@ -378,15 +630,29 @@ def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str
 
 
 def _build_sources(analysis: dict, f: Features) -> list[str]:
-    """组装审计用 sources：最近 3 条公告 PDF + price_history.regime + fund_flow + market_regime。"""
+    """组装审计用 sources：最近 3 条公告 PDF + price_history.regime + fund_flow + market_regime。
+
+    ETF 的 sources 略有不同：不挂公告（ETF 没有上市公司公告），但会附 ETF 元数据
+    （category / 当日成交额 / 规模），方便人 / Agent 反查决策依据。
+    """
     sources: list[str] = []
-    announcements = analysis.get("announcements") or []
-    for item in announcements[:3]:
-        title = item.get("title") or "公告"
-        pdf = item.get("pdf_url") or "-"
-        sources.append(f"{item.get('date')}: {title} ({pdf})")
-    if not sources:
-        sources.append("analyze_company.quote")
+    if not f.is_etf:
+        # 股票：公告 + 价格 + 资金 + 大盘
+        announcements = analysis.get("announcements") or []
+        for item in announcements[:3]:
+            title = item.get("title") or "公告"
+            pdf = item.get("pdf_url") or "-"
+            sources.append(f"{item.get('date')}: {title} ({pdf})")
+        if not sources:
+            sources.append("analyze_company.quote")
+    else:
+        # ETF：元数据 + 价格 + 资金 + 大盘
+        sources.append(f"etf.category={f.etf_category or '-'}")
+        if f.amount_yi is not None:
+            sources.append(f"etf.turnover={f.amount_yi:.2f}yi（当日成交额）")
+        if f.market_cap_yi is not None:
+            sources.append(f"etf.size={f.market_cap_yi:.1f}yi（规模）")
+
     sources.append(f"price_history.regime={f.regime or '-'}")
     if f.ff_available:
         def _fmt(v: float | None) -> str:
@@ -404,6 +670,7 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
 
 def _decision_from_analysis(
     target_market: str,
+    target_code: str,
     snapshot: dict | None,
     analysis: dict,
     capital_total: Decimal,
@@ -418,7 +685,7 @@ def _decision_from_analysis(
     - RISK_ON：在 reasons 头部加一句宏观正向提示，但不会主动加仓 / 升档。
     - NEUTRAL / 缺数据：完全不影响 action。
     """
-    analysis = {**analysis, "market": target_market}
+    analysis = {**analysis, "market": target_market, "code": target_code}
     f = _extract_features(snapshot, analysis, capital_total, market_regime)
 
     # 1. 各维度信号收集（只贡献 reasons / risks 文案，不触发 action）
@@ -429,14 +696,20 @@ def _decision_from_analysis(
         reasons.extend(r)
         risks.extend(k)
 
-    # 2. 决策分支：持仓侧 vs 自选侧
+    # 2. 决策分支：持仓侧 vs 自选侧（ETF 走专用决策树，不依赖公告维度）
     if f.qty > 0:
-        action, confidence, more_reasons, trace = _decide_for_holding(f, max_single_pct)
+        if f.is_etf:
+            action, confidence, more_reasons, trace = _decide_etf_for_holding(f, max_single_pct)
+        else:
+            action, confidence, more_reasons, trace = _decide_for_holding(f, max_single_pct)
         reasons.extend(more_reasons)
         if action == "hold" and not reasons:
             reasons.append("当前没有触发明显的减仓或卖出信号")
     else:
-        action, confidence, more_reasons, more_risks, trace = _decide_for_watching(f)
+        if f.is_etf:
+            action, confidence, more_reasons, more_risks, trace = _decide_etf_for_watching(f)
+        else:
+            action, confidence, more_reasons, more_risks, trace = _decide_for_watching(f)
         reasons.extend(more_reasons)
         risks.extend(more_risks)
 
@@ -802,6 +1075,7 @@ def analyze_now(conn, account_id: int, account_slug: str, account_display_name: 
         snapshot = snapshots.get((tgt_market, tgt_code))
         decision = _decision_from_analysis(
             tgt_market,
+            tgt_code,
             snapshot,
             analysis,
             capital_total,
