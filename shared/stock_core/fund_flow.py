@@ -14,15 +14,19 @@
 
 接口路径迭代历史
   - 2026-05 之前：``/api/qt/stock/fflow/daykline/get`` 返回 13 列（含占比 + 收盘价 + 涨跌幅）
-  - 2026-05 起：``/daykline/get`` 在 push2his 被反爬封禁（TLS 后服务端立刻 RST）；
+  - 2026-05-初：``/daykline/get`` 在 push2his 被反爬封禁（TLS 后服务端立刻 RST）；
     切到 ``/api/qt/stock/fflow/kline/get`` 仍能拿到 ~120 天数据，但接口只返回前
     6 列（日期 + 主力 / 小 / 中 / 大 / 超大 金额），占比 / 收盘价 / 涨跌幅都没了。
-    上层 ``_render_text`` 和决策树都已能容忍这些字段为 ``None``，因此切路径不破坏
-    任何 caller，只是 ``render_analysis_text`` 的 "当日资金分层占比" 表会显示 "-"。
+  - 2026-05-14：东财把反爬规则反过来 —— ``/kline/get`` 被封，``/daykline/get`` 复活，
+    后者继续返回完整 13 列。本模块从此改为 **双路径自动 fallback**：
+    先试 daykline（更丰富的 13 列），失败再 fallback 到 kline，再失败 raise。
+    上层 ``_render_text`` 和决策树都已能容忍 6 列输入（缺的字段为 ``None``），
+    因此 fallback 安全；只是 ``render_analysis_text`` 的 "当日资金分层占比" 表
+    在走 kline 路径时会显示 "-"。
 
 字段对应（接口返回 ``klines`` 的逗号分隔字符串）：
   f51 日期 / f52 主力净额(元) / f53 小单 / f54 中单 / f55 大单 / f56 超大单
-  ── 以下字段 2026-05 起新接口不再返回，旧 daykline 路径已被封禁 ──
+  ── 以下字段只在 daykline 路径才返回 ──
   f57 主力净占比(%) / f58 小单占比 / f59 中单占比 / f60 大单占比 / f61 超大单占比
   f62 收盘价 / f63 涨跌幅(%)
 """
@@ -41,8 +45,13 @@ from .tz import CN_TZ, is_market_open
 from .xueqiu import XueqiuClient
 
 
-_FFLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
-# 仍按 13 列向后端要，新接口只返回前 6 列；解析层会容忍少列。
+_FFLOW_URLS: tuple[str, ...] = (
+    # 主路径：daykline（13 列，含占比 / 收盘价 / 涨跌幅）—— 2026-05-14 复活
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+    # 备用路径：kline（6 列）—— 2026-05 初切上来的，目前被反爬封禁
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get",
+)
+# 仍按 13 列向后端要，6 列路径解析层会容忍少列。
 _FFLOW_FIELDS1 = "f1,f2,f3,f7"
 _FFLOW_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 _FFLOW_UT = "b2884a393a59ad64002292a3e90d46a5"
@@ -134,11 +143,15 @@ def _parse_kline_row(row: str) -> dict[str, Any] | None:
     }
 
 
-# schema_version=2: 2026-05 接口从 /daykline/get 切到 /kline/get，行从 13 列变 6 列。
-# +1 让旧缓存（里面 close / change_pct / *_pct 都是历史值）自然失效。
-@cached(ttl=_ttl_for_call, key_prefix="ff", schema_version=2)
+# schema_version=3: 2026-05-14 重新启用 daykline 双路径 fallback，bump 让旧缓存失效，
+# 让下一次抓取能拿到更丰富的 13 列数据（含 close / change_pct / *_pct）。
+@cached(ttl=_ttl_for_call, key_prefix="ff", schema_version=3)
 def fetch_daily_fund_flow(market: str, code: str) -> list[dict]:
     """拉东财个股资金流日 K（约 120 个交易日）。
+
+    **双路径 fallback**：依次尝试 ``_FFLOW_URLS`` 里的每个 URL，
+    任意一个返回非空 klines 即返回。东财的反爬规则会在 daykline / kline
+    之间来回切换，这种 fallback 让本接口对反爬规则变化具有韧性。
 
     market: ``'a'`` / ``'hk'``；其它（``'us'`` / 北交所）由 :func:`eastmoney_secid`
     抛 ValueError，调用方应自己跳过这两类。
@@ -153,11 +166,24 @@ def fetch_daily_fund_flow(market: str, code: str) -> list[dict]:
         "secid": secid,
         "ut": _FFLOW_UT,
     }
-    r = fetch(_FFLOW_URL, params=params, timeout=10)
-    payload = r.json() or {}
-    klines = ((payload.get("data") or {}).get("klines") or [])
-    rows = [_parse_kline_row(k) for k in klines]
-    return [r for r in rows if r is not None and r.get("date")]
+    last_err: Exception | None = None
+    for url in _FFLOW_URLS:
+        try:
+            r = fetch(url, params=params, timeout=10)
+            payload = r.json() or {}
+            klines = ((payload.get("data") or {}).get("klines") or [])
+            if not klines:
+                # 接口返回空，尝试下一个路径（rc=102 或 data:null 都会走这里）
+                continue
+            rows = [_parse_kline_row(k) for k in klines]
+            return [row for row in rows if row is not None and row.get("date")]
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    # 所有路径都失败，抛最后一个错误（让上层走 retry / cache 兜底）
+    if last_err is not None:
+        raise last_err
+    return []
 
 
 def _to_yi(value: float | None) -> float | None:

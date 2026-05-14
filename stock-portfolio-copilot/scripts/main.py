@@ -350,6 +350,18 @@ def cmd_portfolio_show(args, conn) -> None:
     if not rows:
         print("暂无持仓快照，请先运行 portfolio sync")
         return
+
+    # 默认隐藏 qty=0 的清零仓位（仍有 realized_pnl，但已无操作意义），加 --include-cleared 显示全部
+    if not args.include_cleared:
+        from decimal import Decimal as _D
+        active = [r for r in rows if r["qty"] is not None and _D(str(r["qty"])) != 0]
+        hidden = len(rows) - len(active)
+        rows = active
+        if hidden > 0:
+            print(f"（已隐藏 {hidden} 个 qty=0 的已清零标的，用 --include-cleared 显示全部）")
+            if not rows:
+                return
+
     print(
         render_table(
             ["市场", "代码", "持仓", "摊薄成本", "币种", "最新价", "未实现盈亏", "已实现盈亏", "市值(CNY)", "快照时间"],
@@ -590,6 +602,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_portfolio_show = p_portfolio_sub.add_parser("show")
     _add_account_arg(p_portfolio_show)
     p_portfolio_show.add_argument("--market")
+    p_portfolio_show.add_argument(
+        "--include-cleared",
+        action="store_true",
+        help="同时显示 qty=0 的已清零仓位（默认隐藏，仅展示活仓）",
+    )
     p_portfolio_show.set_defaults(func=cmd_portfolio_show)
     p_portfolio_check = p_portfolio_sub.add_parser(
         "check",
