@@ -24,11 +24,14 @@ FUND_REVERSAL_UP = "OUTFLOW_TO_INFLOW"
 MARKET_REGIME_RISK_OFF = "RISK_OFF"
 MARKET_REGIME_RISK_ON = "RISK_ON"
 MARKET_REGIME_NEUTRAL = "NEUTRAL"
+MARKET_A = "a"
+MARKET_HK = "hk"
 ACTION_LABELS = {
     "avoid": "回避",
     "buy": "买入候选",
     "focus": "重点关注",
     "hold": "持有",
+    "probe": "试探买入",
     "sell": "卖出",
     "trim": "减仓",
     "watch": "观察",
@@ -38,6 +41,7 @@ ACTION_DESCRIPTIONS = {
     "buy": "满足更严格的买入候选条件，仍需结合开盘承接和仓位计划执行",
     "focus": "宽松信号较好，优先加入盯盘清单，但还没有达到买入条件",
     "hold": "持仓未触发明确处理信号",
+    "probe": "港股大盘弱市下，反转买入候选降档为试探：先用常规仓位 1/4-1/3 建首仓，确认修复后再加第二笔",
     "sell": "持仓亏损与风险信号同时触发，优先考虑退出",
     "trim": "仓位、风险或价格结构触发减仓条件",
     "watch": "继续跟踪，等待更清晰的触发条件",
@@ -96,6 +100,8 @@ class Features:
       - 新加字段只改本类 + ``_extract_features`` 一处
       - 决策树本身从 200 行降到 ~80 行，可读性显著上升
     """
+    # 标的元数据
+    market: str
     # 行情
     current: object | None
     change_pct: object | None
@@ -151,6 +157,7 @@ def _extract_features(
         weight_pct = q_money(position_value_cny / capital_total * Decimal("100"))
 
     return Features(
+        market=snapshot.get("market") if snapshot else str(analysis.get("market") or ""),
         current=quote.get("current"),
         change_pct=quote.get("percent"),
         regime=price_history.get("regime"),
@@ -344,7 +351,7 @@ def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str
         return "avoid", Decimal("0.68"), extra_reasons, extra_risks, trace
 
     buy_eval = _evaluate_self_select_buy(
-        f.regime, f.risk_hits, f.positive_hits, f.change_pct,
+        f.market, f.regime, f.risk_hits, f.positive_hits, f.change_pct,
         f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.market_regime,
     )
     if buy_eval is not None:
@@ -396,6 +403,7 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
 # ── 主入口（调度器）──────────────────────────────────────────────
 
 def _decision_from_analysis(
+    target_market: str,
     snapshot: dict | None,
     analysis: dict,
     capital_total: Decimal,
@@ -403,11 +411,14 @@ def _decision_from_analysis(
     market_regime: str | None = None,
 ) -> dict:
     """市场风险偏好软联动（``market_regime``）规则：
-    - RISK_OFF：自选侧 buy 候选自动降为 focus（在 ``_evaluate_self_select_buy`` 内处理）；
+    - RISK_OFF：
+      - A 股自选侧 buy 候选自动降为 focus（在 ``_evaluate_self_select_buy`` 内处理）
+      - 港股自选侧若属于反转修复型 buy，可降档为 probe（试探买入，小仓位首仓）
       持仓侧 hold 仅加风险提示，不强制降仓；已经在 trim / sell 的 confidence + 0.05。
     - RISK_ON：在 reasons 头部加一句宏观正向提示，但不会主动加仓 / 升档。
     - NEUTRAL / 缺数据：完全不影响 action。
     """
+    analysis = {**analysis, "market": target_market}
     f = _extract_features(snapshot, analysis, capital_total, market_regime)
 
     # 1. 各维度信号收集（只贡献 reasons / risks 文案，不触发 action）
@@ -584,6 +595,7 @@ def _is_strict_buy_candidate(
 
 
 def _evaluate_self_select_buy(
+    market: str,
     regime: str | None,
     risk_hits: int,
     positive_hits: int,
@@ -598,7 +610,9 @@ def _evaluate_self_select_buy(
 
     None 表示不构成 buy 候选，调用方应继续往下走 focus / watch 分支。
     返回非 None 时：
-      - 大盘 RISK_OFF：action 自动降为 ``focus``，置信度更低，reason 注明降级原因
+      - 大盘 RISK_OFF：
+        - A 股 / 非港股：action 自动降为 ``focus``，置信度更低
+        - 港股：趋势追高仍降为 ``focus``；反转修复路径允许降档为 ``probe``（试探买入）
       - 否则：action 为 ``buy``，trend 路径置信度更高（0.72），reversal 较低（0.68）
     """
     buy_ok, buy_path = _is_strict_buy_candidate(
@@ -614,7 +628,7 @@ def _evaluate_self_select_buy(
             return (
                 "focus",
                 Decimal("0.65"),
-                trend_msg + "；但大盘 RISK_OFF，先降级为 focus 等大盘修复",
+                trend_msg + "；但大盘 RISK_OFF，趋势追高先降级为 focus，等大盘修复后再考虑放大仓位",
             )
         return "buy", Decimal("0.72"), trend_msg
     if buy_path == "reversal":
@@ -623,6 +637,12 @@ def _evaluate_self_select_buy(
             "属于左侧 / 反转型 buy，置信度低于趋势型"
         )
         if market_regime == MARKET_REGIME_RISK_OFF:
+            if market == MARKET_HK:
+                return (
+                    "probe",
+                    Decimal("0.60"),
+                    reversal_msg + "；港股大盘仍 RISK_OFF，但允许用常规仓位 1/4-1/3 试探首仓，确认修复后再加第二笔",
+                )
             return (
                 "focus",
                 Decimal("0.62"),
@@ -781,6 +801,7 @@ def analyze_now(conn, account_id: int, account_slug: str, account_display_name: 
         analysis_cache[(tgt_market, tgt_code)] = analysis
         snapshot = snapshots.get((tgt_market, tgt_code))
         decision = _decision_from_analysis(
+            tgt_market,
             snapshot,
             analysis,
             capital_total,
@@ -857,7 +878,7 @@ def render_analysis_text(payload: dict) -> str:
                     f"年线 {'站上' if idx.get('above_ma200') else '跌破'})"
                 )
         lines.append("")
-        lines.append("软联动：RISK_OFF 时，自选侧本应 buy 的标的会自动降为 focus；持仓侧 hold 仅加风险提示，不强制减仓。")
+        lines.append("软联动：A 股 RISK_OFF 时，自选侧本应 buy 的标的会降为 focus；港股 RISK_OFF 下仅反转修复型标的可降档为试探买入（小仓位首仓）；持仓侧 hold 仅加风险提示，不强制减仓。")
         lines.append("")
 
     for item in payload.get("results", []):

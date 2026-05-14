@@ -85,6 +85,20 @@ $SPC report pnl --account default
 **输出审计**：决策的 `sources` 末尾会带上 `market_regime=...` 与 `fund_flow.regime=... (1d=..., 3d=..., 5d=..., 20d=...)`，
 任何 buy / focus 升档都能反查到具体路径与触发数据。
 
+**特殊降档：港股 RISK_OFF 下的 `probe`（试探买入）**
+
+| 触发条件 | 输出 action | 默认 confidence | 仓位建议 |
+|---|---|---|---|
+| 港股 + 大盘 RISK_OFF + 反转买入路径全部条件满足 | `probe` | 0.60 | 常规仓位的 1/4-1/3 建首仓，确认修复后再加第二笔 |
+| A 股 + 大盘 RISK_OFF + 反转买入路径全部条件满足 | `focus` | 0.62 | 不入场，等大盘修复 |
+| 任意市场 + 大盘 RISK_OFF + 趋势追高路径 | `focus` | 0.65 | 不追高，等大盘修复 |
+
+> `probe` 通道**只对港股开放**（A 股 / 其它市场永远走 focus），原因：港股流动性 / 估值结构和 A 股不同，弱市里完全不让进场会错过左侧反转修复型机会；但 A 股 RISK_OFF 区间普遍有更明显的"集中下跌"特征，宁可保守。
+>
+> `probe` 仓位的**后续生命周期不由本 skill 自动管理**（持仓侧 `_decide_for_holding` 不感知 entry_kind）。一旦 probe 入场后，加仓 / 止损 / 转正常仓位由人或 LLM 决定。建议把 probe 仓位的初始计划（止损价、加仓条件）记录在交易日志里。
+>
+> 注意 `confidence` 与"动作激进度"并不正相关：probe（0.60）激进度高于 focus（0.62），但 confidence 反而更低——因为 confidence 反映"系统对该建议的把握"，弱市抢反转把握自然更低。
+
 参考实现位置：`spc_core/decision.py` 的 `_is_trend_buy_candidate` / `_is_reversal_buy_candidate` / `_evaluate_self_select_buy`。
 
 
@@ -102,8 +116,10 @@ $SPC report pnl --account default
 **联动规则**（软联动，不强制改仓）：
 
 1. **市场隔离**：A 股标的只看 A 股 regime，港股标的只看港股 regime（两者常常分化）
-2. **RISK_OFF + 自选侧**：本应严格触发 buy 候选的标的，自动降级为 focus，
-   不进入"今日可买入清单"，理由会写明"等大盘修复"
+2. **RISK_OFF + 自选侧**：
+   - A 股：本应严格触发 buy 候选的标的，自动降级为 focus，不进入"今日可买入清单"
+   - 港股：趋势追高型 buy 同样降级为 focus；但**反转修复型 buy** 允许降档为 `probe`
+     （试探买入），只能做常规仓位的 `1/4-1/3` 首仓，确认修复后再加第二笔
 3. **RISK_OFF + 持仓侧**：hold **不会**自动降为 trim；只是给 risks 列表追加
    "大盘 RISK_OFF，宏观防御为主"提示，最终是否减仓由人或 LLM 决定
 4. **RISK_OFF + 已 trim/sell**：confidence + 0.05（防御信号得到宏观背书）

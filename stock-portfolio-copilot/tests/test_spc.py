@@ -454,8 +454,8 @@ class SPCTestCase(unittest.TestCase):
         # 反转路径置信度低于趋势路径（0.68 vs 0.72）
         self.assertEqual(decision["confidence"], "0.68")
 
-    def test_reversal_buy_blocked_by_market_risk_off(self):
-        """反转路径同样受大盘 RISK_OFF 压制，自动降为 focus。"""
+    def test_hk_reversal_buy_downgrades_to_probe_under_market_risk_off(self):
+        """港股在 RISK_OFF 下，反转修复型 buy 不再一刀切 focus，而是降档为 probe。"""
         add_watch(self.conn, self.acct_id, "hk", "00700", "")
 
         class ReversalProvider(FakeProvider):
@@ -490,7 +490,9 @@ class SPCTestCase(unittest.TestCase):
         )
         decision = payload["results"][0]["decision"]
 
-        self.assertEqual(decision["action"], "focus")
+        self.assertEqual(decision["action"], "probe")
+        self.assertEqual(decision["action_label"], "试探买入")
+        self.assertEqual(decision["confidence"], "0.60")
         self.assertTrue(
             any("反转买入路径" in r for r in decision["reasoning"]),
             f"reasoning={decision['reasoning']}",
@@ -498,6 +500,111 @@ class SPCTestCase(unittest.TestCase):
         self.assertTrue(
             any("RISK_OFF" in r for r in decision["reasoning"]),
             f"reasoning={decision['reasoning']}",
+        )
+        self.assertTrue(
+            any("1/4-1/3" in r for r in decision["reasoning"]),
+            f"reasoning={decision['reasoning']}",
+        )
+
+    def test_hk_trend_buy_stays_focus_under_market_risk_off(self):
+        """港股在 RISK_OFF 下仍不追趋势高位，趋势型 buy 应继续降为 focus。"""
+        add_watch(self.conn, self.acct_id, "hk", "00700", "")
+
+        class TrendProvider(FakeProvider):
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                quote = self.fetch_quote(market, code)
+                if (market, code) == ("hk", "00700"):
+                    return self._attach_fund_flow(market, code, {
+                        "fetched_at": quote["fetched_at"],
+                        "info": {"name": "腾讯控股"},
+                        "quote": {"current": quote["current"], "percent": 2.5},
+                        "price_history": {"regime": "NEW_YTD_HIGH"},
+                        "announcements": [
+                            {"date": "2026-05-01", "title": "回购股份公告", "pdf_url": "h1"},
+                        ],
+                    })
+                return super().analyze(market, code, ann_days, with_peers, skip)
+
+        provider = TrendProvider(
+            fund_flow_overrides={
+                ("hk", "00700"): _ff(
+                    regime="PERSISTENT_INFLOW",
+                    m3=2.0, m5=4.0, m20=15.0, main_today_yi=1.2,
+                ),
+            },
+            market_regime_overrides={"hk": "RISK_OFF"},
+        )
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "focus")
+        self.assertEqual(decision["confidence"], "0.65")
+        self.assertTrue(
+            any("趋势追高先降级为 focus" in r for r in decision["reasoning"]),
+            f"reasoning={decision['reasoning']}",
+        )
+
+    def test_a_share_reversal_buy_stays_focus_under_market_risk_off(self):
+        """A 股在 RISK_OFF 下，反转修复型 buy 应继续降为 focus（不复用港股 probe 通道）。
+
+        守护"港股 probe 分支没有意外波及 A 股"——_evaluate_self_select_buy 里的
+        ``if market == MARKET_HK`` 一旦被改坏，本用例会立刻失败。
+        """
+        add_watch(self.conn, self.acct_id, "a", "300308", "")
+
+        class AReversalProvider(FakeProvider):
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                quote = self.fetch_quote(market, code)
+                if (market, code) == ("a", "300308"):
+                    return self._attach_fund_flow(market, code, {
+                        "fetched_at": quote["fetched_at"],
+                        "info": {"name": "中际旭创"},
+                        "quote": {"current": quote["current"], "percent": 1.5},
+                        "price_history": {"regime": "NEAR_YTD_LOW"},
+                        "concepts": ["通信", "光模块"],
+                        "peers": [],
+                        "announcements": [
+                            {"date": "2026-05-01", "title": "回购股份公告", "pdf_url": "a1"},
+                            {"date": "2026-05-02", "title": "新品发布合作", "pdf_url": "a2"},
+                        ],
+                    })
+                return super().analyze(market, code, ann_days, with_peers, skip)
+
+        provider = AReversalProvider(
+            fund_flow_overrides={
+                ("a", "300308"): _ff(
+                    regime="PERSISTENT_INFLOW", reversal="OUTFLOW_TO_INFLOW",
+                    m3=2.0, m5=4.0, m20=15.0, main_today_yi=1.2,
+                ),
+            },
+            market_regime_overrides={"a": "RISK_OFF"},
+        )
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "focus")
+        self.assertEqual(decision["confidence"], "0.62")
+        self.assertTrue(
+            any("反转买入路径" in r for r in decision["reasoning"]),
+            f"reasoning={decision['reasoning']}",
+        )
+        self.assertTrue(
+            any("RISK_OFF" in r for r in decision["reasoning"]),
+            f"reasoning={decision['reasoning']}",
+        )
+        # 关键回归断言：A 股不允许走 probe 通道
+        self.assertNotEqual(decision["action"], "probe")
+        self.assertFalse(
+            any("1/4-1/3" in r for r in decision["reasoning"]),
+            f"A 股不应出现港股专属的 1/4-1/3 试探文案；reasoning={decision['reasoning']}",
         )
 
     def test_low_regimes_still_block_buy_even_with_strong_reversal(self):
