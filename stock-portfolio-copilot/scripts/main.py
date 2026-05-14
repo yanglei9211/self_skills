@@ -19,7 +19,7 @@ from spc_core.ledger import (
     list_trades,
     list_watch,
 )
-from spc_core.portfolio import pnl_summary, sync_portfolio
+from spc_core.portfolio import check_portfolio_consistency, pnl_summary, sync_portfolio
 from spc_core.settings import (
     capital_settings,
     resolve_account,
@@ -147,8 +147,20 @@ def cmd_account_set_default(args, conn) -> None:
 
 def cmd_position_init(args, conn) -> None:
     acct = _resolve(conn, args)
-    add_position_seed(conn, acct["id"], args.market, args.code, args.qty, args.cost, args.currency, args.time, args.note)
-    print(f"已初始化持仓：{args.market} {args.code}（账户 {acct['slug']}）")
+    add_position_seed(
+        conn,
+        acct["id"],
+        args.market,
+        args.code,
+        args.qty,
+        args.cost,
+        args.currency,
+        args.time,
+        args.note,
+        force=args.force,
+    )
+    suffix = "（覆盖已有 seed）" if args.force else ""
+    print(f"已初始化持仓：{args.market} {args.code}（账户 {acct['slug']}）{suffix}")
 
 
 def cmd_position_list(args, conn) -> None:
@@ -289,6 +301,47 @@ def cmd_portfolio_sync(args, conn) -> None:
         print("没有可同步的持仓")
         return
     print(f"已同步 {len(rows)} 个标的（账户 {acct['slug']}）")
+
+
+def cmd_portfolio_check(args, conn) -> None:
+    """检查每只标的的 seed + trade + snapshot 一致性，识别 NO_TRADES / 残股等问题。"""
+    acct = _resolve(conn, args)
+    reports = check_portfolio_consistency(conn, acct["id"])
+    if not reports:
+        print(f"账户 {acct['slug']}：没有 seed 也没有 trade，无需检查")
+        return
+
+    print(f"账户 {acct['slug']} 一致性检查（{len(reports)} 个标的）")
+    print()
+
+    status_counts = {"OK": 0, "WARN": 0, "FAIL": 0}
+    rows = []
+    for r in reports:
+        status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+        flag = {"OK": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(r["status"], r["status"])
+        snap_qty = r["snapshot_qty"] or "-"
+        rows.append([
+            flag,
+            r["market"],
+            r["code"],
+            r["seed_qty"] or "-",
+            str(r["trade_count"]),
+            r["derived_qty"],
+            snap_qty,
+            "\n".join(r["messages"]) if r["messages"] else "-",
+        ])
+    print(
+        render_table(
+            ["状态", "市场", "代码", "seed_qty", "trades", "推算 qty", "snapshot qty", "问题"],
+            rows,
+        )
+    )
+    print()
+    print(
+        f"汇总：✅ OK {status_counts.get('OK', 0)} / "
+        f"⚠️ WARN {status_counts.get('WARN', 0)} / "
+        f"❌ FAIL {status_counts.get('FAIL', 0)}"
+    )
 
 
 def cmd_portfolio_show(args, conn) -> None:
@@ -455,6 +508,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_position_init.add_argument("--currency")
     p_position_init.add_argument("--time")
     p_position_init.add_argument("--note", default="")
+    p_position_init.add_argument(
+        "--force",
+        action="store_true",
+        help="覆盖已有 seed（仅适用于残股摊薄等罕见场景；有 trade 时仍会被拒绝）",
+    )
     p_position_init.set_defaults(func=cmd_position_init)
     p_position_list = p_position_sub.add_parser("list")
     _add_account_arg(p_position_list)
@@ -533,6 +591,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_account_arg(p_portfolio_show)
     p_portfolio_show.add_argument("--market")
     p_portfolio_show.set_defaults(func=cmd_portfolio_show)
+    p_portfolio_check = p_portfolio_sub.add_parser(
+        "check",
+        help="一致性审计：seed + trade + snapshot 是否对齐，识别 NO_TRADES / 残股 / 数据漂移",
+    )
+    _add_account_arg(p_portfolio_check)
+    p_portfolio_check.set_defaults(func=cmd_portfolio_check)
 
     # analyze
     p_analyze = sub.add_parser("analyze")

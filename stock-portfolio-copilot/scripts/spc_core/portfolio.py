@@ -204,6 +204,126 @@ def sync_portfolio(conn, account_id: int, market: str | None = None, code: str |
     return snapshots
 
 
+def check_portfolio_consistency(conn, account_id: int) -> list[dict]:
+    """检查每只标的的 seed + trade + 推算持仓 + 最新 snapshot 是否一致。
+
+    用于 ``spc portfolio check``，主要识别以下问题：
+
+    - **NO_TRADES**: 有 seed 但 trade_ledger 完全为空。意味着所有买卖都没记录，
+      `report pnl` 的已实现盈亏会偏离实际。常见原因：agent 错把 sell 写成
+      position init。**这是最严重的告警**。
+    - **STALE_SNAPSHOT**: 推算出的 qty 和最新 portfolio_snapshot 不一致，
+      通常说明改过 seed/trade 后忘了 `portfolio sync`。
+    - **RESIDUAL_POSITION**: 摊薄成本远高于当前价（≥ 50% 偏离），疑似残股，
+      给提醒但不报错；并把 trim/sell 信号在分析时弱化的提示作为建议。
+    - **NEGATIVE_QTY**: 卖出量 > 累计买入 + seed 量，逻辑破损。
+    - **OK**: 全部检查通过。
+
+    Returns:
+        每个 (market, code) 一条记录，dict 含 status / messages / 详情。
+    """
+    rows = conn.execute(
+        """
+        SELECT market, code FROM (
+            SELECT market, code FROM position_seed WHERE account_id = ?
+            UNION
+            SELECT market, code FROM trade_ledger WHERE is_deleted = 0 AND account_id = ?
+        ) ORDER BY market, code
+        """,
+        (account_id, account_id),
+    ).fetchall()
+    symbols = [(r["market"], r["code"]) for r in rows]
+
+    reports: list[dict] = []
+    for sym_market, sym_code in symbols:
+        seed = conn.execute(
+            "SELECT qty, cost_price, currency, note FROM position_seed "
+            "WHERE account_id = ? AND market = ? AND code = ?",
+            (account_id, sym_market, sym_code),
+        ).fetchone()
+        trades = conn.execute(
+            "SELECT side, qty, price FROM trade_ledger "
+            "WHERE account_id = ? AND market = ? AND code = ? AND is_deleted = 0 "
+            "ORDER BY trade_time, id",
+            (account_id, sym_market, sym_code),
+        ).fetchall()
+        snap = conn.execute(
+            "SELECT qty, avg_cost_price, last_price FROM portfolio_snapshot "
+            "WHERE account_id = ? AND market = ? AND code = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (account_id, sym_market, sym_code),
+        ).fetchone()
+
+        # 推算理论 qty / 摊薄成本
+        qty = Decimal(seed["qty"]) if seed else Decimal("0")
+        cost_basis = qty * Decimal(seed["cost_price"]) if seed else Decimal("0")
+        avg_cost = Decimal(seed["cost_price"]) if seed else Decimal("0")
+        for t in trades:
+            t_qty = to_decimal(t["qty"], "qty")
+            t_price = to_decimal(t["price"], "price")
+            if t["side"] == "buy":
+                cost_basis = cost_basis + t_qty * t_price
+                qty = qty + t_qty
+                avg_cost = (cost_basis / qty) if qty != 0 else Decimal("0")
+            else:
+                if t_qty > qty:
+                    # NEGATIVE_QTY 单独处理
+                    qty = qty - t_qty
+                    continue
+                cost_basis = cost_basis - avg_cost * t_qty
+                qty = qty - t_qty
+                if qty == 0:
+                    avg_cost = Decimal("0")
+                    cost_basis = Decimal("0")
+
+        messages: list[str] = []
+        status = "OK"
+
+        if seed and not trades:
+            status = "WARN"
+            messages.append(
+                "NO_TRADES: 有 seed 但 trade_ledger 完全为空 — "
+                "如果你期间发生过买卖却没看到记录，几乎可以确定有 sell 被错走成了 position init"
+            )
+
+        if qty < 0:
+            status = "FAIL"
+            messages.append(f"NEGATIVE_QTY: 推算持仓 = {qty}，sell 数量超过买入 + seed")
+
+        if snap and snap["qty"] is not None:
+            snap_qty = to_decimal(snap["qty"], "snap.qty")
+            if abs(snap_qty - qty) > Decimal("0.0001"):
+                status = max(status, "WARN", key=["OK", "WARN", "FAIL"].index)
+                messages.append(
+                    f"STALE_SNAPSHOT: snapshot qty={snap_qty} 与 seed+trade 推算 qty={qty} 不一致，"
+                    f"请运行 'spc portfolio sync'"
+                )
+
+        if snap and snap["last_price"] is not None and qty > 0 and avg_cost > 0:
+            last_price = to_decimal(snap["last_price"], "last_price")
+            deviation = abs(avg_cost - last_price) / max(last_price, Decimal("0.0001"))
+            if deviation >= Decimal("0.5"):
+                messages.append(
+                    f"RESIDUAL_POSITION: 摊薄成本 {avg_cost} vs 现价 {last_price}，"
+                    f"偏离 {float(deviation) * 100:.1f}%，疑似残股；分析侧的 trim/sell 信号对其操作意义有限"
+                )
+
+        reports.append({
+            "market": sym_market,
+            "code": sym_code,
+            "status": status,
+            "seed_qty": str(seed["qty"]) if seed else None,
+            "seed_cost": str(seed["cost_price"]) if seed else None,
+            "trade_count": len(trades),
+            "derived_qty": decimal_str(qty),
+            "derived_avg_cost": decimal_str(avg_cost) if avg_cost > 0 else None,
+            "snapshot_qty": str(snap["qty"]) if snap and snap["qty"] is not None else None,
+            "messages": messages,
+        })
+
+    return reports
+
+
 def pnl_summary(conn, account_id: int) -> dict:
     snaps = latest_snapshots(conn, account_id)
     total_value = Decimal("0")

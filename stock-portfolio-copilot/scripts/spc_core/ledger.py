@@ -18,32 +18,112 @@ from spc_core.utils import (
 )
 
 
-def add_position_seed(conn, account_id: int, market: str, code: str, qty: str, cost: str, currency: str | None, time_text: str | None, note: str) -> None:
+def add_position_seed(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    qty: str,
+    cost: str,
+    currency: str | None,
+    time_text: str | None,
+    note: str,
+    *,
+    force: bool = False,
+) -> None:
+    """写入或覆盖 position_seed。
+
+    护栏（防止 agent / 用户错把买卖当成 init）:
+
+    1. **已有 trade_ledger 记录时**：硬拒绝（force 都救不了）。
+       买入/卖出请用 ``trade add``。如确实要清零重置，先 ``trade delete --id <id>``
+       清空所有 trade 再 init。这条护栏防的是「sell 误用 position init 覆盖 qty」
+       这种导致已实现盈亏归零、交易历史丢失的破坏性场景。
+
+    2. **已有 seed 但无 trade**：默认拒绝，``--force`` 允许覆盖（UPDATE）。
+       典型场景：残股摊薄成本调整、手动改正录入错误。
+
+    3. **首次 init**：直接 INSERT。
+
+    Raises:
+        ValueError: 触发护栏 1 / 2 时抛出，带可执行的修复提示。
+    """
     ensure_defaults(conn)
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
+
+    # 护栏 1：检查 trade_ledger（含 buy + sell）
+    trade_count = conn.execute(
+        "SELECT COUNT(*) FROM trade_ledger "
+        "WHERE account_id = ? AND market = ? AND code = ? AND is_deleted = 0",
+        (account_id, norm_market, norm_code),
+    ).fetchone()[0]
+    if trade_count > 0:
+        raise ValueError(
+            f"{norm_market.upper()} {norm_code} 已有 {trade_count} 条 trade 记录，"
+            f"禁止用 position init（会破坏盈亏统计 / 交易历史）。\n"
+            f"  - 买入/卖出请用：spc trade add --account ... --side buy/sell ...\n"
+            f"  - 若真的要重置 seed：先 'spc trade list --account ... --market ... --code ...' "
+            f"找到对应 trade，逐条 'spc trade delete --id <id>'，再 init --force"
+        )
+
+    # 护栏 2：检查已有 seed
+    existing = conn.execute(
+        "SELECT id, qty, cost_price FROM position_seed "
+        "WHERE account_id = ? AND market = ? AND code = ?",
+        (account_id, norm_market, norm_code),
+    ).fetchone()
+    if existing and not force:
+        raise ValueError(
+            f"{norm_market.upper()} {norm_code} 已有 seed（qty={existing['qty']}, "
+            f"cost={existing['cost_price']}）。\n"
+            f"  - 如果是「买入/卖出」操作：请用 spc trade add\n"
+            f"  - 如果是「残股摊薄成本调整」等罕见场景：加 --force 才能覆盖\n"
+            f"  - 不要把 init --force 当成日常成交记账工具"
+        )
+
     qty_d = q_qty(to_decimal(qty, "qty"))
     cost_d = q_price(to_decimal(cost, "cost"))
     curr = (currency or default_currency(norm_market)).upper()
     now = utc_now_iso()
-    conn.execute(
-        """
-        INSERT INTO position_seed(account_id, market, code, qty, cost_price, currency, seed_time, note, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            account_id,
-            norm_market,
-            norm_code,
-            decimal_str(qty_d),
-            decimal_str(cost_d),
-            curr,
-            parse_user_time(time_text),
-            note or "",
-            now,
-            now,
-        ),
-    )
+
+    if existing:
+        # force 覆盖：UPDATE 而不是 DELETE+INSERT，避免 id 跳号
+        conn.execute(
+            """
+            UPDATE position_seed
+               SET qty = ?, cost_price = ?, currency = ?, seed_time = ?, note = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (
+                decimal_str(qty_d),
+                decimal_str(cost_d),
+                curr,
+                parse_user_time(time_text),
+                note or "",
+                now,
+                existing["id"],
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO position_seed(account_id, market, code, qty, cost_price, currency, seed_time, note, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                norm_market,
+                norm_code,
+                decimal_str(qty_d),
+                decimal_str(cost_d),
+                curr,
+                parse_user_time(time_text),
+                note or "",
+                now,
+                now,
+            ),
+        )
     conn.commit()
 
 

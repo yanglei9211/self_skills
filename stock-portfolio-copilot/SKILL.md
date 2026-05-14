@@ -41,6 +41,28 @@ SPC="$SELF_SKILLS_HOME/stock-portfolio-copilot/bin/spc"
 
 `bin/spc` 内部已经做了"先在父目录找 .venv，找不到再解析软链回真身找 .venv"的兜底，所以同一台机器上软链路径或真身路径调用结果一致。
 
+## ⚠️ position init vs trade add：红线纪律
+
+**这是最容易被 agent 用错的命令对，错一次就破坏整个账户的盈亏历史。** 必须严格区分：
+
+| 场景 | 正确命令 | 备注 |
+|---|---|---|
+| 首次建仓（db 完全没记录过该标的）| `position init` | 一次性，未来不应再 init |
+| **任何买入、卖出、加仓、减仓、止损、清仓** | **`trade add --side buy/sell`** | 走 trade_ledger，自动算成本和已实现盈亏 |
+| 残股摊薄成本调整（多次止损后剩余的小仓位，按"残股法"重新核算）| `position init --force` | 仅当**已无 trade 记录**时，且 note 必须写明原因 |
+| 已有 trade 但想重置 seed | **不允许**，需先 `trade delete` 全部清空 | 破坏性操作，避免 |
+
+代码层面已经加了双重护栏（`spc_core/ledger.py:add_position_seed`）：
+
+1. 该标的 **已有 trade 记录** → `position init` 直接拒绝（`--force` 也救不了）
+2. 该标的 **已有 seed 但无 trade** → 默认拒绝，必须 `--force` 才能覆盖
+
+⚠️ **agent 务必牢记**：当用户说「卖出/买入/止损/加仓某只股票」时，无论是否要更新持仓数量，**唯一正确的命令是 `trade add`**，**永远不要走 `position init` 的快捷路径**。后者只用于：
+- 工具初次启用时录入历史持仓基线
+- 残股法成本核算（罕见，且必须配 `--force --note`）
+
+错误的副作用：trade_ledger 留空 → `report pnl` 已实现盈亏归零 → 历史无法复盘 → 数据不可逆。
+
 ## 常用命令
 
 下面示例都假设你已经按上文设好了 `$SPC` 变量。
@@ -48,8 +70,10 @@ SPC="$SELF_SKILLS_HOME/stock-portfolio-copilot/bin/spc"
 ```bash
 $SPC position init --account default --market a --code 300750 --qty 1000 --cost 245.30
 $SPC trade add --account default --market hk --code 01810 --side buy --qty 500 --price 19.10 --time "2026-05-08 10:32:00"
+$SPC trade add --account default --market a --code 600584 --side sell --qty 300 --price 54.58 --time "2026-05-14 14:55:02"
 $SPC portfolio sync --account default
 $SPC portfolio show --account default
+$SPC portfolio check --account default   # 检查 seed + trade + snapshot 一致性（含残股识别）
 $SPC watch add --account default --market hk --code 01810
 $SPC capital set --account default --total 500000 --max-single-pct 20
 $SPC analyze now --account default --scope holdings
