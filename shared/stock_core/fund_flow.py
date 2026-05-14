@@ -239,6 +239,275 @@ def _classify_reversal(roll_5d: dict[str, Any], roll_20d: dict[str, Any]) -> str
     return None
 
 
+# ────────────────────────────────────────────────────────────────
+# 多周期交叉验证（cross_validate）
+# ────────────────────────────────────────────────────────────────
+# 单看 20d `regime` 标签会有滞后性：标签可能停留在 PERSISTENT_INFLOW，
+# 但近 5d 已经转流出。本模块把"短期优先 / 共振确认 / 加速衰竭 / reversal 背书"
+# 这套人肉判读固化成结构化字段，让上游（报告渲染 + spc 决策树 + LLM prompt）
+# 都拿同一份结论，不再各自手算。
+
+# 主判断采用 1d / 5d / 10d / 20d 四周期；3d 留给 buy 路径阈值检查。
+_CROSS_PERIODS: tuple[str, ...] = ("1d", "5d", "10d", "20d")
+
+# 共振 / 加速判定的最小窗口净额阈值（亿元）：低于此值视为"接近 0，方向不可靠"。
+_DIR_ZERO_EPS_YI = 0.05
+
+# concentration_5d_in_20d 的"近期集中"判定阈值。
+_CONCENTRATION_THRESHOLD = 0.5
+
+
+def _direction(value: float | None) -> str | None:
+    """把净额映射为方向标签。``None`` 透传，绝对值过小视为 ``"flat"``。"""
+    if value is None:
+        return None
+    if abs(value) < _DIR_ZERO_EPS_YI:
+        return "flat"
+    return "in" if value > 0 else "out"
+
+
+def _daily_avg(window: dict[str, Any]) -> float | None:
+    """窗口日均净额（亿元）。"""
+    total = window.get("main_yi")
+    days = window.get("days")
+    if total is None or not days:
+        return None
+    return total / days
+
+
+def _classify_acceleration(rolling: dict[str, dict]) -> str | None:
+    """比较 10d→5d→1d 日均净额变化，输出加速 / 衰竭 / 平稳。
+
+    判定逻辑：以 5d 方向为主轴
+      - 5d 流入：1d 日均 > 5d 日均 > 10d 日均 → ``accelerating_inflow``
+                 1d 日均 < 5d 日均（同向变小）→ ``decelerating_inflow``
+                 1d 反向（变流出）→ ``decelerating_inflow``（已经在变坏）
+      - 5d 流出：对称
+      - 5d ~ 0：``stable``
+      - 任一周期日均缺失：``None``
+    """
+    avg_1d = _daily_avg(rolling.get("1d") or {})
+    avg_5d = _daily_avg(rolling.get("5d") or {})
+    avg_10d = _daily_avg(rolling.get("10d") or {})
+    if avg_1d is None or avg_5d is None or avg_10d is None:
+        return None
+    if abs(avg_5d) < _DIR_ZERO_EPS_YI:
+        return "stable"
+    if avg_5d > 0:
+        if avg_1d > avg_5d > avg_10d:
+            return "accelerating_inflow"
+        if avg_1d < avg_5d:
+            return "decelerating_inflow"
+        return "stable"
+    # avg_5d < 0
+    if avg_1d < avg_5d < avg_10d:
+        return "accelerating_outflow"
+    if avg_1d > avg_5d:
+        return "decelerating_outflow"
+    return "stable"
+
+
+def _classify_verdict(
+    *,
+    directions: dict[str, str | None],
+    all_aligned: bool,
+    short_long_conflict: bool,
+    acceleration: str | None,
+    reversal_label: str | None,
+    reversal_confirmed: bool | None,
+) -> tuple[str, str]:
+    """综合给一个枚举 + 一句中文解读。
+
+    优先级（高 → 低）：
+      1. 共振流入 / 共振流出（all_aligned + accelerating）
+      2. reversal 已确认（被短期数据背书）
+      3. 短长冲突（短期与 20d 方向反转）
+      4. 衰竭（同向但日均在变小）
+      5. 持续 / 震荡（兜底）
+    """
+    accel = acceleration or ""
+    if all_aligned and accel == "accelerating_inflow":
+        return "RESONANCE_INFLOW", "四周期一致流入且日均加速，主力共振进场"
+    if all_aligned and accel == "accelerating_outflow":
+        return "RESONANCE_OUTFLOW", "四周期一致流出且日均加速，主力共振撤离"
+
+    if reversal_label == "OUTFLOW_TO_INFLOW" and reversal_confirmed:
+        return "REVERSAL_INFLOW_CONFIRMED", "1d/5d 同向流入背书 OUTFLOW_TO_INFLOW，反转已确认"
+    if reversal_label == "INFLOW_TO_OUTFLOW" and reversal_confirmed:
+        return "REVERSAL_OUTFLOW_CONFIRMED", "1d/5d 同向流出背书 INFLOW_TO_OUTFLOW，趋势切换已确认"
+    if reversal_label and reversal_confirmed is False:
+        return "REVERSAL_UNCONFIRMED", "20d 标签提示反转，但 1d/5d 未同向背书，反转未确认"
+
+    if short_long_conflict:
+        long_dir = directions.get("20d")
+        if long_dir == "in":
+            return "WEAKENING_INFLOW", "20d 仍流入但短期已转流出，趋势在退潮"
+        if long_dir == "out":
+            return "WEAKENING_OUTFLOW", "20d 仍流出但短期已转流入，下跌动能在衰竭"
+        return "MIXED", "短长方向冲突"
+
+    if accel == "decelerating_inflow":
+        return "DECELERATING_INFLOW", "同向流入但日均在变小，动能减弱"
+    if accel == "decelerating_outflow":
+        return "DECELERATING_OUTFLOW", "同向流出但日均在变小，抛压减弱"
+
+    long_dir = directions.get("20d")
+    if long_dir == "in":
+        return "PERSISTENT_INFLOW_STEADY", "持续净流入，节奏平稳"
+    if long_dir == "out":
+        return "PERSISTENT_OUTFLOW_STEADY", "持续净流出，节奏平稳"
+    return "MIXED", "进出反复 / 数据混乱"
+
+
+def cross_validate(rolling: dict[str, dict] | None,
+                   reversal: str | None = None) -> dict[str, Any]:
+    """对 1d/5d/10d/20d 四周期做交叉验证，输出结构化结论。
+
+    设计目标：
+      - 让"短期优先 / 共振确认 / 加速衰竭 / reversal 背书"四项判读只在这里算一次
+      - 上游（报告 / 决策树 / prompt）只引用字段，不再各自重写算法
+      - 输入残缺（缺 1d 或 10d）时也能给出能用的字段，缺什么置 ``None``
+
+    Args:
+        rolling: ``summarize_fund_flow`` 输出的 rolling 子树
+        reversal: ``summarize_fund_flow`` 输出的 reversal 标签（用于判断
+                  ``reversal_confirmed`` 是否被短期数据背书）
+
+    Returns: 见模块文档；任何字段都允许为 ``None``，调用方需自己 None 兜底。
+    """
+    rolling = rolling or {}
+    nets = {p: (rolling.get(p) or {}).get("main_yi") for p in _CROSS_PERIODS}
+    directions = {p: _direction(nets[p]) for p in _CROSS_PERIODS}
+
+    # all_aligned: 四周期都有数据且方向都是 in（或都是 out）；flat 不算"对齐"
+    nonnull_dirs = [d for d in directions.values() if d is not None]
+    if len(nonnull_dirs) == len(_CROSS_PERIODS):
+        all_in = all(d == "in" for d in nonnull_dirs)
+        all_out = all(d == "out" for d in nonnull_dirs)
+        all_aligned = all_in or all_out
+    else:
+        all_aligned = False
+
+    # short_long_conflict：1d 与 20d 反向，且 5d 与 20d 反向（避免单日噪音误判）
+    d1, d5, d20 = directions.get("1d"), directions.get("5d"), directions.get("20d")
+    short_long_conflict = (
+        d20 in ("in", "out")
+        and d5 in ("in", "out")
+        and d1 in ("in", "out")
+        and d5 != d20
+        and d1 != d20
+    )
+    if short_long_conflict:
+        conflict_kind = (
+            "short_outflow_long_inflow" if d20 == "in" else "short_inflow_long_outflow"
+        )
+    else:
+        conflict_kind = None
+
+    # concentration_5d_in_20d：仅在 5d / 20d 方向一致时定义；否则为 None
+    concentration: float | None = None
+    n5, n20 = nets.get("5d"), nets.get("20d")
+    if (
+        n5 is not None and n20 is not None
+        and abs(n20) >= _DIR_ZERO_EPS_YI
+        and ((n5 > 0 and n20 > 0) or (n5 < 0 and n20 < 0))
+    ):
+        concentration = round(abs(n5) / abs(n20), 3)
+
+    acceleration = _classify_acceleration(rolling)
+
+    # reversal_confirmed：reversal 标签是否被短期数据背书
+    #   - OUTFLOW_TO_INFLOW 需要 1d ≥ 0 且 5d > 0
+    #   - INFLOW_TO_OUTFLOW 需要 1d ≤ 0 且 5d < 0
+    #   - 无 reversal 标签 → None
+    #   - 有 reversal 但 1d/5d 缺数据 → None
+    reversal_confirmed: bool | None = None
+    if reversal in ("OUTFLOW_TO_INFLOW", "INFLOW_TO_OUTFLOW"):
+        if n5 is None or nets.get("1d") is None:
+            reversal_confirmed = None
+        elif reversal == "OUTFLOW_TO_INFLOW":
+            reversal_confirmed = (nets["1d"] >= 0) and (n5 > 0)
+        else:
+            reversal_confirmed = (nets["1d"] <= 0) and (n5 < 0)
+
+    is_resonance = all_aligned and (
+        acceleration in ("accelerating_inflow", "accelerating_outflow")
+    )
+
+    verdict, verdict_zh = _classify_verdict(
+        directions=directions,
+        all_aligned=all_aligned,
+        short_long_conflict=short_long_conflict,
+        acceleration=acceleration,
+        reversal_label=reversal,
+        reversal_confirmed=reversal_confirmed,
+    )
+
+    return {
+        "periods": list(_CROSS_PERIODS),
+        "directions": directions,
+        "all_aligned": all_aligned,
+        "short_long_conflict": short_long_conflict,
+        "conflict_kind": conflict_kind,
+        "acceleration": acceleration,
+        "concentration_5d_in_20d": concentration,
+        "is_resonance": is_resonance,
+        "reversal_confirmed": reversal_confirmed,
+        "verdict": verdict,
+        "verdict_zh": verdict_zh,
+    }
+
+
+# ────────────────────────────────────────────────────────────────
+# regime / reversal 中文标签（供 fund_flow.py / company_analysis.py 等共享）
+# ────────────────────────────────────────────────────────────────
+# 之前 fund_flow.py::_render_text 写过一份纯文字版，company_analysis.py
+# 又写过一份带 emoji 版，规则改了要改两处。这里固化成模块级常量，调用方
+# 选 ``with_emoji=True`` 决定是否带前缀 emoji。
+
+REGIME_LABEL_ZH: dict[str, str] = {
+    "PERSISTENT_INFLOW": "持续净流入",
+    "PERSISTENT_OUTFLOW": "持续净流出",
+    "OSCILLATING": "震荡 / 进出反复",
+}
+
+REGIME_EMOJI: dict[str, str] = {
+    "PERSISTENT_INFLOW": "🟢",
+    "PERSISTENT_OUTFLOW": "🔴",
+    "OSCILLATING": "⚪️",
+}
+
+REVERSAL_LABEL_ZH: dict[str, str] = {
+    "INFLOW_TO_OUTFLOW": "近 5 日由流入转为流出",
+    "OUTFLOW_TO_INFLOW": "近 5 日由流出转为流入",
+}
+
+REVERSAL_EMOJI: dict[str, str] = {
+    "INFLOW_TO_OUTFLOW": "⚠️",
+    "OUTFLOW_TO_INFLOW": "🟡",
+}
+
+
+def regime_label(regime: str | None, *, with_emoji: bool = False) -> str:
+    """统一渲染 regime 标签。``None`` 返回 ``"-"``。"""
+    if not regime:
+        return "-"
+    zh = REGIME_LABEL_ZH.get(regime, regime)
+    if with_emoji:
+        return f"{REGIME_EMOJI.get(regime, '')} {zh}".strip()
+    return zh
+
+
+def reversal_label(reversal: str | None, *, with_emoji: bool = False) -> str | None:
+    """统一渲染 reversal 标签。``None`` 返回 ``None``（调用方可省略本行）。"""
+    if not reversal:
+        return None
+    zh = REVERSAL_LABEL_ZH.get(reversal, reversal)
+    if with_emoji:
+        return f"{REVERSAL_EMOJI.get(reversal, '')} {zh}".strip()
+    return zh
+
+
 def summarize_fund_flow(rows: list[dict]) -> dict[str, Any]:
     """把日 K 列表压成"今日 + 1d/3d/5d/10d/20d 累计 + regime + reversal"摘要。"""
     if not rows:
@@ -274,6 +543,9 @@ def summarize_fund_flow(rows: list[dict]) -> dict[str, Any]:
         "rolling": rolling,
         "regime": regime,
         "reversal": reversal,
+        # 多周期交叉验证结论：消费方（报告渲染 + spc 决策树）直接读字段，
+        # 不要再各自手算 1d/5d/10d/20d 方向、加速、共振。
+        "cross_validation": cross_validate(rolling, reversal),
     }
 
 
@@ -403,22 +675,17 @@ def _render_text(market: str, code: str, summary: dict[str, Any]) -> str:
         return f"# 主力资金动向 {market.upper()} {code}\n\n（暂无数据：{summary['error']}）"
     lines: list[str] = []
     lines.append(f"# 主力资金动向 {market.upper()} {code} — 截至 {summary.get('as_of')}")
-    regime = summary.get("regime") or "-"
-    regime_zh = {
-        "PERSISTENT_INFLOW": "持续净流入",
-        "PERSISTENT_OUTFLOW": "持续净流出",
-        "OSCILLATING": "震荡 / 进出反复",
-    }.get(regime, regime)
-    lines.append(f"\n> regime: **{regime}** ({regime_zh})")
+    regime = summary.get("regime")
+    lines.append(f"\n> regime: **{regime or '-'}** ({regime_label(regime)})")
     reversal = summary.get("reversal")
-    if reversal:
-        rev_zh = {
-            "INFLOW_TO_OUTFLOW": "近 5 日由流入转为流出",
-            "OUTFLOW_TO_INFLOW": "近 5 日由流出转为流入",
-        }.get(reversal, reversal)
+    rev_zh = reversal_label(reversal)
+    if reversal and rev_zh:
         lines.append(f"> reversal: **{reversal}** ({rev_zh})")
     if market == "hk":
         lines.append("> _港股资金分级为东财根据成交单笔大小推算，仅供参考。_")
+    cross = summary.get("cross_validation") or {}
+    if cross.get("verdict"):
+        lines.append(f"> cross_validation: **{cross['verdict']}** ({cross.get('verdict_zh') or '-'})")
 
     lines.append("")
     lines.append("## 累计窗口")
@@ -433,6 +700,31 @@ def _render_text(market: str, code: str, summary: dict[str, Any]) -> str:
             f"| {win} | {amount_str} | "
             f"{w.get('inflow_days', 0)} / {w.get('outflow_days', 0)} (共 {w.get('days', 0)} 天) |"
         )
+
+    # 多周期解读：交叉验证结论一并铺开，让 LLM 不用再现算
+    if cross:
+        lines.append("")
+        lines.append("## 多周期解读")
+        lines.append(f"- **verdict**：`{cross.get('verdict')}` — {cross.get('verdict_zh') or '-'}")
+        dirs = cross.get("directions") or {}
+        dir_str = " / ".join(f"{p}={dirs.get(p) or '-'}" for p in cross.get("periods") or _CROSS_PERIODS)
+        lines.append(f"- **方向**：{dir_str}")
+        lines.append(
+            f"- **共振**：all_aligned={cross.get('all_aligned')}, "
+            f"acceleration={cross.get('acceleration') or '-'}, "
+            f"is_resonance={cross.get('is_resonance')}"
+        )
+        if cross.get("short_long_conflict"):
+            lines.append(f"- **短长冲突**：⚠️ {cross.get('conflict_kind')}（短期优先 → 信号偏弱）")
+        conc = cross.get("concentration_5d_in_20d")
+        if conc is not None:
+            tag = "（≥0.5，近期集中）" if conc >= _CONCENTRATION_THRESHOLD else ""
+            lines.append(f"- **5d/20d 集中度**：{conc}{tag}")
+        rc = cross.get("reversal_confirmed")
+        if rc is True:
+            lines.append("- **reversal 背书**：✅ 1d/5d 同向背书，反转已确认")
+        elif rc is False:
+            lines.append("- **reversal 背书**：❌ 1d/5d 未同向背书，反转未确认（不应据此 buy）")
 
     today = summary.get("today") or {}
     close = today.get("close")

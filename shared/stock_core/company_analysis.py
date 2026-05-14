@@ -66,7 +66,11 @@ from stock_core.announcements import (
     _parse_a_share_symbol,
 )
 from stock_core.cache import cached
-from stock_core.fund_flow import get_fund_flow_summary
+from stock_core.fund_flow import (
+    get_fund_flow_summary,
+    regime_label,
+    reversal_label,
+)
 from stock_core.http import fetch
 from stock_core.kline import fetch_daily_kline, summarize_price_history
 from stock_core.symbols import normalize_symbol  # re-exported below for backward compat
@@ -689,21 +693,18 @@ def render_text(data: dict) -> str:
         today_ff = ff.get("today") or {}
         rolling = ff.get("rolling") or {}
         regime = ff.get("regime")
-        regime_label = {
-            "PERSISTENT_INFLOW": "🟢 持续净流入",
-            "PERSISTENT_OUTFLOW": "🔴 持续净流出",
-            "OSCILLATING": "⚪️ 震荡 / 进出反复",
-        }.get(regime, regime or "-")
         reversal = ff.get("reversal")
-        reversal_label = {
-            "INFLOW_TO_OUTFLOW": "⚠️ 近 5 日由流入转为流出",
-            "OUTFLOW_TO_INFLOW": "🟡 近 5 日由流出转为流入",
-        }.get(reversal) if reversal else None
+        cross = ff.get("cross_validation") or {}
 
         lines.append(f"## 三、主力资金动向（截至 {ff.get('as_of')}，东方财富 fflow）")
-        lines.append(f"- **regime**：{regime_label}")
-        if reversal_label:
-            lines.append(f"- **reversal**：{reversal_label}")
+        lines.append(f"- **regime**：{regime_label(regime, with_emoji=True)}")
+        rev_zh = reversal_label(reversal, with_emoji=True)
+        if rev_zh:
+            lines.append(f"- **reversal**：{rev_zh}")
+        if cross.get("verdict"):
+            lines.append(
+                f"- **cross_validation**：`{cross['verdict']}` — {cross.get('verdict_zh') or '-'}"
+            )
         if market == "hk":
             lines.append("- _港股资金分级为东财根据成交单笔大小推算，仅供参考。_")
         lines.append("")
@@ -719,6 +720,33 @@ def render_text(data: dict) -> str:
                 f"{w.get('inflow_days', 0)} / {w.get('outflow_days', 0)} (共 {w.get('days', 0)} 天) |"
             )
         lines.append("")
+        # 多周期解读：把交叉验证结论铺开，避免 LLM 在 prompt 里手算 1d/5d/10d/20d
+        if cross:
+            lines.append("### 多周期解读（cross_validation）")
+            dirs = cross.get("directions") or {}
+            periods = cross.get("periods") or ["1d", "5d", "10d", "20d"]
+            dir_str = " / ".join(f"{p}={dirs.get(p) or '-'}" for p in periods)
+            lines.append(f"- **方向**：{dir_str}")
+            lines.append(
+                f"- **共振**：all_aligned={cross.get('all_aligned')}, "
+                f"acceleration=`{cross.get('acceleration') or '-'}`, "
+                f"is_resonance={cross.get('is_resonance')}"
+            )
+            if cross.get("short_long_conflict"):
+                lines.append(
+                    f"- **短长冲突**：⚠️ `{cross.get('conflict_kind')}`"
+                    "（短期优先 → 信号偏弱）"
+                )
+            conc = cross.get("concentration_5d_in_20d")
+            if conc is not None:
+                tag = "（≥0.5，近期集中）" if conc >= 0.5 else ""
+                lines.append(f"- **5d/20d 集中度**：{conc}{tag}")
+            rc = cross.get("reversal_confirmed")
+            if rc is True:
+                lines.append("- **reversal 背书**：✅ 1d/5d 同向背书，反转已确认")
+            elif rc is False:
+                lines.append("- **reversal 背书**：❌ 1d/5d 未同向背书，反转未确认（不应据此 buy）")
+            lines.append("")
         lines.append(
             f"### 当日资金分层（收盘 {today_ff.get('close')}，"
             f"涨跌 {today_ff.get('change_pct')}%）"

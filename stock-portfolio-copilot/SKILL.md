@@ -106,8 +106,35 @@ $SPC report pnl --account default
   避免变成"系统主动建议抄底"
 - 大盘 RISK_OFF 时**两条路径都自动降级为 focus**（仅 reasoning 里说明降级原因），与现有大盘联动一致
 
-**输出审计**：决策的 `sources` 末尾会带上 `market_regime=...` 与 `fund_flow.regime=... (1d=..., 3d=..., 5d=..., 20d=...)`，
-任何 buy / focus 升档都能反查到具体路径与触发数据。
+**输出审计**：决策的 `sources` 末尾会带上：
+- `market_regime=...`
+- `fund_flow.regime=... (1d=..., 3d=..., 5d=..., 10d=..., 20d=...)`
+- `fund_flow.cross_validation=<verdict> (reversal_confirmed=..., short_long_conflict=...)`
+
+任何 buy / focus 升档都能反查到具体路径、四周期数据与多周期交叉验证结论；`spc explain` 也会展开 `confidence_trace`。
+
+### 主力资金多周期交叉验证（硬约束）
+
+> **下沉提示**：判定算法已经在 `shared/stock_core/fund_flow.py::cross_validate` 实现，
+> `summarize_fund_flow` 会自动把结论挂在 `fund_flow.cross_validation` 字段。
+> 决策树（本 skill）+ 个股报告（stock-market-hub）+ LLM prompt（agent-constraints.md）
+> **统一引用同一份字段**，不要再各自手算 1d/5d/10d/20d 方向 / 加速 / 共振。
+
+代码层硬门控（`spc_core/decision.py`）：
+
+1. **reversal 必须被短期数据背书**：`fund_flow.reversal == OUTFLOW_TO_INFLOW` 时，
+   `cross_validation.reversal_confirmed` 必须为 True（即 1d ≥ 0 且 5d > 0）
+   才允许走反转路径；False 时反转路径直接被否决，落回 focus。
+   决策代码：`_is_reversal_buy_candidate` 中的 `if ff_reversal == FUND_REVERSAL_UP and cross.reversal_confirmed is False: return False`
+2. **趋势路径动能减弱软扣分**：`cross_validation.acceleration == decelerating_inflow` 时，
+   trend buy confidence 由 0.72 降到 0.67，并在 reasons 中标注 `decelerating_inflow`。
+   决策代码：`_evaluate_self_select_buy` 中的 trend 分支。
+
+LLM 在 prompt 里只需引用 `cross_validation` 字段做结论（短长冲突 / 共振 / 加速），
+完整字段语义见 `stock-market-hub/references/agent-constraints.md §3 第 6 条`。
+
+**违规**：仅引用 `regime` 标签或仅检查 `3/5d 累计 ≥ 0` 而不复述 `cross_validation`
+字段的结论 → 视为 `stock-market-hub/references/agent-constraints.md §3 第 6 条` 违规。
 
 **特殊降档：港股 RISK_OFF 下的 `probe`（试探买入）**
 

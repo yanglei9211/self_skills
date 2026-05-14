@@ -137,7 +137,11 @@ class Features:
     ff_1d: float | None
     ff_3d: float | None
     ff_5d: float | None
+    ff_10d: float | None
     ff_20d: float | None
+    # 多周期交叉验证（来自 shared/stock_core/fund_flow.py::cross_validate）
+    # 缺数据 / 老缓存没这个字段时为 None；决策树读到 None 时退化为只看 regime/reversal。
+    ff_cross: dict | None
     # 大盘
     market_regime: str | None
 
@@ -205,7 +209,9 @@ def _extract_features(
         ff_1d=_ff_yi("1d"),
         ff_3d=_ff_yi("3d"),
         ff_5d=_ff_yi("5d"),
+        ff_10d=_ff_yi("10d"),
         ff_20d=_ff_yi("20d"),
+        ff_cross=(fund_flow.get("cross_validation") if ff_available else None),
         market_regime=market_regime,
     )
 
@@ -604,7 +610,7 @@ def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str
 
     buy_eval = _evaluate_self_select_buy(
         f.market, f.regime, f.risk_hits, f.positive_hits, f.change_pct,
-        f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.market_regime,
+        f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.ff_cross, f.market_regime,
     )
     if buy_eval is not None:
         action, confidence, buy_reason = buy_eval
@@ -659,8 +665,17 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
             return "-" if v is None else f"{v:+.2f}yi"
         sources.append(
             f"fund_flow.regime={f.ff_regime} "
-            f"(1d={_fmt(f.ff_1d)}, 3d={_fmt(f.ff_3d)}, 5d={_fmt(f.ff_5d)}, 20d={_fmt(f.ff_20d)})"
+            f"(1d={_fmt(f.ff_1d)}, 3d={_fmt(f.ff_3d)}, 5d={_fmt(f.ff_5d)}, "
+            f"10d={_fmt(f.ff_10d)}, 20d={_fmt(f.ff_20d)})"
         )
+        if isinstance(f.ff_cross, dict) and f.ff_cross.get("verdict"):
+            verdict = f.ff_cross.get("verdict")
+            confirmed = f.ff_cross.get("reversal_confirmed")
+            conflict = f.ff_cross.get("short_long_conflict")
+            sources.append(
+                f"fund_flow.cross_validation={verdict} "
+                f"(reversal_confirmed={confirmed}, short_long_conflict={conflict})"
+            )
     if f.market_regime is not None:
         sources.append(f"market_regime={f.market_regime}")
     return sources
@@ -805,6 +820,7 @@ def _is_reversal_buy_candidate(
     ff_3d: float | None = None,
     ff_5d: float | None = None,
     ff_reversal: str | None = None,
+    ff_cross: dict | None = None,
 ) -> bool:
     """反转买入路径（左侧抢反转型）：
 
@@ -816,6 +832,13 @@ def _is_reversal_buy_candidate(
     - 近 3 日 + 近 5 日累计资金都为正（确保不是单日反弹）
     - 至少 2 条正向公告，0 条风险公告（比趋势路径要求更高）
     - 当日涨幅不过热
+    - **多周期交叉验证（cross_validation）**：
+      - 当 ff_reversal == OUTFLOW_TO_INFLOW 时，``cross.reversal_confirmed``
+        必须为 True（即 1d/5d 同向流入背书），否则视为"掉头未确认"，本路径不触发
+      - cross 字段缺失（老缓存）时退化为旧行为，仅靠 ff_3d/ff_5d 判断
+      - 注：``cross.short_long_conflict`` 在 PERSISTENT_INFLOW 分支下逻辑上不可达
+        （本函数硬要求 ff_5d > 0，与 conflict 要求 5d 与 20d 反向矛盾），故不在
+        本层做该字段的硬门控；它仍会出现在 cross.verdict 与渲染层供审计
 
     主力资金缺数据时，该路径**不**生效（反转买入比趋势买入更需要资金背书，
     缺数据宁可让标的留在 focus）。
@@ -840,6 +863,11 @@ def _is_reversal_buy_candidate(
         return False
     if ff_5d is None or ff_5d <= 0:
         return False
+    # 多周期交叉验证（cross 缺失时跳过该层硬约束，保持向后兼容）
+    if ff_cross:
+        # 走"reversal 字段触发"路径时，必须 1d/5d 同向背书
+        if ff_reversal == FUND_REVERSAL_UP and ff_cross.get("reversal_confirmed") is False:
+            return False
     return True
 
 
@@ -852,6 +880,7 @@ def _is_strict_buy_candidate(
     ff_3d: float | None = None,
     ff_5d: float | None = None,
     ff_reversal: str | None = None,
+    ff_cross: dict | None = None,
 ) -> tuple[bool, str | None]:
     """聚合调度：返回 (是否 buy 候选, 触发路径名)。
 
@@ -862,6 +891,7 @@ def _is_strict_buy_candidate(
         return True, "trend"
     if _is_reversal_buy_candidate(
         regime, risk_hits, positive_hits, change_pct, ff_regime, ff_3d, ff_5d, ff_reversal,
+        ff_cross,
     ):
         return True, "reversal"
     return False, None
@@ -877,6 +907,7 @@ def _evaluate_self_select_buy(
     ff_3d: float | None,
     ff_5d: float | None,
     ff_reversal: str | None,
+    ff_cross: dict | None,
     market_regime: str | None,
 ) -> tuple[str, Decimal, str] | None:
     """自选侧 buy 决策评估，返回 (action, confidence, reason_msg) 或 None。
@@ -887,28 +918,52 @@ def _evaluate_self_select_buy(
         - A 股 / 非港股：action 自动降为 ``focus``，置信度更低
         - 港股：趋势追高仍降为 ``focus``；反转修复路径允许降档为 ``probe``（试探买入）
       - 否则：action 为 ``buy``，trend 路径置信度更高（0.72），reversal 较低（0.68）
+      - 趋势路径下 ``cross.short_long_conflict`` 触发时：confidence -0.05，
+        reasons 标注"多周期未共振"；但仍走 buy（不一票否决，避免好趋势被噪音误杀）
     """
     buy_ok, buy_path = _is_strict_buy_candidate(
         regime, risk_hits, positive_hits, change_pct, ff_regime, ff_3d, ff_5d, ff_reversal,
+        ff_cross,
     )
     if not buy_ok:
         return None
+    # 趋势路径的"动能减弱"软扣分（不一票否决）：
+    #   trend_buy 已经硬卡 ff_3d/ff_5d ≥ 0，所以这里不会用 short_long_conflict
+    #   （那个要求 5d 与 20d 反向，trend 路径下永远不成立）。
+    #   改用 ``acceleration == decelerating_inflow``：同向流入但日均在变小，
+    #   说明买盘动能在弱化，confidence -0.05；reversal 路径不享受此扣分（因为
+    #   reversal 自身已经被 reversal_confirmed/short_long_conflict 严格门控）。
+    trend_decelerating = (
+        buy_path == "trend"
+        and isinstance(ff_cross, dict)
+        and ff_cross.get("acceleration") == "decelerating_inflow"
+    )
     if buy_path == "trend":
         trend_msg = (
             "【趋势跟随路径】强趋势（创新高）+ 正向信号 + 主力资金短中期不撤离 + 不过热涨幅同时满足"
         )
+        if trend_decelerating:
+            trend_msg += (
+                "；⚠️ 但 cross_validation.acceleration=decelerating_inflow，"
+                "同向流入但日均在变小，动能在弱化 → confidence -0.05"
+            )
         if market_regime == MARKET_REGIME_RISK_OFF:
             return (
                 "focus",
                 Decimal("0.65"),
                 trend_msg + "；但大盘 RISK_OFF，趋势追高先降级为 focus，等大盘修复后再考虑放大仓位",
             )
-        return "buy", Decimal("0.72"), trend_msg
+        base = Decimal("0.72")
+        if trend_decelerating:
+            base = Decimal("0.67")
+        return "buy", base, trend_msg
     if buy_path == "reversal":
         reversal_msg = (
             "【反转买入路径】非破位区间 + 资金已反向流入（近 3/5 日累计转正）+ 多重正向公告 + 不过热涨幅；"
             "属于左侧 / 反转型 buy，置信度低于趋势型"
         )
+        if isinstance(ff_cross, dict) and ff_cross.get("reversal_confirmed") is True:
+            reversal_msg += "；cross_validation.reversal_confirmed=True，1d/5d 同向背书"
         if market_regime == MARKET_REGIME_RISK_OFF:
             if market == MARKET_HK:
                 return (

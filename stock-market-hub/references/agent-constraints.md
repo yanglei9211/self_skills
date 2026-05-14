@@ -103,7 +103,35 @@ PDF 第几页。**
    - `OUTFLOW_TO_INFLOW`（近 5 日反向流入）→ 必须写"近 5 日资金转向流入，下跌动能可能在衰竭"
 4. **当日描述必须给出"机构档位"**（超大单 + 大单的净额与占比），不能只说总主力数字。例：「今日主力净流出 11 亿，**其中超大单 -7 亿、大单 -4 亿**，机构在抛货，散户（中小单）在接」
 5. **港股**：必须加注「港股资金分级为东财根据成交单笔大小推算，仅供参考」字样
-6. **北交所 / 美股 / 缺失**：`fund_flow` 字段为空或带 `error` 时，**直接说"无主力资金流数据，本节略过"**，禁止杜撰
+6. ⚠️ **多周期交叉验证（硬规则）**：
+   `analyze_company.py` 的 `fund_flow.cross_validation` 字段已经把"短期优先 / 共振确认 / 加速衰竭 / reversal 背书"这套判读结构化好了，**直接引用字段，不要在 prompt 里手算**：
+   - `cross_validation.verdict`：综合枚举（取值见下表），结论必须基于它，**禁止仅凭 20d `regime` 标签跳到结论**
+   - `cross_validation.directions`：`{1d, 5d, 10d, 20d}` 各自方向标签（`in` / `out` / `flat`）
+   - `cross_validation.short_long_conflict`（bool）：1d/5d 是否与 20d 反向 → True 时**必须**在结论里点出"短长冲突，短期优先"
+   - `cross_validation.acceleration`：`accelerating_inflow` / `decelerating_inflow` / `accelerating_outflow` / `decelerating_outflow` / `stable`
+   - `cross_validation.is_resonance`（bool）：True 时**必须**写"多周期共振"
+   - `cross_validation.reversal_confirmed`：True / False / None — `reversal` 标签是否被 1d/5d 同向背书；False 时**禁止**用"反转已确认"措辞
+   - `cross_validation.concentration_5d_in_20d`（仅同向时定义）：≥0.5 时说明"近期集中变化"
+
+   verdict 取值参考：
+
+   | verdict | 含义 |
+   |---|---|
+   | `RESONANCE_INFLOW` / `RESONANCE_OUTFLOW` | 四周期一致 + 加速 |
+   | `REVERSAL_INFLOW_CONFIRMED` / `REVERSAL_OUTFLOW_CONFIRMED` | reversal 标签被短期数据背书 |
+   | `REVERSAL_UNCONFIRMED` | reversal 标签未被背书（不应据此 buy） |
+   | `WEAKENING_INFLOW` / `WEAKENING_OUTFLOW` | 长期方向仍在但短期已转向（趋势退潮） |
+   | `DECELERATING_INFLOW` / `DECELERATING_OUTFLOW` | 同向但日均在变小 |
+   | `PERSISTENT_INFLOW_STEADY` / `PERSISTENT_OUTFLOW_STEADY` / `MIXED` | 兜底 |
+
+   **违规判定**：仅引用 `regime` 标签或仅检查 `3/5d 累计 ≥ 0` 而**不**复述/采用 `cross_validation` 字段的结论，视为本条违规。
+
+   **正例**（引用 cross_validation 字段做结论）：
+   > 截至 2026-05-14，宁德时代（SZ300750）`fund_flow.regime=PERSISTENT_INFLOW`，但 `cross_validation.verdict=WEAKENING_INFLOW`，
+   > 1d/5d/10d 均已转流出（`directions={1d:out, 5d:out, 10d:out, 20d:in}`，`short_long_conflict=true`）。
+   > 按短期优先原则，**主力正在退潮**，20d 标签滞后于真实趋势；
+   > reversal 路径不应触发（cross 已硬卡 `reversal_confirmed=false` 时不允许 buy）。
+7. **北交所 / 美股 / 缺失**：`fund_flow` 字段为空或带 `error` 时，**直接说"无主力资金流数据，本节略过"**，禁止杜撰
 
 **反例**：
 > 主力资金近期持续撤离这只股票。

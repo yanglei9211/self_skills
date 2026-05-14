@@ -34,7 +34,7 @@ from spc_core.portfolio import pnl_summary, sync_portfolio  # noqa: E402
 from spc_core.settings import capital_settings, set_capital  # noqa: E402
 from spc_core.market_bridge import StockMarketHubProvider  # noqa: E402
 from spc_core.utils import utc_now_iso  # noqa: E402
-from stock_core.fund_flow import _ttl_for_call, _ttl_for_moment  # noqa: E402
+from stock_core.fund_flow import _ttl_for_call, _ttl_for_moment, cross_validate  # noqa: E402
 from stock_core.stock_market_hub import analyze_symbol, render_analysis_text  # noqa: E402
 from stock_core.tz import CN_TZ  # noqa: E402
 
@@ -146,9 +146,25 @@ class FakeProvider:
         }
 
 
-def _ff(regime: str, *, reversal: str | None = None, m3: float = 0.0, m5: float = 0.0, m20: float = 0.0,
+def _ff(regime: str, *, reversal: str | None = None, m3: float = 0.0, m5: float = 0.0,
+        m10: float | None = None, m20: float = 0.0,
         main_today_yi: float = 0.0, super_big_yi: float = 0.0, big_yi: float = 0.0) -> dict:
-    """构造 fund_flow 摘要的小工具（仅含 decision.py 实际用到的字段）。"""
+    """构造 fund_flow 摘要的小工具。
+
+    自动通过 :func:`cross_validate` 挂上 ``cross_validation`` 字段，
+    与生产路径 ``summarize_fund_flow`` 的契约保持一致。
+
+    ``m10`` 默认沿用 ``m5``（兼容旧用例）；如需精细控制 10d 单独传。
+    """
+    if m10 is None:
+        m10 = m5
+    rolling = {
+        "1d": {"main_yi": main_today_yi, "inflow_days": 0, "outflow_days": 0, "days": 1},
+        "3d": {"main_yi": m3, "inflow_days": 0, "outflow_days": 0, "days": 3},
+        "5d": {"main_yi": m5, "inflow_days": 0, "outflow_days": 0, "days": 5},
+        "10d": {"main_yi": m10, "inflow_days": 0, "outflow_days": 0, "days": 10},
+        "20d": {"main_yi": m20, "inflow_days": 0, "outflow_days": 0, "days": 20},
+    }
     return {
         "as_of": "2026-05-08",
         "today": {
@@ -160,15 +176,10 @@ def _ff(regime: str, *, reversal: str | None = None, m3: float = 0.0, m5: float 
             "mid_pct": 0.0, "small_pct": 0.0,
             "close": 100.0, "change_pct": 0.0,
         },
-        "rolling": {
-            "1d": {"main_yi": main_today_yi, "inflow_days": 0, "outflow_days": 0, "days": 1},
-            "3d": {"main_yi": m3, "inflow_days": 0, "outflow_days": 0, "days": 3},
-            "5d": {"main_yi": m5, "inflow_days": 0, "outflow_days": 0, "days": 5},
-            "10d": {"main_yi": m5, "inflow_days": 0, "outflow_days": 0, "days": 10},
-            "20d": {"main_yi": m20, "inflow_days": 0, "outflow_days": 0, "days": 20},
-        },
+        "rolling": rolling,
         "regime": regime,
         "reversal": reversal,
+        "cross_validation": cross_validate(rolling, reversal),
     }
 
 
@@ -784,6 +795,211 @@ class SPCTestCase(unittest.TestCase):
         cached_rows = [{"date": "2026-05-11"}]
         ttl = _ttl_for_call("a", "600276", cached_data=cached_rows)
         self.assertEqual(ttl, 4 * 3600.0)
+
+    # ── cross_validate（多周期交叉验证）单元测试 ─────────────────
+    # 数据契约：cross_validate 输入 rolling = {p: {"main_yi": float|None, ...}}
+    # 输出包含 directions / all_aligned / short_long_conflict / acceleration /
+    # is_resonance / reversal_confirmed / verdict / verdict_zh 等字段。
+
+    @staticmethod
+    def _rolling(*, m1: float, m5: float, m10: float, m20: float) -> dict:
+        return {
+            "1d": {"main_yi": m1, "days": 1},
+            "5d": {"main_yi": m5, "days": 5},
+            "10d": {"main_yi": m10, "days": 10},
+            "20d": {"main_yi": m20, "days": 20},
+        }
+
+    def test_cross_validate_resonance_inflow(self):
+        """四周期一致流入 + 1d 日均 > 5d > 10d → RESONANCE_INFLOW。"""
+        rolling = self._rolling(m1=2.0, m5=8.0, m10=14.0, m20=24.0)
+        # 日均：1d=2.0, 5d=1.6, 10d=1.4 → 1d>5d>10d 加速
+        cross = cross_validate(rolling, reversal=None)
+        self.assertEqual(cross["verdict"], "RESONANCE_INFLOW")
+        self.assertTrue(cross["all_aligned"])
+        self.assertEqual(cross["acceleration"], "accelerating_inflow")
+        self.assertTrue(cross["is_resonance"])
+        self.assertFalse(cross["short_long_conflict"])
+
+    def test_cross_validate_short_long_conflict_weakening(self):
+        """20d 仍流入，但 1d 与 5d 已转流出 → WEAKENING_INFLOW + short_long_conflict。"""
+        rolling = self._rolling(m1=-1.2, m5=-3.0, m10=-3.0, m20=15.0)
+        cross = cross_validate(rolling, reversal="INFLOW_TO_OUTFLOW")
+        self.assertTrue(cross["short_long_conflict"])
+        self.assertEqual(cross["conflict_kind"], "short_outflow_long_inflow")
+        # reversal=INFLOW_TO_OUTFLOW 被 1d/5d 同向流出背书 → 优先级高于 WEAKENING
+        self.assertEqual(cross["verdict"], "REVERSAL_OUTFLOW_CONFIRMED")
+        self.assertTrue(cross["reversal_confirmed"])
+
+    def test_cross_validate_reversal_unconfirmed(self):
+        """reversal=OUTFLOW_TO_INFLOW 但 1d 仍流出 → reversal_confirmed=False。"""
+        rolling = self._rolling(m1=-1.5, m5=2.0, m10=2.0, m20=-10.0)
+        cross = cross_validate(rolling, reversal="OUTFLOW_TO_INFLOW")
+        self.assertFalse(cross["reversal_confirmed"])
+        self.assertEqual(cross["verdict"], "REVERSAL_UNCONFIRMED")
+
+    def test_cross_validate_concentration_only_when_aligned(self):
+        """concentration_5d_in_20d 仅在 5d 与 20d 同向时定义，反向应为 None。"""
+        # 同向：5d=+8, 20d=+15 → 8/15 ≈ 0.533
+        rolling_aligned = self._rolling(m1=1.5, m5=8.0, m10=12.0, m20=15.0)
+        cross_a = cross_validate(rolling_aligned)
+        self.assertAlmostEqual(cross_a["concentration_5d_in_20d"], 0.533, places=2)
+        # 反向：5d=-3, 20d=+15 → None
+        rolling_conflict = self._rolling(m1=-1.0, m5=-3.0, m10=-3.0, m20=15.0)
+        cross_c = cross_validate(rolling_conflict, reversal="INFLOW_TO_OUTFLOW")
+        self.assertIsNone(cross_c["concentration_5d_in_20d"])
+
+    def test_cross_validate_missing_period_does_not_crash(self):
+        """缺 1d 时仍能给出可用结论（reversal_confirmed=None，不能背书）。"""
+        rolling = {
+            "5d": {"main_yi": 4.0, "days": 5},
+            "10d": {"main_yi": 6.0, "days": 10},
+            "20d": {"main_yi": 15.0, "days": 20},
+        }
+        cross = cross_validate(rolling, reversal="OUTFLOW_TO_INFLOW")
+        # 1d 缺失：reversal_confirmed 必须为 None，否则 decision 会误判
+        self.assertIsNone(cross["reversal_confirmed"])
+        # all_aligned 也应为 False（因为 1d 缺失，方向不全）
+        self.assertFalse(cross["all_aligned"])
+
+    def test_summarize_fund_flow_attaches_cross_validation(self):
+        """生产路径 summarize_fund_flow 应自动挂 cross_validation 字段，
+        让上游消费方 (decision/render) 不需要再各自调 cross_validate。"""
+        from stock_core.fund_flow import summarize_fund_flow
+        # 构造 5 行最小日 K（5 天连续流入），跑一遍真实摘要
+        rows = [
+            {"date": f"2026-05-0{i}", "main": 1e8, "small": None, "mid": None,
+             "big": None, "super_big": None, "main_pct": None, "small_pct": None,
+             "mid_pct": None, "big_pct": None, "super_big_pct": None,
+             "close": 100.0, "change_pct": 1.0}
+            for i in range(1, 6)
+        ]
+        summary = summarize_fund_flow(rows)
+        self.assertIn("cross_validation", summary)
+        cross = summary["cross_validation"]
+        self.assertEqual(set(cross["periods"]), {"1d", "5d", "10d", "20d"})
+        self.assertIn("verdict", cross)
+
+
+class SPCCrossValidationDecisionTestCase(SPCTestCase):
+    """spc 决策树新增的多周期交叉验证分支。
+
+    继承 SPCTestCase 拿账户 / 资金 / 数据库 setUp。
+    """
+
+    def test_reversal_unconfirmed_blocks_buy_path(self):
+        """reversal=OUTFLOW_TO_INFLOW 但 1d 仍流出 → cross.reversal_confirmed=False
+        → 反转买入路径应被否决，落到 focus（不再像旧版那样直接 buy）。"""
+        add_watch(self.conn, self.acct_id, "hk", "00700", "")
+
+        class ReversalProvider(FakeProvider):
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                quote = self.fetch_quote(market, code)
+                if (market, code) == ("hk", "00700"):
+                    return self._attach_fund_flow(market, code, {
+                        "fetched_at": quote["fetched_at"],
+                        "info": {"name": "腾讯控股"},
+                        "quote": {"current": quote["current"], "percent": 1.0},
+                        "price_history": {"regime": "NEAR_YTD_LOW"},
+                        "announcements": [
+                            {"date": "2026-05-01", "title": "回购股份公告", "pdf_url": "h1"},
+                            {"date": "2026-05-02", "title": "新品发布合作", "pdf_url": "h2"},
+                        ],
+                    })
+                return super().analyze(market, code, ann_days, with_peers, skip)
+
+        # 关键数据：m3/m5 仍 > 0（旧规则会放行），但 m1d=-1.5 让 cross.reversal_confirmed=False
+        provider = ReversalProvider(fund_flow_overrides={
+            ("hk", "00700"): _ff(
+                regime="OSCILLATING", reversal="OUTFLOW_TO_INFLOW",
+                m3=2.0, m5=4.0, m10=4.0, m20=-12.0, main_today_yi=-1.5,
+            ),
+        })
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertNotEqual(decision["action"], "buy",
+                            f"reversal_confirmed=False 时不应升档 buy，实际 action={decision['action']}")
+        # sources 必须留下交叉验证审计痕迹（spc explain 反查可用）
+        self.assertTrue(
+            any("cross_validation" in s for s in decision["sources"]),
+            f"sources 缺少 cross_validation 审计；sources={decision['sources']}",
+        )
+
+    def test_trend_buy_decelerating_inflow_softens_confidence(self):
+        """趋势路径下 cross.acceleration=decelerating_inflow → confidence 0.72 → 0.67。"""
+        add_watch(self.conn, self.acct_id, "a", "300308", "")
+
+        # 300308 默认走 trend 路径（NEW_ALL_TIME_HIGH + 正向公告）
+        # 让 1d/3d/5d 都 > 0（满足 trend 硬约束）但日均在变小：
+        #   1d=0.5, 5d=4 (avg 0.8), 10d=10 (avg 1.0), 20d=20 (avg 1.0)
+        #   → 1d 日均 (0.5) < 5d 日均 (0.8) → decelerating_inflow
+        provider = FakeProvider(fund_flow_overrides={
+            ("a", "300308"): _ff(
+                regime="PERSISTENT_INFLOW",
+                m3=2.0, m5=4.0, m10=10.0, m20=20.0, main_today_yi=0.5,
+            ),
+        })
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "buy")
+        self.assertEqual(decision["confidence"], "0.67",
+                         f"trend buy + decelerating_inflow 应 -0.05 → 0.67，实际 {decision['confidence']}")
+        self.assertTrue(
+            any("decelerating_inflow" in r for r in decision["reasoning"]),
+            f"reasoning 应标注 decelerating_inflow；reasoning={decision['reasoning']}",
+        )
+
+    def test_reversal_buy_still_works_when_cross_confirms(self):
+        """回归断言：cross.reversal_confirmed=True + short_long_conflict=False 时，
+        反转买入路径仍应正常升档为 buy（确保下沉没削弱原能力）。"""
+        add_watch(self.conn, self.acct_id, "hk", "00700", "")
+
+        class ReversalProvider(FakeProvider):
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                quote = self.fetch_quote(market, code)
+                if (market, code) == ("hk", "00700"):
+                    return self._attach_fund_flow(market, code, {
+                        "fetched_at": quote["fetched_at"],
+                        "info": {"name": "腾讯控股"},
+                        "quote": {"current": quote["current"], "percent": 1.5},
+                        "price_history": {"regime": "NEAR_YTD_LOW"},
+                        "announcements": [
+                            {"date": "2026-05-01", "title": "回购股份公告", "pdf_url": "h1"},
+                            {"date": "2026-05-02", "title": "新品发布合作", "pdf_url": "h2"},
+                        ],
+                    })
+                return super().analyze(market, code, ann_days, with_peers, skip)
+
+        # 四周期一致流入 + reversal=OUTFLOW_TO_INFLOW + 1d/5d 同向流入背书
+        provider = ReversalProvider(fund_flow_overrides={
+            ("hk", "00700"): _ff(
+                regime="PERSISTENT_INFLOW", reversal="OUTFLOW_TO_INFLOW",
+                m3=2.0, m5=4.0, m10=8.0, m20=15.0, main_today_yi=1.2,
+            ),
+        })
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "buy")
+        self.assertEqual(decision["confidence"], "0.68")
+        self.assertTrue(
+            any("reversal_confirmed=True" in r for r in decision["reasoning"]),
+            f"reasoning 应标注 reversal_confirmed=True；reasoning={decision['reasoning']}",
+        )
 
     def test_cli_smoke(self):
         cmd = [sys.executable, str(SKILL_DIR / "scripts" / "main.py")]
