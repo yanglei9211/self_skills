@@ -66,6 +66,11 @@ from stock_core.announcements import (
     _parse_a_share_symbol,
 )
 from stock_core.cache import cached
+from stock_core.enrichment import (
+    fetch_sector_strength,
+    fetch_stock_news_relevance,
+    fetch_xueqiu_attention,
+)
 from stock_core.fund_flow import (
     get_fund_flow_summary,
     regime_label,
@@ -555,6 +560,13 @@ def analyze(symbol: str, args: argparse.Namespace) -> dict:
     if "fund_flow" not in skip and _ff_eligible:
         tasks["fund_flow"] = lambda: _get_fund_flow(market, code)
 
+    # ── Enrichment 维度（v1：news / sector / attention）──
+    # 这 3 个是 spc decision 的辅助维度，不阻塞主分析；任一失败不影响其余字段。
+    # attention 无依赖，可以放第一阶段并发跑；news / sector 依赖 quote/info/peers
+    # 的结果，放第二阶段串行跑。
+    if "attention" not in skip and market in ("a", "hk"):
+        tasks["attention"] = lambda: fetch_xueqiu_attention(market, code, xq_sym)
+
     with ThreadPoolExecutor(max_workers=min(6, len(tasks))) as ex:
         future_map = {ex.submit(fn): name for name, fn in tasks.items()}
         for fut in as_completed(future_map):
@@ -569,6 +581,71 @@ def analyze(symbol: str, args: argparse.Namespace) -> dict:
             except Exception as e:  # noqa: BLE001
                 out[name] = None
                 print(f"[analyze_company] {name}: FAIL {type(e).__name__}: {e}", file=sys.stderr)
+
+    # ── 第二阶段：依赖前序结果的 enrichment ──
+    # 1) stock_news：用真实公司名 + 简称做关键词匹配（必须等 info 跑完）
+    # 2) sector_strength：用 peers 同业 + quote.percent 算个股 vs 板块强弱
+    if "stock_news" not in skip and market in ("a", "hk"):
+        info = out.get("info") or {}
+        if isinstance(info, dict):
+            full_name = (
+                info.get("公司名称") or info.get("中文名称")
+                or info.get("公司全称") or info.get("名称") or ""
+            )
+            short_name = (
+                info.get("公司简称") or info.get("证券简称") or info.get("中文简称") or ""
+            )
+            aliases: list[str] = []
+            if isinstance(info.get("曾用名"), str) and info["曾用名"].strip():
+                aliases.extend([s for s in re.split(r"[，,;\s]+", info["曾用名"]) if s.strip()])
+        else:
+            full_name = short_name = ""
+            aliases = []
+        try:
+            out["stock_news"] = fetch_stock_news_relevance(
+                market=market,
+                code=code,
+                name=str(full_name).strip(),
+                short_name=str(short_name).strip(),
+                aliases=aliases,
+                days=7,
+                pool_size=100,
+            )
+            cnt = (out["stock_news"] or {}).get("related_count", 0)
+            print(f"[analyze_company] stock_news: OK (related={cnt})", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            out["stock_news"] = None
+            print(f"[analyze_company] stock_news: FAIL {type(e).__name__}: {e}", file=sys.stderr)
+
+    if "sector_strength" not in skip and market in ("a", "hk"):
+        peers = out.get("peers") or []
+        peer_syms: list[str] = []
+        if isinstance(peers, list):
+            for p in peers:
+                if isinstance(p, dict):
+                    sym = p.get("symbol") or p.get("xq_symbol") or p.get("code")
+                    if sym:
+                        peer_syms.append(str(sym))
+        self_pct = None
+        q = out.get("quote") or {}
+        if isinstance(q, dict):
+            try:
+                self_pct = float(q.get("percent")) if q.get("percent") is not None else None
+            except (TypeError, ValueError):
+                self_pct = None
+        try:
+            out["sector_strength"] = fetch_sector_strength(
+                market=market,
+                code=code,
+                self_xq_symbol=xq_sym,
+                peer_xq_symbols=peer_syms,
+                self_change_pct=self_pct,
+            )
+            label = (out["sector_strength"] or {}).get("label", "n/a")
+            print(f"[analyze_company] sector_strength: OK ({label})", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            out["sector_strength"] = None
+            print(f"[analyze_company] sector_strength: FAIL {type(e).__name__}: {e}", file=sys.stderr)
 
     return out
 
