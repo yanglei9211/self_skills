@@ -8,16 +8,24 @@ from spc_core.audit import render_diff, render_explain, render_log, render_show
 from spc_core.db import connect
 from spc_core.decision import analyze_now, render_analysis_text
 from spc_core.ledger import (
+    EXEC_PLAN_LIST_DEFAULT_LIMIT,
+    add_execution_review,
     add_position_seed,
     add_trade,
     add_watch,
+    attach_trade_to_plan,
+    cancel_execution_plan,
+    create_execution_plan,
     delete_trade,
     delete_watch,
+    get_execution_plan_detail,
     latest_analysis_run,
     latest_snapshots,
+    list_execution_plans,
     list_position_seed,
     list_trades,
     list_watch,
+    update_execution_plan,
 )
 from spc_core.portfolio import check_portfolio_consistency, pnl_summary, sync_portfolio
 from spc_core.settings import (
@@ -37,6 +45,112 @@ def _add_account_arg(parser, required: bool = True) -> None:
 
 def _resolve(conn, args) -> dict:
     return resolve_account(conn, args.account)
+
+
+def _parse_optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in {"yes", "y", "true", "1"}:
+        return True
+    if text in {"no", "n", "false", "0"}:
+        return False
+    raise ValueError(f"无法识别的布尔值: {value}；请用 yes/no")
+
+
+def _render_execution_plan(detail: dict) -> str:
+    fill = detail.get("fill_summary") or {}
+    completion = f"{fill['completion_pct']}%" if fill.get("completion_pct") else "-"
+    lines = [
+        f"执行计划 #{detail['id']}",
+        f"标的：{str(detail['market']).upper()} {detail['code']}",
+        f"方向：{detail['side']}",
+        f"动作：{detail['action_type']}",
+        f"状态：{detail['status']}",
+    ]
+    if detail.get("source_ref_id"):
+        source_desc = f"analysis_run #{detail['source_ref_id']}"
+        if detail.get("source_action"):
+            source_desc += f" / source_action={detail['source_action']}"
+        if detail.get("confidence"):
+            source_desc += f" / confidence={detail['confidence']}"
+        lines.append(f"来源：{source_desc}")
+    lines.extend(
+        [
+            "",
+            "计划：",
+            f"- thesis：{detail['thesis']}",
+            f"- invalidation：{detail.get('invalidation') or '-'}",
+            f"- target_qty：{detail.get('target_qty') or '-'}",
+            f"- target_cash_cny：{detail.get('target_cash_cny') or '-'}",
+            f"- target_position_pct：{detail.get('target_position_pct') or '-'}",
+            f"- 价格区间：{(detail.get('price_limit_low') or '-')}" +
+            f" - {(detail.get('price_limit_high') or '-')}",
+            f"- 止损/止盈：{detail.get('stop_loss_price') or '-'} / {detail.get('take_profit_price') or '-'}",
+            f"- 加仓条件：{detail.get('add_condition') or '-'}",
+            f"- 减仓条件：{detail.get('reduce_condition') or '-'}",
+            f"- 标签：{detail.get('tags') or '-'}",
+        ]
+    )
+    lines.extend(
+        [
+            "",
+            "成交：",
+            f"- 已成交笔数：{fill.get('trade_count', 0)}",
+            f"- 已成交数量：{fill.get('filled_qty', '-')}",
+            f"- 成交均价：{fill.get('avg_price') or '-'}",
+            f"- 完成度：{completion}",
+        ]
+    )
+
+    trades = detail.get("trades") or []
+    if trades:
+        lines.extend(
+            [
+                "",
+                render_table(
+                    ["trade_id", "时间", "方向", "数量", "价格", "币种", "role", "备注"],
+                    [
+                        [
+                            row["id"],
+                            to_local_display(row["trade_time"]),
+                            row["side"],
+                            row["qty"],
+                            row["price"],
+                            row["currency"],
+                            row["role"],
+                            row["note"] or "-",
+                        ]
+                        for row in trades
+                    ],
+                ),
+            ]
+        )
+
+    reviews = detail.get("reviews") or []
+    if reviews:
+        lines.extend(
+            [
+                "",
+                render_table(
+                    ["review_id", "时间", "horizon", "outcome", "纪律", "执行", "假设", "lesson"],
+                    [
+                        [
+                            row["id"],
+                            to_local_display(row["review_time"]),
+                            row["horizon"],
+                            row["outcome"],
+                            row["discipline_score"] if row["discipline_score"] is not None else "-",
+                            row["execution_score"] if row["execution_score"] is not None else "-",
+                            row["thesis_score"] if row["thesis_score"] is not None else "-",
+                            row["lesson"],
+                        ]
+                        for row in reviews
+                    ],
+                ),
+            ]
+        )
+    return "\n".join(lines)
 
 
 # ── account commands ────────────────────────────────────────────────
@@ -208,6 +322,7 @@ def cmd_trade_add(args, conn) -> None:
         args.fee_transfer,
         args.tax_stamp,
         args.note,
+        args.plan_id,
     )
     print(f"已记录成交，trade id={trade_id}（账户 {acct['slug']}）")
 
@@ -416,6 +531,170 @@ def cmd_report_decision(args, conn) -> None:
     print(pretty_json(row))
 
 
+# ── execution commands ──────────────────────────────────────────────
+
+def cmd_exec_plan_create(args, conn) -> None:
+    acct = _resolve(conn, args)
+    plan_id = create_execution_plan(
+        conn,
+        acct["id"],
+        args.market,
+        args.code,
+        args.side,
+        args.action_type,
+        args.thesis,
+        status=args.status,
+        source_ref_id=args.source_analysis_id,
+        source_action=args.source_action,
+        invalidation=args.invalidation,
+        target_qty=args.target_qty,
+        target_cash_cny=args.target_cash_cny,
+        target_position_pct=args.target_position_pct,
+        price_limit_low=args.price_limit_low,
+        price_limit_high=args.price_limit_high,
+        stop_loss_price=args.stop_loss_price,
+        take_profit_price=args.take_profit_price,
+        add_condition=args.add_condition,
+        reduce_condition=args.reduce_condition,
+        time_window_start=args.time_window_start,
+        time_window_end=args.time_window_end,
+        confidence=args.confidence,
+        risk_level=args.risk_level,
+        tags=args.tags,
+        note=args.note,
+        force=args.force,
+    )
+    print(f"已创建执行计划 id={plan_id}（账户 {acct['slug']}）")
+
+
+def cmd_exec_plan_list(args, conn) -> None:
+    acct = _resolve(conn, args)
+    rows = list_execution_plans(
+        conn,
+        acct["id"],
+        status=args.status,
+        market=args.market,
+        code=args.code,
+        limit=args.limit,
+    )
+    if not rows:
+        print("暂无执行计划")
+        return
+    table_rows = []
+    for row in rows:
+        fill = get_execution_plan_detail(conn, acct["id"], row["id"])["fill_summary"]
+        table_rows.append(
+            [
+                row["id"],
+                row["status"],
+                row["market"],
+                row["code"],
+                row["side"],
+                row["action_type"],
+                row["target_qty"] or "-",
+                fill["filled_qty"],
+                fill["completion_pct"] or "-",
+                to_local_display(row["created_at"]),
+            ]
+        )
+    print(
+        render_table(
+            ["ID", "状态", "市场", "代码", "方向", "动作", "目标数量", "已成交", "完成度%", "创建时间"],
+            table_rows,
+        )
+    )
+
+
+def cmd_exec_plan_show(args, conn) -> None:
+    acct = _resolve(conn, args)
+    detail = get_execution_plan_detail(conn, acct["id"], args.id)
+    print(_render_execution_plan(detail))
+
+
+def cmd_exec_plan_cancel(args, conn) -> None:
+    acct = _resolve(conn, args)
+    status = "expired" if args.expire else "cancelled"
+    cancel_execution_plan(
+        conn,
+        acct["id"],
+        args.id,
+        reason=args.reason,
+        new_status=status,
+    )
+    print(f"已将执行计划 id={args.id} 标记为 {status}（账户 {acct['slug']}）")
+
+
+def cmd_exec_plan_update(args, conn) -> None:
+    acct = _resolve(conn, args)
+    update_fields = [
+        "action_type",
+        "thesis",
+        "invalidation",
+        "target_qty",
+        "target_cash_cny",
+        "target_position_pct",
+        "price_limit_low",
+        "price_limit_high",
+        "stop_loss_price",
+        "take_profit_price",
+        "add_condition",
+        "reduce_condition",
+        "time_window_start",
+        "time_window_end",
+        "confidence",
+        "risk_level",
+        "tags",
+        "note",
+    ]
+    updates = {
+        field: getattr(args, field)
+        for field in update_fields
+        if getattr(args, field) is not None
+    }
+    detail = update_execution_plan(conn, acct["id"], args.id, updates=updates)
+    print(f"已更新执行计划 id={args.id}（状态 {detail['status']}，账户 {acct['slug']}）")
+
+
+def cmd_exec_attach(args, conn) -> None:
+    acct = _resolve(conn, args)
+    attach_trade_to_plan(
+        conn,
+        acct["id"],
+        args.plan_id,
+        args.trade_id,
+        role=args.role,
+        note=args.note,
+        force=args.force,
+    )
+    print(f"已关联 plan id={args.plan_id} 和 trade id={args.trade_id}（账户 {acct['slug']}）")
+
+
+def cmd_exec_review_add(args, conn) -> None:
+    acct = _resolve(conn, args)
+    review_id = add_execution_review(
+        conn,
+        acct["id"],
+        plan_id=args.plan_id,
+        trade_id=args.trade_id,
+        review_time=args.time,
+        horizon=args.horizon,
+        outcome=args.outcome,
+        discipline_score=args.discipline_score,
+        execution_score=args.execution_score,
+        thesis_score=args.thesis_score,
+        plan_followed=_parse_optional_bool(args.plan_followed),
+        mistake_tags=args.mistake_tags,
+        good_tags=args.good_tags,
+        pnl_snapshot_cny=args.pnl_snapshot_cny,
+        max_favorable_excursion_pct=args.max_favorable_excursion_pct,
+        max_adverse_excursion_pct=args.max_adverse_excursion_pct,
+        lesson=args.lesson,
+        next_rule=args.next_rule,
+        note=args.note,
+    )
+    print(f"已记录执行复盘 id={review_id}（账户 {acct['slug']}）")
+
+
 # ── audit commands（spc explain / log / show / diff） ───────────────
 
 def cmd_explain(args, conn) -> None:
@@ -548,6 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_trade_add.add_argument("--fee-platform")
     p_trade_add.add_argument("--fee-transfer")
     p_trade_add.add_argument("--tax-stamp")
+    p_trade_add.add_argument("--plan-id", type=int)
     p_trade_add.add_argument("--note", default="")
     p_trade_add.set_defaults(func=cmd_trade_add)
     p_trade_delete = p_trade_sub.add_parser("delete")
@@ -639,6 +919,117 @@ def build_parser() -> argparse.ArgumentParser:
     p_report_decision = p_report_sub.add_parser("decision")
     _add_account_arg(p_report_decision)
     p_report_decision.set_defaults(func=cmd_report_decision)
+
+    # execution
+    p_exec = sub.add_parser("exec")
+    p_exec_sub = p_exec.add_subparsers(dest="section", required=True)
+
+    p_exec_plan = p_exec_sub.add_parser("plan")
+    p_exec_plan_sub = p_exec_plan.add_subparsers(dest="action", required=True)
+
+    p_exec_plan_create = p_exec_plan_sub.add_parser("create")
+    _add_account_arg(p_exec_plan_create)
+    p_exec_plan_create.add_argument("--market", required=True)
+    p_exec_plan_create.add_argument("--code", required=True)
+    p_exec_plan_create.add_argument("--side", required=True)
+    p_exec_plan_create.add_argument("--action-type", required=True)
+    p_exec_plan_create.add_argument("--thesis", required=True)
+    p_exec_plan_create.add_argument("--status", default="planned")
+    p_exec_plan_create.add_argument("--source-analysis-id", type=int)
+    p_exec_plan_create.add_argument("--source-action")
+    p_exec_plan_create.add_argument("--invalidation")
+    p_exec_plan_create.add_argument("--target-qty")
+    p_exec_plan_create.add_argument("--target-cash-cny")
+    p_exec_plan_create.add_argument("--target-position-pct")
+    p_exec_plan_create.add_argument("--price-limit-low")
+    p_exec_plan_create.add_argument("--price-limit-high")
+    p_exec_plan_create.add_argument("--stop-loss-price")
+    p_exec_plan_create.add_argument("--take-profit-price")
+    p_exec_plan_create.add_argument("--add-condition")
+    p_exec_plan_create.add_argument("--reduce-condition")
+    p_exec_plan_create.add_argument("--time-window-start")
+    p_exec_plan_create.add_argument("--time-window-end")
+    p_exec_plan_create.add_argument("--confidence")
+    p_exec_plan_create.add_argument("--risk-level")
+    p_exec_plan_create.add_argument("--tags")
+    p_exec_plan_create.add_argument("--note", default="")
+    p_exec_plan_create.add_argument("--force", action="store_true")
+    p_exec_plan_create.set_defaults(func=cmd_exec_plan_create)
+
+    p_exec_plan_list = p_exec_plan_sub.add_parser("list")
+    _add_account_arg(p_exec_plan_list)
+    p_exec_plan_list.add_argument("--status")
+    p_exec_plan_list.add_argument("--market")
+    p_exec_plan_list.add_argument("--code")
+    p_exec_plan_list.add_argument("--limit", type=int, default=EXEC_PLAN_LIST_DEFAULT_LIMIT)
+    p_exec_plan_list.set_defaults(func=cmd_exec_plan_list)
+
+    p_exec_plan_show = p_exec_plan_sub.add_parser("show")
+    _add_account_arg(p_exec_plan_show)
+    p_exec_plan_show.add_argument("--id", type=int, required=True)
+    p_exec_plan_show.set_defaults(func=cmd_exec_plan_show)
+
+    p_exec_plan_cancel = p_exec_plan_sub.add_parser("cancel")
+    _add_account_arg(p_exec_plan_cancel)
+    p_exec_plan_cancel.add_argument("--id", type=int, required=True)
+    p_exec_plan_cancel.add_argument("--reason", default="")
+    p_exec_plan_cancel.add_argument("--expire", action="store_true", help="标记为 expired 而不是 cancelled")
+    p_exec_plan_cancel.set_defaults(func=cmd_exec_plan_cancel)
+
+    p_exec_plan_update = p_exec_plan_sub.add_parser("update")
+    _add_account_arg(p_exec_plan_update)
+    p_exec_plan_update.add_argument("--id", type=int, required=True)
+    p_exec_plan_update.add_argument("--action-type", dest="action_type")
+    p_exec_plan_update.add_argument("--thesis")
+    p_exec_plan_update.add_argument("--invalidation")
+    p_exec_plan_update.add_argument("--target-qty", dest="target_qty")
+    p_exec_plan_update.add_argument("--target-cash-cny", dest="target_cash_cny")
+    p_exec_plan_update.add_argument("--target-position-pct", dest="target_position_pct")
+    p_exec_plan_update.add_argument("--price-limit-low", dest="price_limit_low")
+    p_exec_plan_update.add_argument("--price-limit-high", dest="price_limit_high")
+    p_exec_plan_update.add_argument("--stop-loss-price", dest="stop_loss_price")
+    p_exec_plan_update.add_argument("--take-profit-price", dest="take_profit_price")
+    p_exec_plan_update.add_argument("--add-condition", dest="add_condition")
+    p_exec_plan_update.add_argument("--reduce-condition", dest="reduce_condition")
+    p_exec_plan_update.add_argument("--time-window-start", dest="time_window_start")
+    p_exec_plan_update.add_argument("--time-window-end", dest="time_window_end")
+    p_exec_plan_update.add_argument("--confidence")
+    p_exec_plan_update.add_argument("--risk-level", dest="risk_level")
+    p_exec_plan_update.add_argument("--tags")
+    p_exec_plan_update.add_argument("--note")
+    p_exec_plan_update.set_defaults(func=cmd_exec_plan_update)
+
+    p_exec_attach = p_exec_sub.add_parser("attach")
+    _add_account_arg(p_exec_attach)
+    p_exec_attach.add_argument("--plan-id", type=int, required=True)
+    p_exec_attach.add_argument("--trade-id", type=int, required=True)
+    p_exec_attach.add_argument("--role", default="fill")
+    p_exec_attach.add_argument("--note", default="")
+    p_exec_attach.add_argument("--force", action="store_true")
+    p_exec_attach.set_defaults(func=cmd_exec_attach)
+
+    p_exec_review = p_exec_sub.add_parser("review")
+    p_exec_review_sub = p_exec_review.add_subparsers(dest="action", required=True)
+    p_exec_review_add = p_exec_review_sub.add_parser("add")
+    _add_account_arg(p_exec_review_add)
+    p_exec_review_add.add_argument("--plan-id", type=int)
+    p_exec_review_add.add_argument("--trade-id", type=int)
+    p_exec_review_add.add_argument("--time")
+    p_exec_review_add.add_argument("--horizon", default="manual")
+    p_exec_review_add.add_argument("--outcome", required=True)
+    p_exec_review_add.add_argument("--discipline-score", type=int)
+    p_exec_review_add.add_argument("--execution-score", type=int)
+    p_exec_review_add.add_argument("--thesis-score", type=int)
+    p_exec_review_add.add_argument("--plan-followed")
+    p_exec_review_add.add_argument("--mistake-tags")
+    p_exec_review_add.add_argument("--good-tags")
+    p_exec_review_add.add_argument("--pnl-snapshot-cny")
+    p_exec_review_add.add_argument("--max-favorable-excursion-pct")
+    p_exec_review_add.add_argument("--max-adverse-excursion-pct")
+    p_exec_review_add.add_argument("--lesson", required=True)
+    p_exec_review_add.add_argument("--next-rule")
+    p_exec_review_add.add_argument("--note", default="")
+    p_exec_review_add.set_defaults(func=cmd_exec_review_add)
 
     # ── audit: explain / log / show / diff ────────────────────────
     p_explain = sub.add_parser(

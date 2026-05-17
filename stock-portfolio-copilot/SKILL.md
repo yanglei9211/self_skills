@@ -82,6 +82,52 @@ $SPC report pnl --account default
 
 > 注意：v2 引入了多账户结构，几乎所有命令都需要 `--account <slug>`。首次使用先 `$SPC account create --slug default --name "默认账户" --set-default`，旧版数据库会自动迁移到 `default` 账户。
 
+## 执行计划 / 成交复盘
+
+当用户要把一次分析结论落成交易预案、把真实成交关联到预案、或复盘某次执行时，使用 `exec` 子命令。不要把复盘文字塞进 `trade add --note` 里替代结构化记录。
+
+常用流程：
+
+```bash
+# 1. 建执行计划。至少要传 target-qty / target-cash-cny / target-position-pct 之一
+$SPC exec plan create --account default \
+  --market a --code 300750 --side buy --action-type open \
+  --thesis "趋势强，回踩不破则建仓" \
+  --target-qty 100 --price-limit-low 248 --price-limit-high 255 \
+  --stop-loss-price 238 --tags "trend,core"
+
+# 2. 真实成交时直接关联 plan（推荐）
+$SPC trade add --account default \
+  --market a --code 300750 --side buy --qty 100 --price 251.20 \
+  --time "2026-05-08 10:32:00" --plan-id 1
+
+# 3. 或把已有成交补关联到 plan
+$SPC exec attach --account default --plan-id 1 --trade-id 12
+
+# 4. 查看 / 列表
+$SPC exec plan show --account default --id 1
+$SPC exec plan list --account default --status planned
+
+# 5. 更新未成交计划；已有成交后只能改止损/止盈/条件/标签/备注等事后参考字段
+$SPC exec plan update --account default --id 1 --stop-loss-price 240 --note "止损随结构上移"
+
+# 6. 条件失效时取消或过期
+$SPC exec plan cancel --account default --id 1 --reason "跌破 invalidation"
+$SPC exec plan cancel --account default --id 1 --expire --reason "时间窗口结束未触发"
+
+# 7. 复盘不改变计划生命周期状态，只写 execution_review
+$SPC exec review add --account default --plan-id 1 --trade-id 12 \
+  --horizon five_day --outcome win --discipline-score 4 --execution-score 4 \
+  --thesis-score 4 --plan-followed yes --lesson "按计划成交，未追高"
+```
+
+状态规则：
+
+- 新 plan 只能显式创建为 `planned` / `cancelled` / `expired`；`partially_filled` / `filled` 必须由成交关联自动推导。
+- 删除成交会回算关联计划状态：成交清零回到 `planned`，部分成交为 `partially_filled`，达到 `target_qty` 为 `filled`。
+- `cancelled` / `expired` 是终态，不能再 attach 成交；需要重新规划时新建一条 plan。
+- `exec review add` 只记录复盘，不再把 plan 改成 `reviewed`，避免复盘状态覆盖执行生命周期。
+
 ## buy 候选双路径
 
 自选侧 `buy` 候选**不再唯一要求"创新高"**，而是两条独立路径**任一满足**即可被触发；

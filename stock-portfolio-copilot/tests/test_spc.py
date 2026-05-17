@@ -21,10 +21,15 @@ sys.path.insert(0, str(SHARED_DIR))
 from spc_core.db import connect  # noqa: E402
 from spc_core.decision import analyze_now, render_analysis_text as render_spc_analysis_text  # noqa: E402
 from spc_core.ledger import (  # noqa: E402
+    add_execution_review,
     add_position_seed,
     add_trade,
     add_watch,
+    attach_trade_to_plan,
+    cancel_execution_plan,
+    create_execution_plan,
     delete_trade,
+    get_execution_plan_detail,
     latest_analysis_run,
     latest_snapshots,
     list_trades,
@@ -215,6 +220,10 @@ class SPCTestCase(unittest.TestCase):
         # Set capital for the test account
         set_capital(self.conn, self.acct_id, "500000", "20")
 
+    def test_db_schema_upgraded_to_v3(self):
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 3)
+
     def tearDown(self):
         self.conn.close()
         self.tmp.cleanup()
@@ -299,6 +308,298 @@ class SPCTestCase(unittest.TestCase):
         caps = capital_settings(self.conn, self.acct_id)
         self.assertEqual(caps["total_cny"], "500000")
         self.assertEqual(len(list_watch(self.conn, self.acct_id)), 1)
+
+    def test_execution_plan_from_analysis_trade_and_review_flow(self):
+        add_watch(self.conn, self.acct_id, "a", "300308", "")
+        payload = analyze_now(
+            self.conn,
+            self.acct_id,
+            self.acct_slug,
+            self.acct_name,
+            "watchlist",
+            analysis_provider=self.provider,
+        )
+        self.assertEqual(payload["results"][0]["decision"]["action"], "buy")
+        analysis_id = latest_analysis_run(self.conn, self.acct_id)["id"]
+
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300308",
+            "buy",
+            "open",
+            "趋势强，准备建仓",
+            source_ref_id=analysis_id,
+            source_action="buy",
+            target_qty="100",
+            price_limit_low="930",
+            price_limit_high="940",
+            stop_loss_price="890",
+            confidence="0.72",
+            tags="trend,watchlist",
+        )
+        trade_id = add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300308",
+            "buy",
+            "100",
+            "935.00",
+            "2026-05-08 10:32:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "首笔建仓",
+            plan_id=plan_id,
+        )
+        review_id = add_execution_review(
+            self.conn,
+            self.acct_id,
+            plan_id=plan_id,
+            trade_id=trade_id,
+            horizon="five_day",
+            outcome="win",
+            discipline_score=4,
+            execution_score=4,
+            thesis_score=4,
+            plan_followed=True,
+            lesson="按计划成交，后续可以等回踩再加仓",
+        )
+
+        detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
+        self.assertEqual(detail["source_ref_id"], analysis_id)
+        self.assertEqual(detail["status"], "filled")
+        self.assertEqual(detail["fill_summary"]["trade_count"], 1)
+        self.assertEqual(detail["fill_summary"]["filled_qty"], "100.0000")
+        self.assertEqual(detail["fill_summary"]["completion_pct"], "100.0000")
+        self.assertEqual(detail["trades"][0]["id"], trade_id)
+        self.assertEqual(detail["reviews"][0]["id"], review_id)
+
+    def test_attach_trade_to_plan_updates_status(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "hk",
+            "01810",
+            "buy",
+            "probe",
+            "弱市里先试探一笔",
+            target_qty="500",
+        )
+        trade_id = add_trade(
+            self.conn,
+            self.acct_id,
+            "hk",
+            "01810",
+            "buy",
+            "200",
+            "19.10",
+            "2026-05-08 10:32:00",
+            None,
+            "0.92",
+            "9.55",
+            "0",
+            "0",
+            "10",
+            "",
+        )
+        attach_trade_to_plan(self.conn, self.acct_id, plan_id, trade_id)
+
+        detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
+        self.assertEqual(detail["status"], "partially_filled")
+        self.assertEqual(detail["fill_summary"]["filled_qty"], "200.0000")
+        self.assertEqual(detail["fill_summary"]["completion_pct"], "40.0000")
+
+    def test_delete_trade_refreshes_execution_plan_status(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "open",
+            "建仓计划",
+            target_qty="100",
+        )
+        trade_id = add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "100",
+            "250.00",
+            "2026-05-08 10:00:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            plan_id=plan_id,
+        )
+        self.assertEqual(get_execution_plan_detail(self.conn, self.acct_id, plan_id)["status"], "filled")
+
+        delete_trade(self.conn, self.acct_id, trade_id)
+
+        detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
+        self.assertEqual(detail["status"], "planned")
+        self.assertEqual(detail["fill_summary"]["trade_count"], 0)
+        self.assertEqual(detail["fill_summary"]["filled_qty"], "0.0000")
+
+    def test_execution_review_does_not_override_plan_status(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "hk",
+            "01810",
+            "buy",
+            "probe",
+            "弱市里先试探一笔",
+            target_qty="500",
+        )
+        trade_id = add_trade(
+            self.conn,
+            self.acct_id,
+            "hk",
+            "01810",
+            "buy",
+            "200",
+            "19.10",
+            "2026-05-08 10:32:00",
+            None,
+            "0.92",
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            plan_id=plan_id,
+        )
+        add_execution_review(
+            self.conn,
+            self.acct_id,
+            plan_id=plan_id,
+            trade_id=trade_id,
+            horizon="manual",
+            outcome="pending",
+            lesson="先记录执行质量，不改变计划生命周期状态",
+        )
+
+        detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
+        self.assertEqual(detail["status"], "partially_filled")
+        self.assertEqual(len(detail["reviews"]), 1)
+
+    def test_duplicate_attach_returns_value_error(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "open",
+            "建仓计划",
+            target_qty="100",
+        )
+        trade_id = add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "50",
+            "250.00",
+            "2026-05-08 10:00:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+        )
+        attach_trade_to_plan(self.conn, self.acct_id, plan_id, trade_id)
+        with self.assertRaisesRegex(ValueError, "已经关联"):
+            attach_trade_to_plan(self.conn, self.acct_id, plan_id, trade_id)
+
+    def test_terminal_plan_rejects_attach(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "open",
+            "建仓计划",
+            target_qty="100",
+        )
+        cancel_execution_plan(self.conn, self.acct_id, plan_id, reason="条件失效")
+        trade_id = add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "50",
+            "250.00",
+            "2026-05-08 10:00:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+        )
+        with self.assertRaisesRegex(ValueError, "终态"):
+            attach_trade_to_plan(self.conn, self.acct_id, plan_id, trade_id)
+
+    def test_attach_trade_cross_account_blocked(self):
+        now = utc_now_iso()
+        self.conn.execute(
+            "INSERT INTO accounts(slug, display_name, broker, base_currency, is_default, is_archived, created_at, updated_at) VALUES(?, ?, ?, ?, 0, 0, ?, ?)",
+            ("swing", "波段账户", "", "CNY", now, now),
+        )
+        self.conn.commit()
+        acct2_id = self.conn.execute("SELECT id FROM accounts WHERE slug='swing'").fetchone()[0]
+        set_capital(self.conn, acct2_id, "300000", "25")
+
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "open",
+            "默认账户建仓",
+            target_qty="100",
+        )
+        trade_id = add_trade(
+            self.conn,
+            acct2_id,
+            "a",
+            "300750",
+            "buy",
+            "100",
+            "250.00",
+            "2026-05-08 10:00:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+        )
+
+        with self.assertRaises(ValueError):
+            attach_trade_to_plan(self.conn, self.acct_id, plan_id, trade_id)
 
     def test_analysis_payload_and_text_include_security_name(self):
         add_position_seed(self.conn, self.acct_id, "a", "300750", "1000", "245.30", None, "2026-05-01 09:30:00", "")
@@ -1014,6 +1315,39 @@ class SPCCrossValidationDecisionTestCase(SPCTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = subprocess.run(
             cmd + ["position", "list", "--account", "default"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("300750", proc.stdout)
+
+    def test_cli_execution_smoke(self):
+        cmd = [sys.executable, str(SKILL_DIR / "scripts" / "main.py")]
+        env = os.environ.copy()
+
+        proc = subprocess.run(
+            cmd + [
+                "exec", "plan", "create",
+                "--account", "default",
+                "--market", "a",
+                "--code", "300750",
+                "--side", "buy",
+                "--action-type", "open",
+                "--thesis", "测试建仓计划",
+                "--target-qty", "100",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("已创建执行计划", proc.stdout)
+
+        proc = subprocess.run(
+            cmd + ["exec", "plan", "list", "--account", "default"],
             capture_output=True,
             text=True,
             env=env,

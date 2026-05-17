@@ -6,7 +6,98 @@ import sys
 from spc_core.utils import db_path, utc_now_iso
 
 
-SCHEMA_V2 = """
+# v2→v3 新增的三张表 + 索引；同时被 SCHEMA_V3（fresh install）
+# 和 _migrate_v2_to_v3（增量迁移）复用，避免两边 DDL 漂移。
+_DDL_V3_NEW_TABLES = """
+CREATE TABLE IF NOT EXISTS execution_plan (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL,
+  market TEXT NOT NULL,
+  code TEXT NOT NULL,
+  side TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'planned',
+  source_type TEXT NOT NULL DEFAULT 'manual',
+  source_ref_id INTEGER,
+  source_action TEXT DEFAULT '',
+  thesis TEXT NOT NULL,
+  invalidation TEXT DEFAULT '',
+  target_qty TEXT,
+  target_cash_cny TEXT,
+  target_position_pct TEXT,
+  price_limit_low TEXT,
+  price_limit_high TEXT,
+  stop_loss_price TEXT,
+  take_profit_price TEXT,
+  add_condition TEXT DEFAULT '',
+  reduce_condition TEXT DEFAULT '',
+  time_window_start TEXT,
+  time_window_end TEXT,
+  confidence TEXT,
+  risk_level TEXT DEFAULT '',
+  tags TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_plan_account_symbol
+  ON execution_plan(account_id, market, code, created_at, id);
+
+CREATE TABLE IF NOT EXISTS trade_execution_link (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL,
+  plan_id INTEGER NOT NULL,
+  trade_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'fill',
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  UNIQUE(account_id, plan_id, trade_id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id),
+  FOREIGN KEY(plan_id) REFERENCES execution_plan(id),
+  FOREIGN KEY(trade_id) REFERENCES trade_ledger(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_execution_link_account_plan
+  ON trade_execution_link(account_id, plan_id, trade_id);
+
+CREATE INDEX IF NOT EXISTS idx_trade_execution_link_trade
+  ON trade_execution_link(trade_id);
+
+CREATE TABLE IF NOT EXISTS execution_review (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL,
+  plan_id INTEGER,
+  trade_id INTEGER,
+  review_time TEXT NOT NULL,
+  horizon TEXT NOT NULL DEFAULT 'manual',
+  outcome TEXT NOT NULL,
+  discipline_score INTEGER,
+  execution_score INTEGER,
+  thesis_score INTEGER,
+  plan_followed INTEGER,
+  mistake_tags TEXT DEFAULT '',
+  good_tags TEXT DEFAULT '',
+  pnl_snapshot_cny TEXT,
+  max_favorable_excursion_pct TEXT,
+  max_adverse_excursion_pct TEXT,
+  lesson TEXT NOT NULL,
+  next_rule TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id),
+  FOREIGN KEY(plan_id) REFERENCES execution_plan(id),
+  FOREIGN KEY(trade_id) REFERENCES trade_ledger(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_review_account_plan
+  ON execution_review(account_id, plan_id, trade_id, review_time, id);
+"""
+
+
+SCHEMA_V3 = """
 CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY,
   slug TEXT NOT NULL UNIQUE,
@@ -118,7 +209,7 @@ CREATE TABLE IF NOT EXISTS analysis_run (
   payload_json TEXT NOT NULL,
   FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
-"""
+""" + _DDL_V3_NEW_TABLES
 
 
 def _get_user_version(conn: sqlite3.Connection) -> int:
@@ -336,6 +427,12 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    conn.executescript(_DDL_V3_NEW_TABLES)
+    _set_user_version(conn, 3)
+    conn.commit()
+
+
 def connect(path: str | None = None) -> sqlite3.Connection:
     target = path or str(db_path())
     conn = sqlite3.connect(target)
@@ -348,7 +445,7 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     version = _get_user_version(conn)
 
-    if version >= 2:
+    if version >= 3:
         return
 
     if version == 0:
@@ -358,18 +455,29 @@ def init_db(conn: sqlite3.Connection) -> None:
         ).fetchall()
         if not existing:
             # Truly fresh database
-            conn.executescript(SCHEMA_V2)
-            _set_user_version(conn, 2)
+            conn.executescript(SCHEMA_V3)
+            _set_user_version(conn, 3)
             conn.commit()
             return
         # Has tables but no version stamp — treat as v1
 
-    # version == 1 (or unversioned v1)
-    print("检测到旧版本数据库，正在迁移到多账户结构...", file=sys.stderr)
-    try:
-        _migrate_v1_to_v2(conn)
-    except Exception:
-        conn.rollback()
-        print("迁移失败，数据库未变更。请检查备份后重试。", file=sys.stderr)
-        raise
-    print("迁移完成。所有数据已迁移到默认账户 (slug='default')。", file=sys.stderr)
+    if version <= 1:
+        print("检测到旧版本数据库，正在迁移到多账户结构...", file=sys.stderr)
+        try:
+            _migrate_v1_to_v2(conn)
+        except Exception:
+            conn.rollback()
+            print("迁移失败，数据库未变更。请检查备份后重试。", file=sys.stderr)
+            raise
+        print("迁移完成。所有数据已迁移到默认账户 (slug='default')。", file=sys.stderr)
+        version = 2
+
+    if version == 2:
+        print("检测到 v2 数据库，正在迁移执行记录增强结构...", file=sys.stderr)
+        try:
+            _migrate_v2_to_v3(conn)
+        except Exception:
+            conn.rollback()
+            print("迁移失败，数据库未变更。请检查备份后重试。", file=sys.stderr)
+            raise
+        print("迁移完成。execution_plan / trade_execution_link / execution_review 已启用。", file=sys.stderr)

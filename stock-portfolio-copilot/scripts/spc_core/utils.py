@@ -19,6 +19,9 @@ QTY_PREC = Decimal("0.0001")
 PRICE_PREC = Decimal("0.0001")
 MONEY_PREC = Decimal("0.01")
 RATIO_PREC = Decimal("0.000001")
+# 百分比 / 置信度专用量化（0–100 或 0–1 区间，保留两位小数即可）。
+# 与 PRICE_PREC 拆开避免"百分比当作价格"造成的语义混淆。
+PCT_PREC = Decimal("0.01")
 
 
 # ── ETF 识别 ───────────────────────────────────────────────────
@@ -143,6 +146,15 @@ def q_money(value: Decimal) -> Decimal:
 
 def q_ratio(value: Decimal) -> Decimal:
     return value.quantize(RATIO_PREC, rounding=ROUND_HALF_UP)
+
+
+def q_pct(value: Decimal) -> Decimal:
+    """量化百分比 / 置信度，保留两位小数。
+
+    适用场景：``target_position_pct``（0–100）、``confidence``（0–1）、
+    ``completion_pct``（0–100）等"明确是百分比 / 比率"的字段。
+    """
+    return value.quantize(PCT_PREC, rounding=ROUND_HALF_UP)
 
 
 def hk_stamp_round(value: Decimal) -> Decimal:
