@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import contextmanager
 from decimal import Decimal
 
 from spc_core.settings import ensure_defaults
@@ -11,11 +13,84 @@ from spc_core.utils import (
     normalize_market,
     parse_user_time,
     q_money,
+    q_pct,
     q_price,
     q_qty,
     to_decimal,
     utc_now_iso,
 )
+
+
+# ── 执行计划 / 复盘相关的状态机常量 ───────────────────────────────
+# 集中在这里维护，避免散落 string literal 引发拼写不一致。
+
+PLAN_STATUS_PLANNED = "planned"
+PLAN_STATUS_PARTIAL = "partially_filled"
+PLAN_STATUS_FILLED = "filled"
+PLAN_STATUS_CANCELLED = "cancelled"
+PLAN_STATUS_EXPIRED = "expired"
+
+# 全部允许出现在 execution_plan.status 字段里的值。
+PLAN_STATUSES_ALL: frozenset[str] = frozenset({
+    PLAN_STATUS_PLANNED,
+    PLAN_STATUS_PARTIAL,
+    PLAN_STATUS_FILLED,
+    PLAN_STATUS_CANCELLED,
+    PLAN_STATUS_EXPIRED,
+})
+
+# 创建时允许显式指定的初始状态白名单。
+# 注意：`partially_filled` / `filled` 必须由 attach 状态机推导出来，
+# 用户不能凭空把一个新 plan 直接写成"已完成"，否则审计无法解释。
+PLAN_STATUSES_INITIAL_ALLOWED: frozenset[str] = frozenset({
+    PLAN_STATUS_PLANNED,
+    PLAN_STATUS_CANCELLED,
+    PLAN_STATUS_EXPIRED,
+})
+
+# 终态：不再接受 attach / 不再被状态机自动刷新。
+# review 不再视为终态——review 是 plan 的"事后笔记"，不影响 execution 生命周期。
+PLAN_STATUSES_TERMINAL: frozenset[str] = frozenset({
+    PLAN_STATUS_CANCELLED,
+    PLAN_STATUS_EXPIRED,
+})
+
+EXEC_PLAN_LIST_DEFAULT_LIMIT = 50
+
+OUTCOME_VALUES: frozenset[str] = frozenset({
+    "win", "loss", "breakeven", "stopped", "pending",
+})
+
+HORIZON_VALUES: frozenset[str] = frozenset({
+    "intraday", "next_day", "five_day", "twenty_day", "manual",
+})
+
+SOURCE_TYPE_VALUES: frozenset[str] = frozenset({
+    "manual", "analysis_run", "external", "replan",
+})
+
+ROLE_VALUES: frozenset[str] = frozenset({
+    "fill", "partial_fill", "stop_loss", "take_profit", "manual",
+})
+
+
+@contextmanager
+def _txn(conn):
+    """让"组合写入"这种事务有原子性 —— 任意一步抛错就 rollback。
+
+    使用 SAVEPOINT 而非顶层 BEGIN / COMMIT，可以嵌套也不会和 sqlite3 的隐式事务打架。
+    """
+    sp = "_spc_txn"
+    conn.execute(f"SAVEPOINT {sp}")
+    try:
+        yield
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+        conn.execute(f"RELEASE SAVEPOINT {sp}")
+        raise
+    else:
+        conn.execute(f"RELEASE SAVEPOINT {sp}")
+        conn.commit()
 
 
 def add_position_seed(
@@ -139,7 +214,24 @@ def list_position_seed(conn, account_id: int, market: str | None = None) -> list
     return [dict(row) for row in rows]
 
 
-def add_trade(conn, account_id: int, market: str, code: str, side: str, qty: str, price: str, time_text: str, currency: str | None, fx_rate: str | None, fee_commission: str | None, fee_platform: str | None, fee_transfer: str | None, tax_stamp: str | None, note: str) -> int:
+def add_trade(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    side: str,
+    qty: str,
+    price: str,
+    time_text: str,
+    currency: str | None,
+    fx_rate: str | None,
+    fee_commission: str | None,
+    fee_platform: str | None,
+    fee_transfer: str | None,
+    tax_stamp: str | None,
+    note: str,
+    plan_id: int | None = None,
+) -> int:
     ensure_defaults(conn)
     norm_market = normalize_market(market)
     norm_code = normalize_code(norm_market, code)
@@ -149,37 +241,62 @@ def add_trade(conn, account_id: int, market: str, code: str, side: str, qty: str
     qty_d = q_qty(to_decimal(qty, "qty"))
     price_d = q_price(to_decimal(price, "price"))
     fx_value = None if fx_rate in (None, "") else decimal_str(to_decimal(fx_rate, "fx-rate"))
-    now = utc_now_iso()
     curr = (currency or default_currency(norm_market)).upper()
-    cur = conn.execute(
-        """
-        INSERT INTO trade_ledger(
-          account_id, market, code, side, qty, price, currency, trade_time,
-          fee_commission, fee_platform, fee_transfer, tax_stamp,
-          fx_rate, note, is_deleted, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-        """,
-        (
-            account_id,
-            norm_market,
-            norm_code,
-            side_norm,
-            decimal_str(qty_d),
-            decimal_str(price_d),
-            curr,
-            parse_user_time(time_text),
-            decimal_str(q_money(to_decimal(fee_commission or "0", "fee-commission"))),
-            decimal_str(q_money(to_decimal(fee_platform or "0", "fee-platform"))),
-            decimal_str(q_money(to_decimal(fee_transfer or "0", "fee-transfer"))),
-            decimal_str(q_money(to_decimal(tax_stamp or "0", "tax-stamp"))),
-            fx_value,
-            note or "",
-            now,
-            now,
-        ),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
+
+    # 提前校验 plan / trade 是否匹配——如果不匹配就在 INSERT 之前抛错，
+    # 让前置 fail-fast 兜底。但即便提前校验通过，下面把
+    # INSERT trade + INSERT link + UPDATE plan 仍然必须放在同一个事务里：
+    # 任意一步出错（比如 UNIQUE 冲突）都不能让 trade_ledger 留下幽灵记录。
+    plan_row: dict | None = None
+    if plan_id is not None:
+        plan_row = _require_execution_plan(conn, account_id, plan_id)
+        _validate_plan_trade_link(
+            plan_row,
+            trade_market=norm_market,
+            trade_code=norm_code,
+            trade_side=side_norm,
+        )
+        if plan_row["status"] in PLAN_STATUSES_TERMINAL:
+            raise ValueError(
+                f"执行计划 id={plan_id} 已是终态（{plan_row['status']}），"
+                f"不能再 attach 成交。请新建一条 plan 或重新激活后再录入。"
+            )
+
+    now = utc_now_iso()
+    with _txn(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO trade_ledger(
+              account_id, market, code, side, qty, price, currency, trade_time,
+              fee_commission, fee_platform, fee_transfer, tax_stamp,
+              fx_rate, note, is_deleted, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                account_id,
+                norm_market,
+                norm_code,
+                side_norm,
+                decimal_str(qty_d),
+                decimal_str(price_d),
+                curr,
+                parse_user_time(time_text),
+                decimal_str(q_money(to_decimal(fee_commission or "0", "fee-commission"))),
+                decimal_str(q_money(to_decimal(fee_platform or "0", "fee-platform"))),
+                decimal_str(q_money(to_decimal(fee_transfer or "0", "fee-transfer"))),
+                decimal_str(q_money(to_decimal(tax_stamp or "0", "tax-stamp"))),
+                fx_value,
+                note or "",
+                now,
+                now,
+            ),
+        )
+        trade_id = int(cur.lastrowid)
+        if plan_id is not None:
+            _attach_trade_to_plan_unsafe(
+                conn, account_id, plan_id, trade_id, "fill", "",
+            )
+    return trade_id
 
 
 def list_trades(conn, account_id: int, market: str | None = None, code: str | None = None, include_deleted: bool = False) -> list[dict]:
@@ -210,14 +327,36 @@ def list_trades(conn, account_id: int, market: str | None = None, code: str | No
 
 
 def delete_trade(conn, account_id: int, trade_id: int) -> None:
+    """软删除一笔成交，并把所有关联的执行计划状态刷一次。
+
+    如果删掉这笔成交后，某个 plan 的累计 filled_qty 降到 0，则状态会从
+    `filled` / `partially_filled` 回退到 `planned`；累计仍未填满 target 但 > 0
+    时回退到 `partially_filled`。这避免了"删除一笔成交但 plan 仍显示 filled"
+    的状态机不一致。
+    """
+    # 找出所有受影响的 plan_id，准备删完之后逐个 refresh。
+    affected_plan_ids = [
+        int(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT plan_id FROM trade_execution_link "
+            " WHERE account_id = ? AND trade_id = ?",
+            (account_id, trade_id),
+        ).fetchall()
+    ]
+
     now = utc_now_iso()
-    cur = conn.execute(
-        "UPDATE trade_ledger SET is_deleted = 1, updated_at = ? WHERE id = ? AND account_id = ? AND is_deleted = 0",
-        (now, trade_id, account_id),
-    )
-    conn.commit()
-    if cur.rowcount == 0:
-        raise ValueError(f"找不到可删除的 trade id={trade_id}（可能不属于该账户或已被删除）")
+    with _txn(conn):
+        cur = conn.execute(
+            "UPDATE trade_ledger SET is_deleted = 1, updated_at = ? "
+            " WHERE id = ? AND account_id = ? AND is_deleted = 0",
+            (now, trade_id, account_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"找不到可删除的 trade id={trade_id}（可能不属于该账户或已被删除）"
+            )
+        for pid in affected_plan_ids:
+            _refresh_execution_plan_status(conn, account_id, pid)
 
 
 def add_watch(conn, account_id: int, market: str, code: str, note: str) -> None:
@@ -255,6 +394,692 @@ def list_watch(conn, account_id: int) -> list[dict]:
         (account_id,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _normalize_optional_decimal(value: str | None, field: str, quantize_fn) -> str | None:
+    if value in (None, ""):
+        return None
+    return decimal_str(quantize_fn(to_decimal(value, field)))
+
+
+def _normalize_optional_text(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _require_execution_plan(conn, account_id: int, plan_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM execution_plan WHERE id = ? AND account_id = ?",
+        (plan_id, account_id),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"找不到执行计划 id={plan_id}（可能不属于该账户）")
+    return dict(row)
+
+
+def _get_trade_row(conn, account_id: int, trade_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM trade_ledger WHERE id = ? AND account_id = ?",
+        (trade_id, account_id),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"找不到成交记录 id={trade_id}（可能不属于该账户）")
+    out = dict(row)
+    if out.get("is_deleted"):
+        raise ValueError(f"成交记录 id={trade_id} 已被删除，不能再关联执行计划")
+    return out
+
+
+def _validate_plan_trade_link(
+    plan: dict,
+    *,
+    trade_market: str,
+    trade_code: str,
+    trade_side: str,
+    force: bool = False,
+) -> None:
+    mismatches: list[str] = []
+    if plan["market"] != trade_market:
+        mismatches.append(f"market 不一致（plan={plan['market']} trade={trade_market}）")
+    if plan["code"] != trade_code:
+        mismatches.append(f"code 不一致（plan={plan['code']} trade={trade_code}）")
+    if plan["side"] != trade_side:
+        mismatches.append(f"side 不一致（plan={plan['side']} trade={trade_side}）")
+    if mismatches and not force:
+        raise ValueError("执行计划与成交不匹配：" + "；".join(mismatches))
+
+
+def _refresh_execution_plan_status(conn, account_id: int, plan_id: int) -> None:
+    """根据 trade_execution_link + trade_ledger 当前的真实状况，重算 plan.status。
+
+    支持双向流转（关键变化）：
+      - 累计 filled_qty == 0  → ``planned``（trade 全删了也能回退）
+      - 0 < filled_qty < target → ``partially_filled``
+      - filled_qty >= target  → ``filled``
+
+    终态（cancelled / expired）不会被自动改写——只有显式 cancel / expire 的命令能写。
+    """
+    plan = _require_execution_plan(conn, account_id, plan_id)
+    if plan["status"] in PLAN_STATUSES_TERMINAL:
+        return
+
+    summary = execution_plan_fill_summary(conn, account_id, plan_id)
+    filled_qty = to_decimal(summary["filled_qty"], "filled-qty")
+    target_qty_str = summary["target_qty"]
+    filled_cash_cny_str = summary.get("filled_cash_cny")
+    target_cash_cny_str = summary.get("target_cash_cny")
+    filled_position_pct_str = summary.get("filled_position_pct")
+    target_position_pct_str = summary.get("target_position_pct")
+
+    if filled_qty <= 0:
+        new_status = PLAN_STATUS_PLANNED
+    elif target_qty_str is not None and filled_qty >= to_decimal(target_qty_str, "target-qty"):
+        new_status = PLAN_STATUS_FILLED
+    elif (
+        filled_cash_cny_str is not None
+        and target_cash_cny_str is not None
+        and to_decimal(filled_cash_cny_str, "filled-cash-cny")
+        >= to_decimal(target_cash_cny_str, "target-cash-cny")
+    ):
+        new_status = PLAN_STATUS_FILLED
+    elif (
+        filled_position_pct_str is not None
+        and target_position_pct_str is not None
+        and to_decimal(filled_position_pct_str, "filled-position-pct")
+        >= to_decimal(target_position_pct_str, "target-position-pct")
+    ):
+        new_status = PLAN_STATUS_FILLED
+    else:
+        new_status = PLAN_STATUS_PARTIAL
+
+    if new_status == plan["status"]:
+        return  # 没变化，避免无意义的 updated_at 漂移
+
+    conn.execute(
+        "UPDATE execution_plan SET status = ?, updated_at = ? "
+        " WHERE id = ? AND account_id = ?",
+        (new_status, utc_now_iso(), plan_id, account_id),
+    )
+
+
+def create_execution_plan(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    side: str,
+    action_type: str,
+    thesis: str,
+    *,
+    status: str = "planned",
+    source_type: str | None = None,
+    source_ref_id: int | None = None,
+    source_action: str | None = None,
+    invalidation: str | None = None,
+    target_qty: str | None = None,
+    target_cash_cny: str | None = None,
+    target_position_pct: str | None = None,
+    price_limit_low: str | None = None,
+    price_limit_high: str | None = None,
+    stop_loss_price: str | None = None,
+    take_profit_price: str | None = None,
+    add_condition: str | None = None,
+    reduce_condition: str | None = None,
+    time_window_start: str | None = None,
+    time_window_end: str | None = None,
+    confidence: str | None = None,
+    risk_level: str | None = None,
+    tags: str | None = None,
+    note: str | None = None,
+    force: bool = False,
+) -> int:
+    ensure_defaults(conn)
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    side_norm = side.strip().lower()
+    if side_norm not in {"buy", "sell"}:
+        raise ValueError("side 只能是 buy 或 sell")
+    action = action_type.strip().lower()
+    if not action:
+        raise ValueError("action-type 不能为空")
+    thesis_text = thesis.strip()
+    if not thesis_text:
+        raise ValueError("thesis 不能为空")
+    if not any(v not in (None, "") for v in (target_qty, target_cash_cny, target_position_pct)):
+        raise ValueError("target_qty / target_cash_cny / target_position_pct 至少要传一个")
+
+    status_norm = (status or PLAN_STATUS_PLANNED).strip().lower()
+    if status_norm not in PLAN_STATUSES_INITIAL_ALLOWED:
+        raise ValueError(
+            f"初始 status 只能是 {sorted(PLAN_STATUSES_INITIAL_ALLOWED)}；"
+            f"partially_filled / filled 必须由 attach 状态机推导，不能凭空设置"
+        )
+
+    resolved_source_type = (
+        source_type or ("analysis_run" if source_ref_id is not None else "manual")
+    ).strip().lower()
+    if resolved_source_type not in SOURCE_TYPE_VALUES:
+        raise ValueError(
+            f"source_type 必须是 {sorted(SOURCE_TYPE_VALUES)}，收到: {resolved_source_type}"
+        )
+    if source_ref_id is not None:
+        run = get_analysis_run_by_id(conn, account_id, source_ref_id)
+        if not run:
+            raise ValueError(f"找不到 analysis_run id={source_ref_id}（可能不属于该账户）")
+        payload = run.get("payload") or {}
+        results = payload.get("results") or []
+        if not any(it.get("market") == norm_market and it.get("code") == norm_code for it in results):
+            raise ValueError(
+                f"analysis_run id={source_ref_id} 里没有 {norm_market.upper()} {norm_code} 这只标的"
+            )
+    if source_action and source_action.strip().lower() == "probe" and action != "probe" and not force:
+        raise ValueError("source_action=probe 时 action_type 默认也应为 probe；如需覆盖请加 --force")
+
+    now = utc_now_iso()
+    with _txn(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO execution_plan(
+              account_id, market, code, side, action_type, status, source_type, source_ref_id,
+              source_action, thesis, invalidation, target_qty, target_cash_cny, target_position_pct,
+              price_limit_low, price_limit_high, stop_loss_price, take_profit_price,
+              add_condition, reduce_condition, time_window_start, time_window_end,
+              confidence, risk_level, tags, note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                norm_market,
+                norm_code,
+                side_norm,
+                action,
+                status_norm,
+                resolved_source_type,
+                source_ref_id,
+                _normalize_optional_text(source_action),
+                thesis_text,
+                _normalize_optional_text(invalidation),
+                _normalize_optional_decimal(target_qty, "target-qty", q_qty),
+                _normalize_optional_decimal(target_cash_cny, "target-cash-cny", q_money),
+                _normalize_optional_decimal(target_position_pct, "target-position-pct", q_pct),
+                _normalize_optional_decimal(price_limit_low, "price-limit-low", q_price),
+                _normalize_optional_decimal(price_limit_high, "price-limit-high", q_price),
+                _normalize_optional_decimal(stop_loss_price, "stop-loss-price", q_price),
+                _normalize_optional_decimal(take_profit_price, "take-profit-price", q_price),
+                _normalize_optional_text(add_condition),
+                _normalize_optional_text(reduce_condition),
+                parse_user_time(time_window_start) if time_window_start else None,
+                parse_user_time(time_window_end) if time_window_end else None,
+                _normalize_optional_decimal(confidence, "confidence", q_pct),
+                _normalize_optional_text(risk_level),
+                _normalize_optional_text(tags),
+                _normalize_optional_text(note),
+                now,
+                now,
+            ),
+        )
+    return int(cur.lastrowid)
+
+
+def cancel_execution_plan(
+    conn,
+    account_id: int,
+    plan_id: int,
+    *,
+    reason: str = "",
+    new_status: str = PLAN_STATUS_CANCELLED,
+) -> None:
+    """显式把 plan 标记为 cancelled / expired。
+
+    只允许从非终态切换到终态，避免误把 cancelled 改回 cancelled 这种无意义动作。
+    """
+    if new_status not in {PLAN_STATUS_CANCELLED, PLAN_STATUS_EXPIRED}:
+        raise ValueError(
+            f"cancel/expire 的目标状态只能是 cancelled / expired，收到: {new_status}"
+        )
+    plan = _require_execution_plan(conn, account_id, plan_id)
+    if plan["status"] in PLAN_STATUSES_TERMINAL:
+        raise ValueError(
+            f"执行计划 id={plan_id} 已经是终态（{plan['status']}），不能再次取消/过期"
+        )
+    reason_text = (reason or "").strip()
+    new_note = plan.get("note") or ""
+    if reason_text:
+        suffix = f"[{new_status}] {reason_text}"
+        new_note = (new_note + "\n" + suffix).strip() if new_note else suffix
+    now = utc_now_iso()
+    conn.execute(
+        "UPDATE execution_plan SET status = ?, note = ?, updated_at = ? "
+        " WHERE id = ? AND account_id = ?",
+        (new_status, new_note, now, plan_id, account_id),
+    )
+    conn.commit()
+
+
+# 哪些字段可以通过 update_execution_plan 改。
+# 故意排除 market / code / side / source_ref_id / source_type / created_at：
+#   - 前三个改了意味着这是另一条计划，应当新建；
+#   - 后两个是审计来源，不允许覆盖。
+_UPDATABLE_PLAN_FIELDS: dict[str, str] = {
+    "action_type": "text",
+    "thesis": "text_required",
+    "invalidation": "text",
+    "target_qty": "qty",
+    "target_cash_cny": "money",
+    "target_position_pct": "pct",
+    "price_limit_low": "price",
+    "price_limit_high": "price",
+    "stop_loss_price": "price",
+    "take_profit_price": "price",
+    "add_condition": "text",
+    "reduce_condition": "text",
+    "time_window_start": "time",
+    "time_window_end": "time",
+    "confidence": "pct",
+    "risk_level": "text",
+    "tags": "text",
+    "note": "text",
+}
+
+
+def update_execution_plan(
+    conn,
+    account_id: int,
+    plan_id: int,
+    *,
+    updates: dict,
+) -> dict:
+    """更新一条 plan 的可变字段。
+
+    1. 终态（cancelled / expired）禁止编辑；想恢复请新建一条 plan。
+    2. ``filled`` / ``partially_filled`` 已经有成交：只允许调"事后参考"字段（止损/止盈/
+       条件/标签/备注 等），target / 价格区间 / action_type / thesis 一旦有成交就锁定，
+       避免事后篡改 thesis 让审计失真。
+    3. ``planned`` 状态下所有 _UPDATABLE_PLAN_FIELDS 都可改。
+    """
+    plan = _require_execution_plan(conn, account_id, plan_id)
+    if plan["status"] in PLAN_STATUSES_TERMINAL:
+        raise ValueError(
+            f"执行计划 id={plan_id} 已是终态（{plan['status']}），不能编辑；"
+            f"如需重新规划请新建 plan。"
+        )
+
+    has_fills = plan["status"] in {PLAN_STATUS_PARTIAL, PLAN_STATUS_FILLED}
+    locked_after_fill: frozenset[str] = frozenset({
+        "action_type", "thesis", "target_qty",
+        "target_cash_cny", "target_position_pct",
+        "price_limit_low", "price_limit_high",
+    })
+
+    set_clauses: list[str] = []
+    params: list = []
+    for field, raw in updates.items():
+        if field not in _UPDATABLE_PLAN_FIELDS:
+            raise ValueError(f"不支持更新字段 {field}（或不允许通过 update 修改）")
+        if has_fills and field in locked_after_fill:
+            raise ValueError(
+                f"该 plan 已经有成交，{field} 字段被锁定，不能事后修改；"
+                f"如需调整止损/止盈/标签/备注，请只传这些字段。"
+            )
+        kind = _UPDATABLE_PLAN_FIELDS[field]
+        normalized = _normalize_update_value(field, raw, kind)
+        set_clauses.append(f"{field} = ?")
+        params.append(normalized)
+
+    if not set_clauses:
+        raise ValueError("update 至少要传一个字段")
+
+    now = utc_now_iso()
+    set_clauses.append("updated_at = ?")
+    params.extend([now, plan_id, account_id])
+    conn.execute(
+        f"UPDATE execution_plan SET {', '.join(set_clauses)} "
+        f" WHERE id = ? AND account_id = ?",
+        params,
+    )
+    conn.commit()
+    return _require_execution_plan(conn, account_id, plan_id)
+
+
+def _normalize_update_value(field: str, raw, kind: str):
+    """根据字段类型做单值归一化（供 update_execution_plan 使用）。"""
+    if raw in (None, ""):
+        if kind == "text_required":
+            raise ValueError(f"{field} 不能为空")
+        return "" if kind == "text" else None
+    if kind == "text":
+        return str(raw).strip()
+    if kind == "text_required":
+        text = str(raw).strip()
+        if not text:
+            raise ValueError(f"{field} 不能为空")
+        return text
+    if kind == "qty":
+        return decimal_str(q_qty(to_decimal(raw, field)))
+    if kind == "price":
+        return decimal_str(q_price(to_decimal(raw, field)))
+    if kind == "money":
+        return decimal_str(q_money(to_decimal(raw, field)))
+    if kind == "pct":
+        return decimal_str(q_pct(to_decimal(raw, field)))
+    if kind == "time":
+        return parse_user_time(str(raw))
+    raise ValueError(f"unknown update kind: {kind}")
+
+
+def list_execution_plans(
+    conn,
+    account_id: int,
+    *,
+    status: str | None = None,
+    market: str | None = None,
+    code: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    clauses = ["account_id = ?"]
+    params: list = [account_id]
+    if status:
+        clauses.append("status = ?")
+        params.append(status.strip().lower())
+    if market:
+        norm_market = normalize_market(market)
+        clauses.append("market = ?")
+        params.append(norm_market)
+        if code:
+            clauses.append("code = ?")
+            params.append(normalize_code(norm_market, code))
+    elif code:
+        raise ValueError("只传 code 时必须同时传 market")
+    sql = (
+        "SELECT * FROM execution_plan "
+        f"WHERE {' AND '.join(clauses)} ORDER BY id DESC"
+    )
+    if limit and limit > 0:
+        sql += f" LIMIT {int(limit)}"
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def execution_plan_fill_summary(conn, account_id: int, plan_id: int) -> dict:
+    plan = _require_execution_plan(conn, account_id, plan_id)
+    rows = conn.execute(
+        """
+        SELECT t.id, t.qty, t.price, t.currency, t.fx_rate
+          FROM trade_execution_link l
+          JOIN trade_ledger t
+            ON t.id = l.trade_id
+         WHERE l.account_id = ? AND l.plan_id = ? AND t.is_deleted = 0
+         ORDER BY t.trade_time, t.id
+        """,
+        (account_id, plan_id),
+    ).fetchall()
+
+    filled_qty = Decimal("0")
+    filled_amount = Decimal("0")
+    filled_cash_cny = Decimal("0")
+    cash_convertible = True
+    for row in rows:
+        qty_d = to_decimal(row["qty"], "qty")
+        price_d = to_decimal(row["price"], "price")
+        filled_qty += qty_d
+        filled_amount += qty_d * price_d
+        trade_amount = qty_d * price_d
+        currency = str(row["currency"] or "").upper()
+        if currency == "CNY":
+            filled_cash_cny += trade_amount
+        elif currency == "HKD":
+            fx_rate = row["fx_rate"]
+            if fx_rate in (None, ""):
+                cash_convertible = False
+            else:
+                filled_cash_cny += trade_amount * to_decimal(fx_rate, "fx-rate")
+        else:
+            cash_convertible = False
+    avg_price = None
+    if filled_qty > 0:
+        avg_price = decimal_str(q_price(filled_amount / filled_qty))
+
+    completion_pct = None
+    if plan["target_qty"]:
+        target_qty = to_decimal(plan["target_qty"], "target-qty")
+        if target_qty > 0:
+            completion_pct = decimal_str(q_price((filled_qty / target_qty) * Decimal("100")))
+
+    filled_cash_cny_str = decimal_str(q_money(filled_cash_cny)) if cash_convertible else None
+    target_cash_cny = plan["target_cash_cny"]
+    cash_completion_pct = None
+    if target_cash_cny and cash_convertible:
+        target_cash = to_decimal(target_cash_cny, "target-cash-cny")
+        if target_cash > 0:
+            cash_completion_pct = decimal_str(q_pct((filled_cash_cny / target_cash) * Decimal("100")))
+
+    filled_position_pct_str = None
+    target_position_pct = plan["target_position_pct"]
+    position_completion_pct = None
+    if target_position_pct and cash_convertible:
+        try:
+            from spc_core.settings import capital_settings
+
+            caps = capital_settings(conn, account_id)
+            total_cny = to_decimal(caps["total_cny"], "capital.total_cny")
+            if total_cny > 0:
+                filled_position_pct = (filled_cash_cny / total_cny) * Decimal("100")
+                filled_position_pct_str = decimal_str(q_pct(filled_position_pct))
+                target_pct = to_decimal(target_position_pct, "target-position-pct")
+                if target_pct > 0:
+                    position_completion_pct = decimal_str(q_pct((filled_position_pct / target_pct) * Decimal("100")))
+        except Exception:  # noqa: BLE001
+            filled_position_pct_str = None
+            position_completion_pct = None
+
+    return {
+        "trade_count": len(rows),
+        "filled_qty": decimal_str(q_qty(filled_qty)),
+        "avg_price": avg_price,
+        "target_qty": plan["target_qty"],
+        "completion_pct": completion_pct,
+        "filled_cash_cny": filled_cash_cny_str,
+        "target_cash_cny": target_cash_cny,
+        "cash_completion_pct": cash_completion_pct,
+        "filled_position_pct": filled_position_pct_str,
+        "target_position_pct": target_position_pct,
+        "position_completion_pct": position_completion_pct,
+    }
+
+
+def get_execution_plan_detail(conn, account_id: int, plan_id: int) -> dict:
+    plan = _require_execution_plan(conn, account_id, plan_id)
+    trades = conn.execute(
+        """
+        SELECT t.id, t.market, t.code, t.side, t.qty, t.price, t.currency, t.trade_time,
+               t.note, l.role, l.created_at AS linked_at
+          FROM trade_execution_link l
+          JOIN trade_ledger t
+            ON t.id = l.trade_id
+         WHERE l.account_id = ? AND l.plan_id = ? AND t.is_deleted = 0
+         ORDER BY t.trade_time, t.id
+        """,
+        (account_id, plan_id),
+    ).fetchall()
+    reviews = conn.execute(
+        """
+        SELECT id, trade_id, review_time, horizon, outcome, discipline_score,
+               execution_score, thesis_score, plan_followed, lesson, next_rule,
+               mistake_tags, good_tags, note
+          FROM execution_review
+         WHERE account_id = ? AND plan_id = ?
+         ORDER BY review_time DESC, id DESC
+        """,
+        (account_id, plan_id),
+    ).fetchall()
+    out = dict(plan)
+    out["trades"] = [dict(row) for row in trades]
+    out["reviews"] = [dict(row) for row in reviews]
+    out["fill_summary"] = execution_plan_fill_summary(conn, account_id, plan_id)
+    if plan.get("source_ref_id"):
+        source_run = get_analysis_run_by_id(conn, account_id, int(plan["source_ref_id"]))
+        if source_run:
+            out["source_run"] = {
+                "id": source_run["id"],
+                "run_time": source_run["run_time"],
+                "scope": source_run["scope"],
+            }
+    return out
+
+
+def _attach_trade_to_plan_unsafe(
+    conn,
+    account_id: int,
+    plan_id: int,
+    trade_id: int,
+    role: str,
+    note: str,
+    *,
+    force: bool = False,
+) -> None:
+    plan = _require_execution_plan(conn, account_id, plan_id)
+    if plan["status"] in PLAN_STATUSES_TERMINAL:
+        raise ValueError(
+            f"执行计划 id={plan_id} 已是终态（{plan['status']}），不能再关联成交"
+        )
+    trade = _get_trade_row(conn, account_id, trade_id)
+    _validate_plan_trade_link(
+        plan,
+        trade_market=trade["market"],
+        trade_code=trade["code"],
+        trade_side=trade["side"],
+        force=force,
+    )
+    role_norm = (role or "fill").strip().lower()
+    if role_norm not in ROLE_VALUES:
+        raise ValueError(f"role 必须是 {sorted(ROLE_VALUES)}，收到: {role_norm}")
+    existing = conn.execute(
+        "SELECT id FROM trade_execution_link "
+        " WHERE account_id = ? AND plan_id = ? AND trade_id = ?",
+        (account_id, plan_id, trade_id),
+    ).fetchone()
+    if existing:
+        raise ValueError(f"trade id={trade_id} 已经关联到 plan id={plan_id}")
+    try:
+        conn.execute(
+            """
+            INSERT INTO trade_execution_link(account_id, plan_id, trade_id, role, note, created_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (account_id, plan_id, trade_id, role_norm, note or "", utc_now_iso()),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ValueError(f"trade id={trade_id} 已经关联到 plan id={plan_id}") from exc
+    _refresh_execution_plan_status(conn, account_id, plan_id)
+
+
+def _attach_trade_to_plan(
+    conn,
+    account_id: int,
+    plan_id: int,
+    trade_id: int,
+    role: str,
+    note: str,
+    *,
+    force: bool = False,
+    commit: bool = True,
+) -> None:
+    if commit:
+        with _txn(conn):
+            _attach_trade_to_plan_unsafe(
+                conn, account_id, plan_id, trade_id, role, note, force=force,
+            )
+        return
+    _attach_trade_to_plan_unsafe(
+        conn, account_id, plan_id, trade_id, role, note, force=force,
+    )
+
+
+def attach_trade_to_plan(
+    conn,
+    account_id: int,
+    plan_id: int,
+    trade_id: int,
+    *,
+    role: str = "fill",
+    note: str = "",
+    force: bool = False,
+) -> None:
+    _attach_trade_to_plan(conn, account_id, plan_id, trade_id, role, note, force=force, commit=True)
+
+
+def add_execution_review(
+    conn,
+    account_id: int,
+    *,
+    plan_id: int | None = None,
+    trade_id: int | None = None,
+    review_time: str | None = None,
+    horizon: str = "manual",
+    outcome: str,
+    discipline_score: int | None = None,
+    execution_score: int | None = None,
+    thesis_score: int | None = None,
+    plan_followed: bool | None = None,
+    mistake_tags: str | None = None,
+    good_tags: str | None = None,
+    pnl_snapshot_cny: str | None = None,
+    max_favorable_excursion_pct: str | None = None,
+    max_adverse_excursion_pct: str | None = None,
+    lesson: str = "",
+    next_rule: str | None = None,
+    note: str | None = None,
+) -> int:
+    if plan_id is None and trade_id is None:
+        raise ValueError("plan_id 和 trade_id 至少要传一个")
+    if plan_id is not None:
+        _require_execution_plan(conn, account_id, plan_id)
+    if trade_id is not None:
+        _get_trade_row(conn, account_id, trade_id)
+    lesson_text = lesson.strip()
+    if not lesson_text:
+        raise ValueError("lesson 不能为空")
+    horizon_norm = (horizon or "manual").strip().lower()
+    if horizon_norm not in HORIZON_VALUES:
+        raise ValueError(f"horizon 必须是 {sorted(HORIZON_VALUES)}，收到: {horizon_norm}")
+    outcome_norm = outcome.strip().lower()
+    if outcome_norm not in OUTCOME_VALUES:
+        raise ValueError(f"outcome 必须是 {sorted(OUTCOME_VALUES)}，收到: {outcome_norm}")
+    now = utc_now_iso()
+    with _txn(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO execution_review(
+              account_id, plan_id, trade_id, review_time, horizon, outcome,
+              discipline_score, execution_score, thesis_score, plan_followed,
+              mistake_tags, good_tags, pnl_snapshot_cny,
+              max_favorable_excursion_pct, max_adverse_excursion_pct,
+              lesson, next_rule, note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                plan_id,
+                trade_id,
+                parse_user_time(review_time),
+                horizon_norm,
+                outcome_norm,
+                discipline_score,
+                execution_score,
+                thesis_score,
+                None if plan_followed is None else int(plan_followed),
+                _normalize_optional_text(mistake_tags),
+                _normalize_optional_text(good_tags),
+                _normalize_optional_decimal(pnl_snapshot_cny, "pnl-snapshot-cny", q_money),
+                _normalize_optional_decimal(max_favorable_excursion_pct, "max-favorable-excursion-pct", q_pct),
+                _normalize_optional_decimal(max_adverse_excursion_pct, "max-adverse-excursion-pct", q_pct),
+                lesson_text,
+                _normalize_optional_text(next_rule),
+                _normalize_optional_text(note),
+                now,
+                now,
+            ),
+        )
+    return int(cur.lastrowid)
 
 
 def save_analysis_run(conn, account_id: int, scope: str, market: str | None, code: str | None, payload: dict) -> int:
@@ -448,3 +1273,220 @@ def latest_snapshot_for_symbol(conn, account_id: int, market: str, code: str) ->
         (account_id, norm_market, norm_code),
     ).fetchone()
     return dict(row) if row else None
+
+
+# ── 持仓侧风控辅助查询（P2a / P2b）─────────────────────────────────
+
+def get_active_plan_levels(conn, account_id: int, market: str, code: str) -> dict | None:
+    """查指定 (account, market, code) 上"最近一条非终态 execution_plan"的预案价位。
+
+    用于持仓侧决策（``_decide_for_holding``）的 P2a 路径：
+      - status ∈ {planned, partially_filled} 才算"还在执行中的预案"
+      - 终态（cancelled / expired / filled）的 plan 价位不再生效
+      - 多条非终态时取最新一条（id DESC）
+
+    Returns:
+        ``{"plan_id": int, "stop_loss_price": Decimal | None,
+           "take_profit_price": Decimal | None}``，找不到时返回 None。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    row = conn.execute(
+        """
+        SELECT id, stop_loss_price, take_profit_price
+          FROM execution_plan
+         WHERE account_id = ? AND market = ? AND code = ?
+           AND status IN (?, ?)
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (account_id, norm_market, norm_code, PLAN_STATUS_PLANNED, PLAN_STATUS_PARTIAL),
+    ).fetchone()
+    if not row:
+        return None
+    out: dict = {"plan_id": row["id"], "stop_loss_price": None, "take_profit_price": None}
+    if row["stop_loss_price"]:
+        try:
+            out["stop_loss_price"] = to_decimal(row["stop_loss_price"], "plan.stop_loss_price")
+        except Exception:  # noqa: BLE001
+            pass
+    if row["take_profit_price"]:
+        try:
+            out["take_profit_price"] = to_decimal(row["take_profit_price"], "plan.take_profit_price")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def get_position_peak(conn, account_id: int, market: str, code: str) -> dict | None:
+    """读取当前持仓阶段的最高价记录（trailing stop 用）。
+
+    Returns:
+        dict 含 ``peak_price`` / ``peak_time`` / ``position_open_time`` /
+        ``last_trim_tier`` / ``last_trim_price`` / ``last_trim_time``（v5+），
+        无记录时返回 None。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    row = conn.execute(
+        """
+        SELECT peak_price, peak_time, position_open_time, updated_at,
+               last_trim_tier, last_trim_price, last_trim_time
+          FROM position_peak
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (account_id, norm_market, norm_code),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def set_position_trim_tier(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    *,
+    tier: str,
+    price: Decimal,
+) -> None:
+    """写入"已触发 tier 减仓"标记（P0a 分档幂等性）。
+
+    设计：
+      - 调用方负责保证 ``tier ∈ {"T1", "T2"}``（T3 是 sell，幂等性由 sell 守卫
+        天然保证，不进 last_trim_tier）
+      - 写入前要确保 peak 行存在；如果不存在（理论上不该发生，因为 sync 时已经
+        upsert），就什么都不做，把这条 trim 当作首次触发对待，下次 sync 后正常
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    now = utc_now_iso()
+    cur = conn.execute(
+        """
+        UPDATE position_peak
+           SET last_trim_tier = ?,
+               last_trim_price = ?,
+               last_trim_time = ?,
+               updated_at = ?
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (tier, decimal_str(price), now, now, account_id, norm_market, norm_code),
+    )
+    return cur.rowcount > 0
+
+
+def clear_position_trim_tier(conn, account_id: int, market: str, code: str) -> bool:
+    """清空 trim_tier 标记。
+
+    触发时机：
+      - portfolio.sync：浮亏回升至 T1 阈值以下 → 让标的重新有"再下跌一档"的容量
+      - delete_position_peak：清仓时整条删除，间接清掉 trim_tier
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    now = utc_now_iso()
+    cur = conn.execute(
+        """
+        UPDATE position_peak
+           SET last_trim_tier = NULL,
+               last_trim_price = NULL,
+               last_trim_time = NULL,
+               updated_at = ?
+         WHERE account_id = ? AND market = ? AND code = ?
+           AND last_trim_tier IS NOT NULL
+        """,
+        (now, account_id, norm_market, norm_code),
+    )
+    return cur.rowcount > 0
+
+
+def upsert_position_peak(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    *,
+    last_price: Decimal,
+    avg_cost: Decimal,
+    position_open_time: str,
+) -> dict:
+    """更新（或初始化）``position_peak`` 表。
+
+    规则：
+      - 没有记录时初始化为 ``max(avg_cost, last_price)``，避免"刚买入就立刻把
+        peak 锚定在低于成本的位置"导致 trailing stop 错误地立即触发
+      - 有记录时仅当 ``last_price > peak_price`` 才更新 peak
+      - position_open_time 只在首次初始化时写入；之后保持不变（直至清仓删除）
+
+    调用方负责保证 ``last_price > 0`` 和 ``avg_cost > 0``。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    now = utc_now_iso()
+    row = conn.execute(
+        """
+        SELECT peak_price, peak_time, position_open_time
+          FROM position_peak
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (account_id, norm_market, norm_code),
+    ).fetchone()
+    if row is None:
+        # 初始化：peak = max(avg_cost, last_price)
+        initial_peak = last_price if last_price > avg_cost else avg_cost
+        conn.execute(
+            """
+            INSERT INTO position_peak
+              (account_id, market, code, peak_price, peak_time,
+               position_open_time, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id, norm_market, norm_code,
+                decimal_str(initial_peak), now, position_open_time, now,
+            ),
+        )
+        return {
+            "peak_price": decimal_str(initial_peak),
+            "peak_time": now,
+            "position_open_time": position_open_time,
+            "updated_at": now,
+        }
+    old_peak = to_decimal(row["peak_price"], "peak_price")
+    if last_price > old_peak:
+        conn.execute(
+            """
+            UPDATE position_peak
+               SET peak_price = ?, peak_time = ?, updated_at = ?
+             WHERE account_id = ? AND market = ? AND code = ?
+            """,
+            (
+                decimal_str(last_price), now, now,
+                account_id, norm_market, norm_code,
+            ),
+        )
+        return {
+            "peak_price": decimal_str(last_price),
+            "peak_time": now,
+            "position_open_time": row["position_open_time"],
+            "updated_at": now,
+        }
+    return {
+        "peak_price": row["peak_price"],
+        "peak_time": row["peak_time"],
+        "position_open_time": row["position_open_time"],
+        "updated_at": row["peak_time"],
+    }
+
+
+def delete_position_peak(conn, account_id: int, market: str, code: str) -> bool:
+    """清仓时调用：删除对应的 peak 记录。下次再建仓会重新初始化。"""
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    cur = conn.execute(
+        """
+        DELETE FROM position_peak
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (account_id, norm_market, norm_code),
+    )
+    return cur.rowcount > 0

@@ -38,6 +38,7 @@ MARKET_REGIME_NEUTRAL = "NEUTRAL"
 MARKET_A = "a"
 MARKET_HK = "hk"
 ACTION_LABELS = {
+    "add": "加仓",
     "avoid": "回避",
     "buy": "买入候选",
     "focus": "重点关注",
@@ -48,15 +49,148 @@ ACTION_LABELS = {
     "watch": "观察",
 }
 ACTION_DESCRIPTIONS = {
+    "add": (
+        "已持仓且趋势/反转信号依然成立，仓位仍有空间且未亏损，可考虑分批加仓；"
+        "建议不要一次顶满，配合开盘承接情况执行"
+    ),
     "avoid": "风险或价格结构较差，暂不纳入交易候选",
     "buy": "满足更严格的买入候选条件，仍需结合开盘承接和仓位计划执行",
     "focus": "宽松信号较好，优先加入盯盘清单，但还没有达到买入条件",
     "hold": "持仓未触发明确处理信号",
     "probe": "港股大盘弱市下，反转买入候选降档为试探：先用常规仓位 1/4-1/3 建首仓，确认修复后再加第二笔",
     "sell": "持仓亏损与风险信号同时触发，优先考虑退出",
-    "trim": "仓位、风险或价格结构触发减仓条件",
+    "trim": "仓位、风险、止盈或价格结构触发减仓条件",
     "watch": "继续跟踪，等待更清晰的触发条件",
 }
+
+# ─────────────────────────────────────────────────────────────────
+# P0/P1/P2 持仓侧策略默认参数
+#
+# 这些值都可以被 account_settings 里的同名 key 覆盖，让不同账户（短线 / 长线 /
+# ETF 组合）跑不同风格的止盈止损：
+#   decision.hard_stop_pct.{a_stock|hk_stock|etf}.{t1|t2|t3}
+#     - 三档分级硬止损（详见下方 P0a 注释）
+#     - 旧的 decision.hard_stop_pct.{a_stock|hk_stock|etf}（无后缀）已废弃
+#   decision.take_profit.t1_pct / .t2_pct / .t3_pct
+#   decision.add_position.weight_headroom_ratio  (默认 0.85 = 加仓时单票上限留 15% 缓冲)
+#   decision.trailing_stop.pct                   (默认 0.15 = 从持仓期间最高价回撤 15% 触发 trim)
+#   decision.trailing_stop.severe_pct            (默认 0.25 = 回撤 25% 直接升 sell)
+# ─────────────────────────────────────────────────────────────────
+
+# P0a 分级硬止损：把"单一硬切 sell"拆成三道防线 + 大盘 regime 软联动。
+#
+# 设计动机：
+#   - 单一阈值（如 A 股 10%）容易在"跌停 + 短期回踩"场景被误触发，强制 sell
+#     在地板上；事实上 A 股跌停后第二天反弹概率不低，趋势走坏需要更深跌幅佐证
+#   - 高位接盘 + 短期回踩 10-15% 是牛股常见结构，硬切 sell 会切掉后续上涨
+#   - 真正"已经深套、不再幻想"的硬底线应该比 10% 更深（A 股 18%、港股 25%）
+#
+# T1（首道防线）：减半锁损，给修复机会。多数情况下应停留在 trim 状态
+# T2（深防线）：再减一半，最多留 25% 仓位观察，等待反弹或继续止损
+# T3（硬底线）：强制全退，已经损失惨重不再幻想，sell @ 0.85
+#
+# A 股波动 < 港股 < ETF（行业 ETF）；阈值梯度按市场特性设。
+_HARD_STOP_T1_A = Decimal("0.08")   # 8%
+_HARD_STOP_T2_A = Decimal("0.12")   # 12%
+_HARD_STOP_T3_A = Decimal("0.18")   # 18%
+
+_HARD_STOP_T1_HK = Decimal("0.12")  # 12%
+_HARD_STOP_T2_HK = Decimal("0.18")  # 18%
+_HARD_STOP_T3_HK = Decimal("0.25")  # 25%
+
+_HARD_STOP_T1_ETF = Decimal("0.10")  # 10%
+_HARD_STOP_T2_ETF = Decimal("0.15")  # 15%
+_HARD_STOP_T3_ETF = Decimal("0.22")  # 22%
+
+# P0b 分级止盈：浮盈达到不同档位触发 trim / sell
+_TAKE_PROFIT_T1 = Decimal("0.20")   # 第一级：≥ 20% 浮盈
+_TAKE_PROFIT_T2 = Decimal("0.50")   # 第二级：≥ 50% 浮盈
+_TAKE_PROFIT_T3 = Decimal("1.00")   # 第三级：≥ 100% 浮盈
+
+# P1a 加仓：单票权重达到上限的多少时不再建议加仓
+_ADD_POSITION_HEADROOM_RATIO = Decimal("0.85")
+
+# P2b trailing stop：默认 15% 触发 trim、25% 升 sell
+_TRAILING_STOP_PCT = Decimal("0.15")
+_TRAILING_STOP_SEVERE_PCT = Decimal("0.25")
+
+
+def _account_decimal_setting(conn, account_id: int, key: str, default: Decimal) -> Decimal:
+    """从 account_settings 读 Decimal，缺失则用默认。
+
+    解耦：本模块尽量保持 pure，但实在需要拿 account 配置时通过 setter 注入。
+    解析失败（脏数据）回退到默认值，避免决策因配置错误整体崩。
+    """
+    if conn is None or account_id is None:
+        return default
+    try:
+        from spc_core.settings import get_account_setting
+        raw = get_account_setting(conn, account_id, key)
+    except Exception:  # noqa: BLE001
+        return default
+    if raw is None or raw == "":
+        return default
+    try:
+        return to_decimal(raw, key)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _resolve_decision_params(conn, account_id: int) -> dict:
+    """读取本账户的策略参数，返回 dict 供 _decision_from_analysis 使用。
+
+    所有参数都有兜底默认值，缺配置时使用代码里的常量。
+    """
+    return {
+        # P0a 分级硬止损：三档 × 三市场。旧的 decision.hard_stop_pct.{a_stock,hk_stock,etf}
+        # 单 key 已废弃（被分档替代）；建议用户改用 .t1/.t2/.t3 后缀。
+        "hard_stop_a_t1": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.a_stock.t1", _HARD_STOP_T1_A,
+        ),
+        "hard_stop_a_t2": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.a_stock.t2", _HARD_STOP_T2_A,
+        ),
+        "hard_stop_a_t3": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.a_stock.t3", _HARD_STOP_T3_A,
+        ),
+        "hard_stop_hk_t1": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.hk_stock.t1", _HARD_STOP_T1_HK,
+        ),
+        "hard_stop_hk_t2": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.hk_stock.t2", _HARD_STOP_T2_HK,
+        ),
+        "hard_stop_hk_t3": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.hk_stock.t3", _HARD_STOP_T3_HK,
+        ),
+        "hard_stop_etf_t1": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.etf.t1", _HARD_STOP_T1_ETF,
+        ),
+        "hard_stop_etf_t2": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.etf.t2", _HARD_STOP_T2_ETF,
+        ),
+        "hard_stop_etf_t3": _account_decimal_setting(
+            conn, account_id, "decision.hard_stop_pct.etf.t3", _HARD_STOP_T3_ETF,
+        ),
+        "tp_t1": _account_decimal_setting(
+            conn, account_id, "decision.take_profit.t1_pct", _TAKE_PROFIT_T1,
+        ),
+        "tp_t2": _account_decimal_setting(
+            conn, account_id, "decision.take_profit.t2_pct", _TAKE_PROFIT_T2,
+        ),
+        "tp_t3": _account_decimal_setting(
+            conn, account_id, "decision.take_profit.t3_pct", _TAKE_PROFIT_T3,
+        ),
+        "add_headroom": _account_decimal_setting(
+            conn, account_id, "decision.add_position.weight_headroom_ratio",
+            _ADD_POSITION_HEADROOM_RATIO,
+        ),
+        "trail_pct": _account_decimal_setting(
+            conn, account_id, "decision.trailing_stop.pct", _TRAILING_STOP_PCT,
+        ),
+        "trail_severe_pct": _account_decimal_setting(
+            conn, account_id, "decision.trailing_stop.severe_pct", _TRAILING_STOP_SEVERE_PCT,
+        ),
+    }
 
 
 def _extract_security_name(analysis: dict) -> str:
@@ -74,11 +208,23 @@ def _extract_security_name(analysis: dict) -> str:
 
 
 def _select_targets(conn, account_id: int, scope: str, market: str | None, code: str | None) -> list[tuple[str, str, str]]:
+    """挑出本次 analyze 要跑的标的。
+
+    持仓侧过滤策略：``qty <= 0`` 的清仓快照不再算"在持"。
+    这跟 ``portfolio show`` 默认隐藏 qty=0 的行为对齐——保留 trade_ledger 已实现盈亏，
+    但不在每次 analyze 里再把它们当作"持仓"分析（既费时间也产生噪声）。
+
+    单标的查询（``market + code`` 同时给）走 ``single`` 通道：不论持仓状态都允许 spot-check，
+    用户可能就是想看一只已清仓标的现在跌没跌透 / 适不适合重新建仓。
+    """
     targets: list[tuple[str, str, str]] = []
     if market and code:
         return [(market, code, "single")]
     if scope in {"holdings", "all"}:
         for snap in latest_snapshots(conn, account_id):
+            qty = to_decimal(snap.get("qty") or "0", "snapshot.qty")
+            if qty <= 0:
+                continue
             targets.append((snap["market"], snap["code"], "holdings"))
     if scope in {"watchlist", "all"}:
         existing = {(m, c) for m, c, _ in targets}
@@ -134,6 +280,7 @@ class Features:
     ff_available: bool
     ff_regime: str | None
     ff_reversal: str | None
+    ff_time_label: str | None
     ff_1d: float | None
     ff_3d: float | None
     ff_5d: float | None
@@ -144,6 +291,12 @@ class Features:
     ff_cross: dict | None
     # 大盘
     market_regime: str | None
+    # 持仓期间最高价（trailing stop 用）。无持仓 / 缺数据时为 None。
+    peak_price: Decimal | None
+    # 当前账户对该标的的 active execution_plan 的预案价位（planned / partially_filled）。
+    # 无预案时为 None。如果有多条非终态 plan，取最近一条。
+    plan_stop_loss_price: Decimal | None
+    plan_take_profit_price: Decimal | None
     # ── Enrichment 维度（v1，仅贡献 reasons/risks 文案 + sources 展示）──
     # 这些字段的语义见 shared/stock_core/enrichment.py，缺数据时为 None / 0
     # ① 个股相关新闻（最近 7 天财联社电报命中数）
@@ -158,6 +311,14 @@ class Features:
     attention_followers: int | None
     attention_level: str | None    # low/moderate/hot/very_hot
     attention_crowded: bool        # level >= hot
+    # P0a 分档幂等性（schema v5）：上次已触发的 trim tier 标记，避免重复建议同档减仓。
+    # None 表示尚未在本 lifecycle 触发过 trim；"T1" / "T2" 表示已触发。
+    # T3 (sell) 不进 last_trim_tier，因为 sell 守卫天然防重复。
+    last_trim_tier: str | None = None
+    last_trim_price: Decimal | None = None
+    last_trim_time: str | None = None
+    # 持仓豁免硬止损（P0a / L4），用于历史遗留深套仓位等场景
+    exempt_hard_stop: bool = False
 
 
 def _extract_features(
@@ -165,6 +326,14 @@ def _extract_features(
     analysis: dict,
     capital_total: Decimal,
     market_regime: str | None,
+    *,
+    peak_price: Decimal | None = None,
+    plan_stop_loss_price: Decimal | None = None,
+    plan_take_profit_price: Decimal | None = None,
+    last_trim_tier: str | None = None,
+    last_trim_price: Decimal | None = None,
+    last_trim_time: str | None = None,
+    exempt_hard_stop: bool = False,
 ) -> Features:
     quote = analysis.get("quote") or {}
     announcements = analysis.get("announcements") or []
@@ -241,6 +410,7 @@ def _extract_features(
         ff_available=ff_available,
         ff_regime=fund_flow.get("regime") if ff_available else None,
         ff_reversal=fund_flow.get("reversal") if ff_available else None,
+        ff_time_label=fund_flow.get("flow_label") if ff_available else None,
         ff_1d=_ff_yi("1d"),
         ff_3d=_ff_yi("3d"),
         ff_5d=_ff_yi("5d"),
@@ -248,6 +418,9 @@ def _extract_features(
         ff_20d=_ff_yi("20d"),
         ff_cross=(fund_flow.get("cross_validation") if ff_available else None),
         market_regime=market_regime,
+        peak_price=peak_price,
+        plan_stop_loss_price=plan_stop_loss_price,
+        plan_take_profit_price=plan_take_profit_price,
         news_related=news_related,
         news_important=news_important,
         news_top_titles=news_titles,
@@ -257,6 +430,10 @@ def _extract_features(
         attention_followers=attention_followers,
         attention_level=attention_level,
         attention_crowded=attention_crowded,
+        last_trim_tier=last_trim_tier,
+        last_trim_price=last_trim_price,
+        last_trim_time=last_trim_time,
+        exempt_hard_stop=exempt_hard_stop,
     )
 
 
@@ -303,15 +480,20 @@ def _collect_fund_flow_signals(f: Features) -> tuple[list[str], list[str]]:
     risks: list[str] = []
     if not f.ff_available:
         return reasons, risks
+    ff_suffix = f"（资金流口径：{f.ff_time_label}）" if f.ff_time_label else ""
     if f.ff_regime == FUND_PERSISTENT_INFLOW:
-        reasons.append(f"主力 20 日持续净流入 {f.ff_20d:+.2f} 亿")
+        reasons.append(f"主力 20 日持续净流入 {f.ff_20d:+.2f} 亿{ff_suffix}")
     elif f.ff_regime == FUND_PERSISTENT_OUTFLOW:
-        risks.append(f"主力 20 日持续净流出 {f.ff_20d:+.2f} 亿")
+        risks.append(f"主力 20 日持续净流出 {f.ff_20d:+.2f} 亿{ff_suffix}")
     if f.ff_reversal == FUND_REVERSAL_DOWN:
-        risks.append("近 5 日主力资金由流入转为流出，趋势可能在切换")
+        risks.append(f"近 5 日主力资金由流入转为流出，趋势可能在切换{ff_suffix}")
     elif f.ff_reversal == FUND_REVERSAL_UP:
-        reasons.append("近 5 日主力资金由流出转为流入，下跌动能在衰竭")
+        reasons.append(f"近 5 日主力资金由流出转为流入，下跌动能在衰竭{ff_suffix}")
     return reasons, risks
+
+
+def _ff_suffix(label: str | None) -> str:
+    return f"（资金流口径：{label}）" if label else ""
 
 
 def _collect_news_signals(f: Features) -> tuple[list[str], list[str]]:
@@ -501,8 +683,8 @@ def _evaluate_etf_self_select_buy(f: Features) -> tuple[str, Decimal, str] | Non
             )
             if f.market_regime == MARKET_REGIME_RISK_OFF:
                 return ("focus", Decimal("0.62"),
-                        base_msg + "；大盘 RISK_OFF，降级为 focus 等大盘修复")
-            return ("buy", Decimal("0.68"), base_msg + "；跨境 ETF 置信度低于本地 ETF")
+                        base_msg + _ff_suffix(f.ff_time_label) + "；大盘 RISK_OFF，降级为 focus 等大盘修复")
+            return ("buy", Decimal("0.68"), base_msg + _ff_suffix(f.ff_time_label) + "；跨境 ETF 置信度低于本地 ETF")
 
         if commodity_or_bond:
             # 商品 / 债券 ETF：资金面也无意义
@@ -511,27 +693,27 @@ def _evaluate_etf_self_select_buy(f: Features) -> tuple[str, Decimal, str] | Non
                 "资金面分析意义有限，主要看价格突破"
             )
             if f.market_regime == MARKET_REGIME_RISK_OFF:
-                return ("focus", Decimal("0.62"), base_msg + "；大盘 RISK_OFF，降级 focus")
-            return ("buy", Decimal("0.66"), base_msg)
+                return ("focus", Decimal("0.62"), base_msg + _ff_suffix(f.ff_time_label) + "；大盘 RISK_OFF，降级 focus")
+            return ("buy", Decimal("0.66"), base_msg + _ff_suffix(f.ff_time_label))
 
         # 本地主题 ETF（科创 / 创业 / 行业）：要求资金面齐声
         if f.ff_regime == FUND_PERSISTENT_OUTFLOW:
             return ("focus", Decimal("0.62"),
-                    "【ETF 趋势路径】价格创新高但主力 PERSISTENT_OUTFLOW，降级 focus")
+                    "【ETF 趋势路径】价格创新高但主力 PERSISTENT_OUTFLOW，降级 focus" + _ff_suffix(f.ff_time_label))
         # 1d/3d/5d 任一为负即降级（量级齐声）
         ff_neg = [(name, v) for name, v in (("1d", f.ff_1d), ("3d", f.ff_3d), ("5d", f.ff_5d))
                   if v is not None and v < 0]
         if ff_neg:
             details = ", ".join(f"{n}={v:+.2f}yi" for n, v in ff_neg)
             return ("focus", Decimal("0.63"),
-                    f"【ETF 趋势路径】价格创新高但近期资金有反向迹象（{details}），降级 focus")
+                    f"【ETF 趋势路径】价格创新高但近期资金有反向迹象（{details}），降级 focus" + _ff_suffix(f.ff_time_label))
         msg = (
             f"【ETF 趋势路径】价格 {f.regime} + 1d/3d/5d 资金齐正"
             f"（1d={f.ff_1d:+.2f}yi, 3d={f.ff_3d:+.2f}yi, 5d={f.ff_5d:+.2f}yi）→ 趋势买入"
         )
         if f.market_regime == MARKET_REGIME_RISK_OFF:
-            return ("focus", Decimal("0.65"), msg + "；大盘 RISK_OFF 降级 focus")
-        return ("buy", Decimal("0.72"), msg)
+            return ("focus", Decimal("0.65"), msg + _ff_suffix(f.ff_time_label) + "；大盘 RISK_OFF 降级 focus")
+        return ("buy", Decimal("0.72"), msg + _ff_suffix(f.ff_time_label))
 
     # ── 反转 ETF buy（MID_REGIMES）──
     # 跨境 / 商品 / 债券：不做反转买入（资金面没意义）
@@ -546,8 +728,8 @@ def _evaluate_etf_self_select_buy(f: Features) -> tuple[str, Decimal, str] | Non
         f"3d={f.ff_3d:+.2f}yi/5d={f.ff_5d:+.2f}yi 正向 → 反转买入"
     )
     if f.market_regime == MARKET_REGIME_RISK_OFF:
-        return ("focus", Decimal("0.62"), msg + "；大盘 RISK_OFF 降级 focus")
-    return ("buy", Decimal("0.68"), msg + "（左侧反转，置信度低于趋势）")
+        return ("focus", Decimal("0.62"), msg + _ff_suffix(f.ff_time_label) + "；大盘 RISK_OFF 降级 focus")
+    return ("buy", Decimal("0.68"), msg + _ff_suffix(f.ff_time_label) + "（左侧反转，置信度低于趋势）")
 
 
 def _decide_etf_for_watching(
@@ -595,9 +777,19 @@ def _decide_etf_for_watching(
 
 
 def _decide_etf_for_holding(
-    f: Features, max_single_pct: Decimal,
+    f: Features,
+    max_single_pct: Decimal,
+    params: dict | None = None,
 ) -> tuple[str, Decimal, list[str], list[dict]]:
-    """ETF 持仓侧主决策。"""
+    """ETF 持仓侧主决策。
+
+    沿用股票持仓侧的"硬止损 / 分级止盈 / 预案价位 / trailing stop"四类风控逻辑，
+    并保留 ETF 专属的"创新低 + 资金流出"和"创新高 + 资金分歧"等独有规则。
+
+    ETF 不开启 add 加仓路径——ETF 加仓更适合用户基于宏观 / 主题判断，
+    而非系统单标的信号。
+    """
+    p = params or _resolve_decision_params(None, None)
     extra_reasons: list[str] = []
     trace = _new_trace(Decimal("0.55"), "hold", "ETF 持仓默认起点 hold @ 0.55")
     record, raise_to, current = _make_recorder(trace)
@@ -605,52 +797,213 @@ def _decide_etf_for_holding(
     cross_border = (f.etf_category == ETF_CATEGORY_CROSS_BORDER)
     commodity_or_bond = (f.etf_category in (ETF_CATEGORY_COMMODITY, ETF_CATEGORY_BOND))
 
-    # === sell：本地 ETF 破位 + 资金 PERSISTENT_OUTFLOW ===
+    # ── 1. ETF 专属：破位 + 资金 OUTFLOW → sell ─────────────────
     if (not cross_border and not commodity_or_bond
             and f.regime in LOW_REGIMES and f.ff_regime == FUND_PERSISTENT_OUTFLOW):
         record("etf_low_regime+outflow", "sell", Decimal("0.78"),
                f"ETF 创新低（{f.regime}）+ 主力 PERSISTENT_OUTFLOW → sell")
-        extra_reasons.append("ETF 创新低 + 主力持续流出，建议止损退出")
+        extra_reasons.append("ETF 创新低 + 主力持续流出，建议止损退出" + _ff_suffix(f.ff_time_label))
 
-    # === trim：本地 ETF 创新高但主力流出（顶部分歧）===
+    # ── 2. ETF 专属：创新高 + 资金流出（顶部分歧） → trim ───────
     elif (not cross_border and not commodity_or_bond
             and f.regime in HIGH_REGIMES and f.ff_regime == FUND_PERSISTENT_OUTFLOW):
         record("etf_high+outflow", "trim", Decimal("0.68"),
                f"ETF 创新高（{f.regime}）+ 主力 PERSISTENT_OUTFLOW → trim（顶部分歧）")
-        extra_reasons.append("ETF 价格创新高但主力持续流出，顶部分歧明显")
+        extra_reasons.append("ETF 价格创新高但主力持续流出，顶部分歧明显" + _ff_suffix(f.ff_time_label))
 
-    # === trim：本地 ETF 创新高 + 5 日资金反向（趋势末段）===
+    # ── 3. ETF 专属：创新高 + 5d 资金反向（趋势末段） → trim ───
     elif (not cross_border and not commodity_or_bond
             and f.regime in HIGH_REGIMES and f.ff_reversal == FUND_REVERSAL_DOWN):
         record("etf_high+reversal_down", "trim", Decimal("0.65"),
                f"ETF 创新高 + 5 日资金转流出 → trim")
-        extra_reasons.append("ETF 创新高但 5 日资金已转流出，趋势可能末段")
+        extra_reasons.append("ETF 创新高但 5 日资金已转流出，趋势可能末段" + _ff_suffix(f.ff_time_label))
 
-    # === 仓位超限（同股票）===
-    if f.weight_pct > max_single_pct and f.current is not None and f.avg_cost > 0:
-        cur = to_decimal(f.current, "current")
-        if cur > f.avg_cost:
-            record("etf_weight_over_cap", "trim", Decimal("0.70"),
-                   f"ETF 持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
+    # ── 4-8. 通用价格风控（与股票持仓侧对齐） ─────────────────
+    if f.current is not None and f.avg_cost > 0:
+        cur_price = to_decimal(f.current, "current")
+        t1 = p["hard_stop_etf_t1"]
+        t2 = p["hard_stop_etf_t2"]
+        t3 = p["hard_stop_etf_t3"]
+
+        # ── 4. P0a 分级硬止损（与股票分支对齐，三档 + 大盘联动 + 分档幂等） ──
+        # ETF 没有"风险公告 + 跌 8% = sell"那条 L4 规则的对应分支
+        # （ETF 不会有 risk_hits），所以这里就是纯三档。
+        if cur_price < f.avg_cost:
+            loss_ratio = (f.avg_cost - cur_price) / f.avg_cost
+            loss_pct = loss_ratio * Decimal("100")
+            regime = f.market_regime
+            prev_tier = f.last_trim_tier
+            if loss_ratio >= t3:
+                conf = Decimal("0.80") if regime == MARKET_REGIME_RISK_OFF else Decimal("0.85")
+                record("etf_hard_stop_t3", "sell", conf,
+                       f"ETF 浮亏 {loss_pct:.1f}% ≥ T3 阈值 {t3 * 100:.0f}% (硬底线) → sell")
+                extra_reasons.append(
+                    f"ETF 已跌破硬底线 T3（{t3 * 100:.0f}% 浮亏，当前 -{loss_pct:.1f}%），"
+                    "建议强制全退"
+                )
+            elif loss_ratio >= t2 and current()[0] != "sell":
+                if prev_tier == "T2":
+                    extra_reasons.append(
+                        f"ETF 仍处 T2 深防线区间（浮亏 -{loss_pct:.1f}%），"
+                        f"且系统已在 {f.last_trim_price} 提示过 T2 减仓，幂等保护已生效"
+                    )
+                else:
+                    if regime == MARKET_REGIME_RISK_OFF:
+                        conf = Decimal("0.72")
+                    elif regime == MARKET_REGIME_RISK_ON:
+                        conf = Decimal("0.80")
+                    else:
+                        conf = Decimal("0.78")
+                    raise_to("etf_hard_stop_t2", "trim", conf,
+                             f"ETF 浮亏 {loss_pct:.1f}% ≥ T2 阈值 {t2 * 100:.0f}% (深防线) → 再减半仓")
+                    extra_reasons.append(
+                        f"ETF 已触发 T2 深防线（浮亏 {loss_pct:.1f}% ≥ {t2 * 100:.0f}%），"
+                        "建议再减一半，最多保留约 25% 仓位观察"
+                    )
+            elif loss_ratio >= t1 and current()[0] != "sell":
+                if prev_tier in ("T1", "T2"):
+                    extra_reasons.append(
+                        f"ETF 仍处 T1 首道防线区间（浮亏 -{loss_pct:.1f}%），"
+                        f"且系统已在 {f.last_trim_price} 提示过 {prev_tier} 减仓，幂等保护已生效"
+                    )
+                else:
+                    if regime == MARKET_REGIME_RISK_OFF:
+                        conf = Decimal("0.65")
+                    elif regime == MARKET_REGIME_RISK_ON:
+                        conf = Decimal("0.72")
+                    else:
+                        conf = Decimal("0.70")
+                    raise_to("etf_hard_stop_t1", "trim", conf,
+                             f"ETF 浮亏 {loss_pct:.1f}% ≥ T1 阈值 {t1 * 100:.0f}% (首道防线) → 减半锁损")
+                    extra_reasons.append(
+                        f"ETF 已触发 T1 首道防线（浮亏 {loss_pct:.1f}% ≥ {t1 * 100:.0f}%），"
+                        "建议减半仓锁定损失，给行业方向留出修复机会"
+                    )
+
+        # ── 5. P2a execution_plan 预案价位 ────────────────────
+        if f.plan_stop_loss_price is not None and cur_price <= f.plan_stop_loss_price:
+            record("etf_plan_stop_loss", "sell", Decimal("0.82"),
+                   f"ETF 现价 {cur_price} ≤ 预案止损价 {f.plan_stop_loss_price} → "
+                   "按计划 sell")
+            extra_reasons.append(
+                f"ETF 现价已触及预案止损价 {f.plan_stop_loss_price}，按既定纪律退出"
+            )
+        if (
+            f.plan_take_profit_price is not None
+            and cur_price >= f.plan_take_profit_price
+            and current()[0] != "sell"
+        ):
+            raise_to("etf_plan_take_profit", "trim", Decimal("0.78"),
+                     f"ETF 现价 {cur_price} ≥ 预案止盈价 {f.plan_take_profit_price} → "
+                     "按计划 trim")
+            extra_reasons.append(
+                f"ETF 现价已达到预案止盈价 {f.plan_take_profit_price}，建议至少分批兑现"
+            )
+
+        # ── 6. 仓位超限 + 浮盈 → trim ─────────────────────────
+        if (
+            f.weight_pct > max_single_pct
+            and cur_price > f.avg_cost
+            and current()[0] != "sell"
+        ):
+            raise_to("etf_weight_over_cap", "trim", Decimal("0.70"),
+                     f"ETF 持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
             extra_reasons.append("ETF 仓位超过单票上限且已有浮盈，建议减仓")
 
-    # === 残股识别（摊薄成本 >> 现价）===
-    if f.current is not None and f.avg_cost > 0:
-        cur = to_decimal(f.current, "current")
-        if f.avg_cost > cur * _ETF_RESIDUAL_THRESHOLD:
-            offset_pct = float((f.avg_cost - cur) / cur * 100)
+        # ── 7. P0b 分级止盈（ETF 同股票） ─────────────────────
+        if cur_price > f.avg_cost and current()[0] != "sell":
+            gain_pct = (cur_price - f.avg_cost) / f.avg_cost
+            top_signal = (
+                f.regime in HIGH_REGIMES
+                and f.ff_regime == FUND_PERSISTENT_OUTFLOW
+            )
+            ff_turning_down = (f.ff_reversal == FUND_REVERSAL_DOWN)
+            top_or_turning = top_signal or ff_turning_down
+
+            if gain_pct >= p["tp_t3"]:
+                pct_disp = gain_pct * Decimal("100")
+                if top_or_turning:
+                    record("etf_take_profit_t3+top", "sell", Decimal("0.82"),
+                           f"ETF 浮盈 ≥{p['tp_t3'] * 100:.0f}%（{pct_disp:.1f}%）+ 顶部信号 → sell")
+                    extra_reasons.append(
+                        f"ETF 浮盈已超过 {p['tp_t3'] * 100:.0f}% 且出现顶部 / 资金反转，"
+                        "建议大幅止盈退出"
+                    )
+                else:
+                    raise_to("etf_take_profit_t3", "trim", Decimal("0.78"),
+                             f"ETF 浮盈 ≥{p['tp_t3'] * 100:.0f}%（{pct_disp:.1f}%）→ 大幅止盈")
+                    extra_reasons.append(
+                        f"ETF 浮盈已超过 {pct_disp:.1f}%，建议至少减半锁定利润"
+                    )
+            elif gain_pct >= p["tp_t2"]:
+                pct_disp = gain_pct * Decimal("100")
+                if top_or_turning:
+                    record("etf_take_profit_t2+top", "sell", Decimal("0.80"),
+                           f"ETF 浮盈 ≥{p['tp_t2'] * 100:.0f}%（{pct_disp:.1f}%）+ 顶部信号 → sell")
+                    extra_reasons.append(
+                        f"ETF 浮盈已达 {pct_disp:.1f}% + 顶部信号，建议升级为 sell"
+                    )
+                else:
+                    raise_to("etf_take_profit_t2", "trim", Decimal("0.75"),
+                             f"ETF 浮盈 ≥{p['tp_t2'] * 100:.0f}%（{pct_disp:.1f}%）→ 分批止盈")
+                    extra_reasons.append(
+                        f"ETF 浮盈已达 {pct_disp:.1f}%，建议分批止盈"
+                    )
+            elif gain_pct >= p["tp_t1"]:
+                pct_disp = gain_pct * Decimal("100")
+                if f.regime in HIGH_REGIMES and ff_turning_down:
+                    raise_to("etf_take_profit_t1+reversal", "trim", Decimal("0.70"),
+                             f"ETF 浮盈 ≥{p['tp_t1'] * 100:.0f}% + 创新高 + 资金反转 → 局部止盈")
+                    extra_reasons.append(
+                        f"ETF 浮盈已达 {pct_disp:.1f}%，叠加创新高 + 资金反转，建议先止盈一部分"
+                    )
+                else:
+                    raise_to("etf_take_profit_t1", "trim", Decimal("0.65"),
+                             f"ETF 浮盈 ≥{p['tp_t1'] * 100:.0f}%（{pct_disp:.1f}%）→ 温和止盈")
+                    extra_reasons.append(
+                        f"ETF 浮盈已达 {pct_disp:.1f}%，可考虑分批兑现部分利润"
+                    )
+
+        # ── 8. P2b trailing stop（ETF 同股票） ────────────────
+        if (
+            f.peak_price is not None
+            and f.peak_price > 0
+            and cur_price > f.avg_cost
+            and current()[0] != "sell"
+        ):
+            drawdown = (f.peak_price - cur_price) / f.peak_price
+            if drawdown >= p["trail_severe_pct"]:
+                record("etf_trailing_stop_severe", "sell", Decimal("0.78"),
+                       f"ETF 持仓期间最高 {f.peak_price} → 现价 {cur_price} 回撤 "
+                       f"{drawdown * 100:.1f}% ≥ {p['trail_severe_pct'] * 100:.0f}% → sell")
+                extra_reasons.append(
+                    f"ETF 现价已从持仓期间最高 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                    "趋势已走坏，建议退出剩余仓位"
+                )
+            elif drawdown >= p["trail_pct"]:
+                raise_to("etf_trailing_stop", "trim", Decimal("0.72"),
+                         f"ETF 持仓期间最高 {f.peak_price} → 现价 {cur_price} 回撤 "
+                         f"{drawdown * 100:.1f}% ≥ {p['trail_pct'] * 100:.0f}% → trim")
+                extra_reasons.append(
+                    f"ETF 现价已从持仓期间最高 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                    "建议先减仓锁定一部分利润"
+                )
+
+        # ── 残股识别（摊薄成本 >> 现价） ─────────────────────
+        if f.avg_cost > cur_price * _ETF_RESIDUAL_THRESHOLD:
+            offset_pct = float((f.avg_cost - cur_price) / cur_price * 100)
             extra_reasons.append(
-                f"⚠️ 残股识别：ETF 摊薄成本 {f.avg_cost} vs 现价 {cur}（偏离 +{offset_pct:.0f}%），"
+                f"⚠️ 残股识别：ETF 摊薄成本 {f.avg_cost} vs 现价 {cur_price}（偏离 +{offset_pct:.0f}%），"
                 "属于历史追涨杀跌后剩余仓位；trim/sell 信号对其操作意义有限，建议分批退出而非死守"
             )
 
-    # === 流动性预警 ===
+    # ── 流动性预警 ───────────────────────────────────────
     if f.amount_yi is not None and f.amount_yi < _ETF_TURNOVER_WARN_YI:
         extra_reasons.append(
             f"⚠️ ETF 当日成交额 {f.amount_yi:.2f} 亿偏低，减仓时分批避免冲击成本"
         )
 
-    # === 跨境 / 商品 / 债券提示 ===
+    # ── 跨境 / 商品 / 债券提示 ────────────────────────────
     if cross_border:
         extra_reasons.append(
             "跨境 QDII ETF：A 股主力资金面参考价值低，请结合外盘（如纳指 / 标普）判断"
@@ -668,18 +1021,39 @@ def _decide_etf_for_holding(
 # ── 决策分支：持仓 vs 自选 ───────────────────────────────────────
 
 def _decide_for_holding(
-    f: Features, max_single_pct: Decimal,
+    f: Features,
+    max_single_pct: Decimal,
+    params: dict | None = None,
 ) -> tuple[str, Decimal, list[str], list[dict]]:
-    """qty > 0：从 hold 出发，按风险 / 资金 / 现价亏损 / 仓位超限四类信号升降级。"""
+    """qty > 0：从 hold 出发，按以下优先级处理：
+
+    1. **风险/破位** → trim @ 0.72
+    2. **资金面（PERSISTENT_OUTFLOW + 短期续出）** → sell / trim
+    3. **L4 旧规则（跌 8% + 风险公告）** → sell @ 0.80（有公告佐证时跨档直接 sell）
+    4. **P0a 分级硬止损**（T1/T2 trim、T3 sell；confidence 按大盘 regime 软联动）
+    5. **P2a execution_plan 预案止损/止盈**（用户手填的硬阈值）→ sell @ 0.82 / trim @ 0.78
+    6. **仓位超限 + 浮盈** → trim @ 0.70
+    7. **P0b 分级止盈**（按 gain_pct 分三档；叠加顶部信号 / 资金反转升级 sell）
+    8. **P2b trailing stop**（持仓期间最高价回撤）→ trim / sell
+    9. **P1a 加仓**（前面都未触发、weight 有空间、未亏损、且自选 buy 条件成立）→ add
+    10. **P1b cross_validation 软提示**（acceleration / reversal_confirmed）
+
+    设计原则：
+      - sell 一旦触发，后续止盈 / 加仓不会把它降级（用 ``current()[0] != "sell"`` 守卫）
+      - trim 之间用 ``raise_to`` 升档，避免大数被小数覆盖
+      - P0a / P2a 用 ``record`` 强制改 confidence，因为它们是预案 / 风控硬条件
+    """
+    p = params or _resolve_decision_params(None, None)
     extra_reasons: list[str] = []
     trace = _new_trace(Decimal("0.55"), "hold", "持仓默认起点 hold @ 0.55")
     record, raise_to, current = _make_recorder(trace)
 
+    # ── 1. 风险/破位 → trim ─────────────────────────────────────
     if f.risk_hits >= 2 or f.regime in LOW_REGIMES:
         record("risk_or_low_regime", "trim", Decimal("0.72"),
                f"risk_hits={f.risk_hits} or regime={f.regime} → trim")
 
-    # 主力资金分层使用：
+    # ── 2. 主力资金分层使用 ─────────────────────────────────────
     #   - 20d 定背景（偏强 / 偏弱）
     #   - 5d/3d 定动作（是否真的要减仓 / 回避）
     #   - 1d 只做提示，不单独触发动作
@@ -687,25 +1061,330 @@ def _decide_for_holding(
         if f.regime in LOW_REGIMES and _ff_negative(f.ff_5d):
             raise_to("ff_outflow+low+5d_neg", "sell", Decimal("0.78"),
                      f"20d 资金弱 + 5d 续出({f.ff_5d:+.2f}yi) + 价格破位({f.regime}) → 升 sell")
-            extra_reasons.append("20 日资金背景偏弱，且近 5 日继续流出并叠加价格破位，建议优先退出")
+            extra_reasons.append("20 日资金背景偏弱，且近 5 日继续流出并叠加价格破位，建议优先退出" + _ff_suffix(f.ff_time_label))
         elif current()[0] == "hold" and _ff_negative(f.ff_5d) and _ff_negative(f.ff_3d):
             raise_to("ff_outflow+5d+3d_neg", "trim", Decimal("0.65"),
                      f"20d 资金弱 + 5d({f.ff_5d:+.2f}) + 3d({f.ff_3d:+.2f}) 续出 → 升 trim")
-            extra_reasons.append("20 日资金背景偏弱，且近 5/3 日继续流出，建议先减仓")
+            extra_reasons.append("20 日资金背景偏弱，且近 5/3 日继续流出，建议先减仓" + _ff_suffix(f.ff_time_label))
 
+    # ── 3-8. 价格驱动的止损/止盈/加仓/trailing 都需要现价 + 成本 ─
     if f.current is not None and f.avg_cost > 0:
         cur_price = to_decimal(f.current, "current")
-        if cur_price < f.avg_cost * Decimal("0.92") and f.risk_hits:
-            record("price_loss+risk_announce", "sell", Decimal("0.78"),
-                   f"现价 {cur_price} < 92% 成本 {f.avg_cost} 且有风险公告 → 强制 sell")
-            extra_reasons.append("现价明显低于持仓成本且伴随风险公告")
-        elif f.weight_pct > max_single_pct and cur_price > f.avg_cost:
-            record("weight_over_cap", "trim", Decimal("0.70"),
-                   f"持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
+        if f.is_etf:
+            t1 = p["hard_stop_etf_t1"]
+            t2 = p["hard_stop_etf_t2"]
+            t3 = p["hard_stop_etf_t3"]
+        elif f.market == MARKET_HK:
+            t1 = p["hard_stop_hk_t1"]
+            t2 = p["hard_stop_hk_t2"]
+            t3 = p["hard_stop_hk_t3"]
+        else:
+            t1 = p["hard_stop_a_t1"]
+            t2 = p["hard_stop_a_t2"]
+            t3 = p["hard_stop_a_t3"]
+
+        # ── 3. L4 旧规则升档：跌 8% + 风险公告 → sell @ 0.80 ─────
+        # 旧规则保留触发条件（跌 8% + 风险公告），但 confidence 从 0.78 升到 0.80：
+        # 有公告佐证时这条 sell 应"跨过"P0a 的 T1/T2 trim 防线直接到位，
+        # 等价于"普通 8% 跌 是 T1 trim；8% 跌 + 风险公告 = 立刻全退"。
+        if f.exempt_hard_stop:
+            extra_reasons.append(
+                "⏸️ 该标的已豁免硬止损（P0a / L4），系统不自动发出止损/卖出信号；"
+                "止损纪律由人工判断"
+            )
+        elif cur_price < f.avg_cost * Decimal("0.92") and f.risk_hits:
+            record("price_loss+risk_announce", "sell", Decimal("0.80"),
+                   f"现价 {cur_price} < 92% 成本 {f.avg_cost} 且有风险公告 → 跨档 sell")
+            extra_reasons.append(
+                "现价已明显低于持仓成本且伴随风险公告，跳过分档 trim 直接全退"
+            )
+
+        # ── 4. P0a 分级硬止损：T1/T2 trim、T3 sell ──────────────
+        # 仅当当前价低于成本（即"浮亏"）时才考虑硬止损，避免数值边界 bug。
+        # 三档互斥（elif），从最严重的 T3 开始判断，保证一档对应一条 trace step。
+        # confidence 按大盘 regime 软联动：RISK_OFF 时下调（弱市留更多人工判断空间），
+        # RISK_ON 时上调（强市同样跌幅更值得警惕，可能是个股专属风险）。
+        #
+        # P0a 分档幂等性（schema v5）：
+        #   - last_trim_tier == "T1" 且仍在 T1 区间 → 只给软提示，不重发 trim
+        #   - last_trim_tier == "T1" 且跌到 T2 → 正常触发并升档为 "T2"
+        #   - last_trim_tier == "T2" 且仍在 T2 区间 → 软提示
+        #   - T3 (sell) 永不静默：硬底线，宁可重复 sell 也不能漏
+        #   - exempt_hard_stop：豁免该标的硬止损（历史遗留仓位等场景），只加提示不触发动作
+        if cur_price < f.avg_cost and not f.exempt_hard_stop:
+            loss_ratio = (f.avg_cost - cur_price) / f.avg_cost
+            loss_pct = loss_ratio * Decimal("100")
+            regime = f.market_regime
+            prev_tier = f.last_trim_tier  # None / "T1" / "T2"
+            if loss_ratio >= t3:
+                # 已经深套到不再幻想的硬底线 → sell @ 0.85（RISK_OFF 时 0.80）
+                conf = Decimal("0.80") if regime == MARKET_REGIME_RISK_OFF else Decimal("0.85")
+                record("hard_stop_t3", "sell", conf,
+                       f"浮亏 {loss_pct:.1f}% ≥ T3 阈值 {t3 * 100:.0f}% (硬底线) → sell")
+                extra_reasons.append(
+                    f"现价已跌破硬底线 T3（{t3 * 100:.0f}% 浮亏，当前 -{loss_pct:.1f}%），"
+                    "建议强制全退；如打算重新建仓请先复盘原 thesis"
+                )
+            elif loss_ratio >= t2 and current()[0] != "sell":
+                if prev_tier == "T2":
+                    # 同档幂等：上次 T2 已建议过减仓，本次只软提示
+                    extra_reasons.append(
+                        f"现价仍处 T2 深防线区间（浮亏 -{loss_pct:.1f}%），"
+                        f"且系统已在 {f.last_trim_price} 提示过 T2 减仓。"
+                        "如已按计划减半，请等待价格突破回 T1 阈值以上再做下一步；"
+                        "如尚未执行，请确认意图后再补仓位调整"
+                    )
+                else:
+                    # 首次 T2（含从 T1 升档）
+                    if regime == MARKET_REGIME_RISK_OFF:
+                        conf = Decimal("0.72")
+                    elif regime == MARKET_REGIME_RISK_ON:
+                        conf = Decimal("0.80")
+                    else:
+                        conf = Decimal("0.78")
+                    raise_to("hard_stop_t2", "trim", conf,
+                             f"浮亏 {loss_pct:.1f}% ≥ T2 阈值 {t2 * 100:.0f}% (深防线) → 再减半仓")
+                    extra_reasons.append(
+                        f"现价已触发 T2 深防线（浮亏 {loss_pct:.1f}% ≥ {t2 * 100:.0f}%），"
+                        f"建议再减一半，最多保留约 25% 仓位观察修复"
+                    )
+            elif loss_ratio >= t1 and current()[0] != "sell":
+                if prev_tier in ("T1", "T2"):
+                    # 同档幂等：上次 T1/T2 已建议过减仓，本次只软提示
+                    extra_reasons.append(
+                        f"现价仍处 T1 首道防线区间（浮亏 -{loss_pct:.1f}%），"
+                        f"且系统已在 {f.last_trim_price} 提示过 {prev_tier} 减仓。"
+                        "幂等保护已生效：不重复发出 trim，请关注是否跌至下一档"
+                    )
+                else:
+                    # 首次 T1
+                    if regime == MARKET_REGIME_RISK_OFF:
+                        conf = Decimal("0.65")
+                    elif regime == MARKET_REGIME_RISK_ON:
+                        conf = Decimal("0.72")
+                    else:
+                        conf = Decimal("0.70")
+                    raise_to("hard_stop_t1", "trim", conf,
+                             f"浮亏 {loss_pct:.1f}% ≥ T1 阈值 {t1 * 100:.0f}% (首道防线) → 减半锁损")
+                    extra_reasons.append(
+                        f"现价已触发 T1 首道防线（浮亏 {loss_pct:.1f}% ≥ {t1 * 100:.0f}%），"
+                        f"建议减半仓锁定损失，给标的留出修复机会"
+                    )
+
+        # ── 5. P2a execution_plan 预案价位 ────────────────────
+        # 用户事前手填的 stop_loss / take_profit 拥有较高优先级：
+        # 一旦触发，trace 会显式标注 "from_execution_plan"，避免和系统规则混淆。
+        if f.plan_stop_loss_price is not None and cur_price <= f.plan_stop_loss_price:
+            record("plan_stop_loss", "sell", Decimal("0.82"),
+                   f"现价 {cur_price} ≤ 预案止损价 {f.plan_stop_loss_price} → "
+                   f"按计划 sell（execution_plan 配置）")
+            extra_reasons.append(
+                f"现价已触及预案止损价 {f.plan_stop_loss_price}，按既定纪律退出，"
+                "事后请走 exec review 复盘"
+            )
+        if (
+            f.plan_take_profit_price is not None
+            and cur_price >= f.plan_take_profit_price
+            and current()[0] != "sell"
+        ):
+            raise_to("plan_take_profit", "trim", Decimal("0.78"),
+                     f"现价 {cur_price} ≥ 预案止盈价 {f.plan_take_profit_price} → "
+                     f"按计划 trim（execution_plan 配置）")
+            extra_reasons.append(
+                f"现价已达到预案止盈价 {f.plan_take_profit_price}，建议至少分批兑现一部分利润"
+            )
+
+        # ── 6. 仓位超限 + 浮盈 → trim（保留旧规则） ─────────────
+        if (
+            f.weight_pct > max_single_pct
+            and cur_price > f.avg_cost
+            and current()[0] != "sell"
+        ):
+            raise_to("weight_over_cap", "trim", Decimal("0.70"),
+                     f"持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
             extra_reasons.append("当前仓位超过单票上限且已有浮盈")
+
+        # ── 7. P0b 分级止盈 ────────────────────────────────────
+        # gain_pct 用 (cur - avg) / avg；只在浮盈状态下评估，亏损交给止损路径处理
+        if cur_price > f.avg_cost and current()[0] != "sell":
+            gain_pct = (cur_price - f.avg_cost) / f.avg_cost
+            # 顶部 / 资金反转叠加信号：让止盈从 trim 升级为 sell
+            top_signal = (
+                f.regime in HIGH_REGIMES
+                and f.ff_regime == FUND_PERSISTENT_OUTFLOW
+            )
+            ff_turning_down = (f.ff_reversal == FUND_REVERSAL_DOWN)
+            top_or_turning = top_signal or ff_turning_down
+
+            if gain_pct >= p["tp_t3"]:
+                pct_disp = gain_pct * Decimal("100")
+                if top_or_turning:
+                    record("take_profit_t3+top", "sell", Decimal("0.82"),
+                           f"浮盈 ≥{p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
+                           f"顶部/资金反转信号 → 升级 sell")
+                    extra_reasons.append(
+                        f"浮盈已超过 {p['tp_t3'] * 100:.0f}% 且出现顶部 / 资金反转信号，"
+                        "建议大幅止盈（如 2/3 以上）退出"
+                    )
+                else:
+                    raise_to("take_profit_t3", "trim", Decimal("0.78"),
+                             f"浮盈 ≥{p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ "
+                             "分批止盈锁定利润")
+                    extra_reasons.append(
+                        f"浮盈已超过 {p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%），"
+                        "建议至少减半锁定利润，剩余仓位用 trailing stop 跟踪"
+                    )
+            elif gain_pct >= p["tp_t2"]:
+                pct_disp = gain_pct * Decimal("100")
+                if top_or_turning:
+                    record("take_profit_t2+top", "sell", Decimal("0.80"),
+                           f"浮盈 ≥{p['tp_t2'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
+                           "顶部/资金反转信号 → 升级 sell")
+                    extra_reasons.append(
+                        f"浮盈已达 {pct_disp:.1f}% 且出现顶部 / 资金反转信号，"
+                        "建议升级为 sell 锁定大部分利润"
+                    )
+                else:
+                    raise_to("take_profit_t2", "trim", Decimal("0.75"),
+                             f"浮盈 ≥{p['tp_t2'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ "
+                             "分批止盈")
+                    extra_reasons.append(
+                        f"浮盈已达 {pct_disp:.1f}%，建议分批止盈（如 1/3），剩余继续持有"
+                    )
+            elif gain_pct >= p["tp_t1"]:
+                pct_disp = gain_pct * Decimal("100")
+                if f.regime in HIGH_REGIMES and ff_turning_down:
+                    raise_to("take_profit_t1+reversal", "trim", Decimal("0.70"),
+                             f"浮盈 ≥{p['tp_t1'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
+                             "创新高 + 资金反转 → 局部止盈")
+                    extra_reasons.append(
+                        f"浮盈已达 {pct_disp:.1f}%，价格创新高叠加资金反转，"
+                        "建议先止盈一部分（如 1/4），剩余跟趋势"
+                    )
+                else:
+                    raise_to("take_profit_t1", "trim", Decimal("0.65"),
+                             f"浮盈 ≥{p['tp_t1'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ "
+                             "温和止盈提示")
+                    extra_reasons.append(
+                        f"浮盈已达 {pct_disp:.1f}%，可考虑分批兑现部分利润，"
+                        "但趋势良好时不必急于全退"
+                    )
+
+        # ── 8. P2b trailing stop（持仓期间最高价回撤） ──────────
+        # 仅在浮盈状态下生效（亏损交给硬止损），用持仓期间最高价作锚
+        if (
+            f.peak_price is not None
+            and f.peak_price > 0
+            and cur_price > f.avg_cost
+            and current()[0] != "sell"
+        ):
+            drawdown = (f.peak_price - cur_price) / f.peak_price
+            if drawdown >= p["trail_severe_pct"]:
+                record("trailing_stop_severe", "sell", Decimal("0.78"),
+                       f"持仓期间最高 {f.peak_price} → 现价 {cur_price} "
+                       f"回撤 {drawdown * 100:.1f}% ≥ {p['trail_severe_pct'] * 100:.0f}% → sell")
+                extra_reasons.append(
+                    f"现价已从持仓期间最高价 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                    "趋势已实质走坏，建议止盈退出剩余仓位"
+                )
+            elif drawdown >= p["trail_pct"]:
+                raise_to("trailing_stop", "trim", Decimal("0.72"),
+                         f"持仓期间最高 {f.peak_price} → 现价 {cur_price} "
+                         f"回撤 {drawdown * 100:.1f}% ≥ {p['trail_pct'] * 100:.0f}% → trim")
+                extra_reasons.append(
+                    f"现价已从持仓期间最高价 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                    "建议先减仓锁定一部分利润，避免回吐过多"
+                )
+
+        # ── 9. P1a 加仓（仅在没有任何减仓/止损/止盈信号时考虑） ──
+        # 触发条件：
+        #   - 当前 action 仍为 hold（说明 1-8 都未触发）
+        #   - 权重 < 单票上限 × headroom_ratio（默认 85%）
+        #   - 现价 ≥ 摊薄成本（不在亏损中加仓）
+        #   - 自选侧 trend / reversal buy 条件依然成立
+        if (
+            current()[0] == "hold"
+            and not f.is_etf  # ETF 加仓走独立分支
+            and f.weight_pct < max_single_pct * p["add_headroom"]
+            and cur_price >= f.avg_cost
+        ):
+            add_eval = _evaluate_holding_add(f, market_regime=f.market_regime)
+            if add_eval is not None:
+                add_action, add_conf, add_reason = add_eval
+                record("holding_add_path", add_action, add_conf, add_reason[:120])
+                extra_reasons.append(add_reason)
+
+    # ── 10. P1b cross_validation 软提示（仅在 hold 时补提示） ───
+    if current()[0] == "hold" and isinstance(f.ff_cross, dict):
+        accel = f.ff_cross.get("acceleration")
+        if accel == "decelerating_inflow":
+            extra_reasons.append(
+                "⚠️ cross_validation.acceleration=decelerating_inflow，"
+                "主力虽仍流入但日均在变小，趋势动能在弱化，注意防守，不建议主动加仓"
+                + _ff_suffix(f.ff_time_label)
+            )
+        elif accel == "accelerating_outflow":
+            extra_reasons.append(
+                "⚠️ cross_validation.acceleration=accelerating_outflow，"
+                "主力流出在加速，若未来 1-2 个交易日仍未修复，考虑被动减仓"
+                + _ff_suffix(f.ff_time_label)
+            )
+        if (
+            f.ff_reversal == FUND_REVERSAL_UP
+            and f.ff_cross.get("reversal_confirmed") is False
+        ):
+            extra_reasons.append(
+                "⚠️ cross_validation.reversal_confirmed=False，"
+                "短期资金尚未为反转背书，不可作为加仓依据"
+                + _ff_suffix(f.ff_time_label)
+            )
 
     action, confidence = current()
     return action, confidence, extra_reasons, trace
+
+
+def _evaluate_holding_add(
+    f: Features,
+    market_regime: str | None,
+) -> tuple[str, Decimal, str] | None:
+    """持仓侧加仓评估：复用自选侧 trend/reversal 信号，但置信度低于自选 buy（已建仓加仓更激进，
+    对纪律要求更高）。
+
+    返回 ``(action, confidence, reason)`` 或 None。
+    None 表示加仓条件不成立，调用方保留 hold。
+
+    与 ``_evaluate_self_select_buy`` 的差异：
+      - 自选 buy: trend=0.72, reversal=0.68；本函数 trend=0.68, reversal=0.64
+      - RISK_OFF：本函数直接返回 None（持仓侧不在弱市里主动加仓），让 caller 保留 hold
+      - 大盘 RISK_OFF 时不再走 probe 通道（probe 是首仓概念，不适合加仓）
+    """
+    buy_ok, buy_path = _is_strict_buy_candidate(
+        f.regime, f.risk_hits, f.positive_hits, f.change_pct,
+        f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.ff_cross,
+    )
+    if not buy_ok:
+        return None
+
+    if market_regime == MARKET_REGIME_RISK_OFF:
+        return None
+
+    if buy_path == "trend":
+        return (
+            "add",
+            Decimal("0.68"),
+            "【持仓加仓-趋势】持仓未亏损 + 趋势仍成立（创新高 + 资金不撤离 + 正向公告）"
+            "+ 仓位距上限仍有空间 → 可分批加仓，但不要一次顶满"
+            + _ff_suffix(f.ff_time_label),
+        )
+    if buy_path == "reversal":
+        return (
+            "add",
+            Decimal("0.64"),
+            "【持仓加仓-反转】持仓未亏损 + 反转买入条件依然成立（资金已反向流入 + 多重正向公告）"
+            "+ 仓位距上限仍有空间 → 可分批加仓，反转加仓更激进，建议比趋势加仓再保守 1/2"
+            + _ff_suffix(f.ff_time_label),
+        )
+    return None
 
 
 def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str], list[dict]]:
@@ -728,7 +1407,7 @@ def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str
 
     buy_eval = _evaluate_self_select_buy(
         f.market, f.regime, f.risk_hits, f.positive_hits, f.change_pct,
-        f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.ff_cross, f.market_regime,
+        f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.ff_cross, f.market_regime, f.ff_time_label,
     )
     if buy_eval is not None:
         action, confidence, buy_reason = buy_eval
@@ -779,12 +1458,15 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
 
     sources.append(f"price_history.regime={f.regime or '-'}")
     if f.ff_available:
+        if f.ff_time_label:
+            sources.append(f"fund_flow.time={f.ff_time_label}")
         def _fmt(v: float | None) -> str:
             return "-" if v is None else f"{v:+.2f}yi"
         sources.append(
             f"fund_flow.regime={f.ff_regime} "
             f"(1d={_fmt(f.ff_1d)}, 3d={_fmt(f.ff_3d)}, 5d={_fmt(f.ff_5d)}, "
             f"10d={_fmt(f.ff_10d)}, 20d={_fmt(f.ff_20d)})"
+            + _ff_suffix(f.ff_time_label)
         )
         if isinstance(f.ff_cross, dict) and f.ff_cross.get("verdict"):
             verdict = f.ff_cross.get("verdict")
@@ -820,6 +1502,92 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
 
 # ── 主入口（调度器）──────────────────────────────────────────────
 
+def _maintain_trim_tier_state(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    *,
+    decision: dict,
+    snapshot: dict,
+    decision_params: dict,
+    prev_tier: str | None,
+) -> None:
+    """根据本次决策结果维护 ``position_peak.last_trim_tier`` 状态。
+
+    规则：
+      - 本次 trace 出现 ``hard_stop_t1`` step → 写入 last_trim_tier="T1"
+      - 本次 trace 出现 ``hard_stop_t2`` step → 写入 last_trim_tier="T2"（升档）
+      - T3 (sell) 触发但 sell 已让"清仓-删除 peak"承担收尾，这里不写
+      - 本次价格让浮亏回升到 T1 以下（< t1）且 prev_tier 不为 None → 清空 tier
+
+    设计取舍：
+      - 信任"系统建议过 = 用户即将执行"。如果用户没真减仓，下次 analyze 仍会触发
+        软提示（reason 里），但不会重复发 trim action
+      - 价格回升至 T1 以下时无论 prev_tier 是 T1 还是 T2 都清空，让"修复后再跌"
+        重新走完整三档流程
+    """
+    try:
+        from spc_core.ledger import (
+            set_position_trim_tier,
+            clear_position_trim_tier,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+    trace = decision.get("confidence_trace") or []
+    steps = [s.get("step") for s in trace]
+
+    # 解析当前现价 + 成本，算 loss_ratio 用于"回升重置"
+    try:
+        avg_cost = to_decimal(snapshot.get("avg_cost_price") or "0", "avg_cost_price")
+        last_price = to_decimal(snapshot.get("last_price") or "0", "last_price")
+    except Exception:  # noqa: BLE001
+        return
+    if avg_cost <= 0 or last_price <= 0:
+        return
+    loss_ratio = (avg_cost - last_price) / avg_cost  # 正值=浮亏；负值=浮盈
+
+    # 写入：T2 触发 → "T2"；T1 触发（无 T2 同时）→ "T1"
+    # 注意 hard_stop_t2 和 etf_hard_stop_t2 都算 T2
+    has_t2 = ("hard_stop_t2" in steps) or ("etf_hard_stop_t2" in steps)
+    has_t1 = ("hard_stop_t1" in steps) or ("etf_hard_stop_t1" in steps)
+    if has_t2:
+        try:
+            set_position_trim_tier(
+                conn, account_id, market, code, tier="T2", price=last_price,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if has_t1:
+        try:
+            set_position_trim_tier(
+                conn, account_id, market, code, tier="T1", price=last_price,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    # 回升重置：当前浮亏已低于 T1 阈值 → 清空（无论 prev_tier 是 T1 还是 T2）
+    if prev_tier is not None:
+        # 选择对应市场的 T1 阈值
+        target_market = snapshot.get("market") or market
+        target_code = snapshot.get("code") or code
+        is_etf = is_etf_fn(target_market, target_code)
+        if is_etf:
+            t1 = decision_params["hard_stop_etf_t1"]
+        elif target_market == MARKET_HK:
+            t1 = decision_params["hard_stop_hk_t1"]
+        else:
+            t1 = decision_params["hard_stop_a_t1"]
+        if loss_ratio < t1:
+            try:
+                clear_position_trim_tier(conn, account_id, market, code)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _decision_from_analysis(
     target_market: str,
     target_code: str,
@@ -828,6 +1596,15 @@ def _decision_from_analysis(
     capital_total: Decimal,
     max_single_pct: Decimal,
     market_regime: str | None = None,
+    *,
+    peak_price: Decimal | None = None,
+    plan_stop_loss_price: Decimal | None = None,
+    plan_take_profit_price: Decimal | None = None,
+    last_trim_tier: str | None = None,
+    last_trim_price: Decimal | None = None,
+    last_trim_time: str | None = None,
+    decision_params: dict | None = None,
+    exempt_hard_stop: bool = False,
 ) -> dict:
     """市场风险偏好软联动（``market_regime``）规则：
     - RISK_OFF：
@@ -836,9 +1613,22 @@ def _decision_from_analysis(
       持仓侧 hold 仅加风险提示，不强制降仓；已经在 trim / sell 的 confidence + 0.05。
     - RISK_ON：在 reasons 头部加一句宏观正向提示，但不会主动加仓 / 升档。
     - NEUTRAL / 缺数据：完全不影响 action。
+
+    ``peak_price`` / ``plan_stop_loss_price`` / ``plan_take_profit_price`` 来自 caller
+    （``analyze_now``）从 ``position_peak`` 表和 ``execution_plan`` 查询得到，用于
+    P2a / P2b 的持仓侧风控规则。
     """
     analysis = {**analysis, "market": target_market, "code": target_code}
-    f = _extract_features(snapshot, analysis, capital_total, market_regime)
+    f = _extract_features(
+        snapshot, analysis, capital_total, market_regime,
+        peak_price=peak_price,
+        plan_stop_loss_price=plan_stop_loss_price,
+        plan_take_profit_price=plan_take_profit_price,
+        last_trim_tier=last_trim_tier,
+        last_trim_price=last_trim_price,
+        last_trim_time=last_trim_time,
+        exempt_hard_stop=exempt_hard_stop,
+    )
 
     # 1. 各维度信号收集（只贡献 reasons / risks 文案，不触发 action）
     reasons: list[str] = []
@@ -851,9 +1641,13 @@ def _decision_from_analysis(
     # 2. 决策分支：持仓侧 vs 自选侧（ETF 走专用决策树，不依赖公告维度）
     if f.qty > 0:
         if f.is_etf:
-            action, confidence, more_reasons, trace = _decide_etf_for_holding(f, max_single_pct)
+            action, confidence, more_reasons, trace = _decide_etf_for_holding(
+                f, max_single_pct, params=decision_params,
+            )
         else:
-            action, confidence, more_reasons, trace = _decide_for_holding(f, max_single_pct)
+            action, confidence, more_reasons, trace = _decide_for_holding(
+                f, max_single_pct, params=decision_params,
+            )
         reasons.extend(more_reasons)
         if action == "hold" and not reasons:
             reasons.append("当前没有触发明显的减仓或卖出信号")
@@ -1046,6 +1840,7 @@ def _evaluate_self_select_buy(
     ff_reversal: str | None,
     ff_cross: dict | None,
     market_regime: str | None,
+    ff_time_label: str | None,
 ) -> tuple[str, Decimal, str] | None:
     """自选侧 buy 决策评估，返回 (action, confidence, reason_msg) 或 None。
 
@@ -1088,12 +1883,12 @@ def _evaluate_self_select_buy(
             return (
                 "focus",
                 Decimal("0.65"),
-                trend_msg + "；但大盘 RISK_OFF，趋势追高先降级为 focus，等大盘修复后再考虑放大仓位",
+                trend_msg + _ff_suffix(ff_time_label) + "；但大盘 RISK_OFF，趋势追高先降级为 focus，等大盘修复后再考虑放大仓位",
             )
         base = Decimal("0.72")
         if trend_decelerating:
             base = Decimal("0.67")
-        return "buy", base, trend_msg
+        return "buy", base, trend_msg + _ff_suffix(ff_time_label)
     if buy_path == "reversal":
         reversal_msg = (
             "【反转买入路径】非破位区间 + 资金已反向流入（近 3/5 日累计转正）+ 多重正向公告 + 不过热涨幅；"
@@ -1106,14 +1901,14 @@ def _evaluate_self_select_buy(
                 return (
                     "probe",
                     Decimal("0.60"),
-                    reversal_msg + "；港股大盘仍 RISK_OFF，但允许用常规仓位 1/4-1/3 试探首仓，确认修复后再加第二笔",
+                    reversal_msg + _ff_suffix(ff_time_label) + "；港股大盘仍 RISK_OFF，但允许用常规仓位 1/4-1/3 试探首仓，确认修复后再加第二笔",
                 )
             return (
                 "focus",
                 Decimal("0.62"),
-                reversal_msg + "；大盘 RISK_OFF，先降级为 focus 等大盘修复",
+                reversal_msg + _ff_suffix(ff_time_label) + "；大盘 RISK_OFF，先降级为 focus 等大盘修复",
             )
-        return "buy", Decimal("0.68"), reversal_msg
+        return "buy", Decimal("0.68"), reversal_msg + _ff_suffix(ff_time_label)
     return None
 
 
@@ -1228,7 +2023,21 @@ def _discover_opportunities(results: list[dict], analysis_cache: dict[tuple[str,
     return ranked[:8]
 
 
-def analyze_now(conn, account_id: int, account_slug: str, account_display_name: str, scope: str, market: str | None = None, code: str | None = None, analysis_provider=None) -> dict:
+def analyze_now(
+    conn,
+    account_id: int,
+    account_slug: str,
+    account_display_name: str,
+    scope: str,
+    market: str | None = None,
+    code: str | None = None,
+    analysis_provider=None,
+    *,
+    llm_review_enabled: bool = False,
+    llm_review_backend: str | None = None,
+    llm_review_timeout: int = 180,
+    llm_review_progress=None,
+) -> dict:
     ensure_defaults(conn)
     provider = analysis_provider or StockMarketHubProvider()
     if market:
@@ -1240,6 +2049,8 @@ def analyze_now(conn, account_id: int, account_slug: str, account_display_name: 
     caps = capital_settings(conn, account_id)
     capital_total = to_decimal(caps["total_cny"], "capital.total_cny")
     max_single_pct = to_decimal(caps["max_single_position_pct"], "capital.max_single_position_pct")
+    # P0/P1/P2 策略参数：读 account_settings，缺配置回落到代码默认值
+    decision_params = _resolve_decision_params(conn, account_id)
 
     results = []
     analysis_cache: dict[tuple[str, str], dict] = {}
@@ -1265,6 +2076,57 @@ def analyze_now(conn, account_id: int, account_slug: str, account_display_name: 
         analysis = provider.analyze(tgt_market, tgt_code, with_peers=(tgt_market == "a"))
         analysis_cache[(tgt_market, tgt_code)] = analysis
         snapshot = snapshots.get((tgt_market, tgt_code))
+
+        # P2a: 查 execution_plan 上的预案价位（仅持仓侧用）
+        plan_stop_loss = None
+        plan_take_profit = None
+        # P2b: 查持仓期间最高价
+        peak_price = None
+        # P0a 分档幂等性：读上次已触发的 trim tier 标记
+        last_trim_tier = None
+        last_trim_price = None
+        last_trim_time = None
+        peak_row = None
+        if snapshot is not None:
+            try:
+                from spc_core.ledger import get_active_plan_levels
+                plan_levels = get_active_plan_levels(conn, account_id, tgt_market, tgt_code)
+                if plan_levels:
+                    plan_stop_loss = plan_levels.get("stop_loss_price")
+                    plan_take_profit = plan_levels.get("take_profit_price")
+            except Exception:  # noqa: BLE001
+                # 老库 / 还没实现该 helper 时，退化为不带 plan 价位
+                pass
+            try:
+                from spc_core.ledger import get_position_peak
+                peak_row = get_position_peak(conn, account_id, tgt_market, tgt_code)
+                if peak_row:
+                    peak_price = to_decimal(peak_row["peak_price"], "peak_price")
+                    last_trim_tier = peak_row.get("last_trim_tier")
+                    if peak_row.get("last_trim_price"):
+                        try:
+                            last_trim_price = to_decimal(
+                                peak_row["last_trim_price"], "last_trim_price"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    last_trim_time = peak_row.get("last_trim_time")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 豁免检查：decision.exempt.hard_stop.{market}.{code} = "1" 时跳过硬止损
+        exempt_hard_stop = False
+        try:
+            row = conn.execute(
+                "SELECT value FROM account_settings "
+                "WHERE account_id = ? AND key = ?",
+                (account_id, f"decision.exempt.hard_stop.{tgt_market}.{tgt_code}"),
+            ).fetchone()
+            if row and row[0] == "1":
+                exempt_hard_stop = True
+        except Exception:  # noqa: BLE001
+            pass
+
         decision = _decision_from_analysis(
             tgt_market,
             tgt_code,
@@ -1273,7 +2135,25 @@ def analyze_now(conn, account_id: int, account_slug: str, account_display_name: 
             capital_total,
             max_single_pct,
             market_regime=market_regime_label.get(tgt_market),
+            peak_price=peak_price,
+            plan_stop_loss_price=plan_stop_loss,
+            plan_take_profit_price=plan_take_profit,
+            last_trim_tier=last_trim_tier,
+            last_trim_price=last_trim_price,
+            last_trim_time=last_trim_time,
+            decision_params=decision_params,
+            exempt_hard_stop=exempt_hard_stop,
         )
+
+        # ── P0a 分档幂等性：根据本次 trace 维护 last_trim_tier 状态 ──
+        # 触发或升档时：写入新 tier；浮亏回升至 T1 以下时：清空
+        if snapshot is not None and peak_row is not None:
+            _maintain_trim_tier_state(
+                conn, account_id, tgt_market, tgt_code,
+                decision=decision, snapshot=snapshot,
+                decision_params=decision_params,
+                prev_tier=last_trim_tier,
+            )
         name = _extract_security_name(analysis)
         results.append(
             {
@@ -1305,6 +2185,44 @@ def analyze_now(conn, account_id: int, account_slug: str, account_display_name: 
         "max_single_position_pct": decimal_str(max_single_pct),
         "market_regime": market_regime_payload,  # {"a": {...}, "hk": {...}}
     }
+
+    # ── LLM 复核（L1 旁路）：对 add/trim/sell/buy/probe 类敏感 action 做二次确认 ──
+    # 默认后端为 "prompt"——由当前会话 agent 直接复核，不新开 subprocess。
+    # fail-open：任何失败只在结果里打 warning，不影响主决策。
+    if llm_review_enabled:
+        try:
+            from spc_core.llm_review import attach_review_to_results
+            # 不在这里强制默认 backend——交给 attach_review_to_results 内部走
+            # detect_llm_backend()，这样 SPC_LLM_BACKEND=none 才能真正禁用复核。
+            attach_review_to_results(
+                payload,
+                analysis_cache=analysis_cache,
+                backend=llm_review_backend,
+                enabled=True,
+                timeout=llm_review_timeout,
+                progress=llm_review_progress,
+            )
+        except Exception as e:  # noqa: BLE001
+            payload["llm_review_meta"] = {
+                "enabled": True,
+                "backend": None,
+                "reviewed": 0,
+                "prompted": 0,
+                "failed": 0,
+                "skipped": 0,
+                "unavailable": False,
+                "error": f"LLM review module failed: {type(e).__name__}: {e!s:.200s}",
+            }
+    else:
+        payload["llm_review_meta"] = {
+            "enabled": False,
+            "backend": None,
+            "reviewed": 0,
+            "prompted": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+
     save_analysis_run(conn, account_id, scope, market, code, payload)
     return payload
 
@@ -1384,10 +2302,89 @@ def render_analysis_text(payload: dict) -> str:
         lines.append("数据来源：")
         for source in decision["sources"]:
             lines.append(f"- {source}")
+        # LLM 复核（如有）
+        review = decision.get("llm_review") or {}
+        if review:
+            status = review.get("status")
+            if status == "ok":
+                verdict = review.get("verdict", "?")
+                conf = review.get("confidence")
+                verdict_emoji = {
+                    "confirm": "✅",
+                    "question": "⚠️",
+                    "reject": "🚫",
+                }.get(verdict, "•")
+                lines.append(
+                    f"LLM 复核（{review.get('backend','?')}，{review.get('elapsed_ms', 0)/1000:.1f}s）："
+                    f"{verdict_emoji} {verdict}"
+                    + (f" @ {conf}" if conf is not None else "")
+                )
+                for c in (review.get("concerns") or []):
+                    lines.append(f"  • {c}")
+                if review.get("missing_context"):
+                    lines.append("  需要补充的数据：")
+                    for m in review["missing_context"]:
+                        lines.append(f"  - {m}")
+                if review.get("execution_hint"):
+                    lines.append(f"  执行建议：{review['execution_hint']}")
+            elif status == "prompted":
+                lines.append(
+                    "🤖 **LLM 复核请求**：请当前 agent 基于以上系统建议与数据来源，"
+                    "结合 stock-market-hub 拉取最新公告/资金流/新闻，"
+                    "给出独立复核结论（verdict / confidence / concerns / execution_hint）。"
+                )
+            elif status == "failed":
+                lines.append(
+                    f"⚠️ LLM 复核失败（{review.get('backend','?')}）：{review.get('error', '?')[:120]}；"
+                    "请按规则系统信号处理"
+                )
+            elif status == "unavailable":
+                lines.append(
+                    f"⚠️ LLM 复核未启用：{review.get('message', '未检测到 LLM 后端')}"
+                )
+            # status == "skipped" 不渲染（非敏感 action，复核被跳过是正常的）
         lines.append("")
     opportunities = payload.get("opportunities") or []
     if opportunities:
         lines.append("可额外关注的标的：")
         for item in opportunities:
             lines.append(f"- {item['market'].upper()} {item['code']} {item['name']}：{'；'.join(item['reasons'])}")
+
+    # ── LLM 复核建议清单（仅在复核未启用时显示）─────────────────
+    # 设计动机：复核单标的耗时 90-200s，全开太慢；默认关闭后让用户自己挑想细看的标的。
+    # 这里在分析末尾给出"哪些标的建议复核 + 可直接复制的命令"。
+    meta = payload.get("llm_review_meta") or {}
+    if not meta.get("enabled"):
+        from spc_core.llm_review import should_review
+        review_candidates: list[dict] = []
+        for item in payload.get("results", []):
+            dec = item.get("decision") or {}
+            action = dec.get("action")
+            if not should_review(action):
+                continue
+            review_candidates.append({
+                "market": item.get("market"),
+                "code": item.get("code"),
+                "name": item.get("name") or "",
+                "action": action,
+                "action_label": dec.get("action_label") or action,
+                "confidence": dec.get("confidence"),
+            })
+        if review_candidates:
+            account_slug = (payload.get("account") or {}).get("slug") or "default"
+            lines.append("")
+            lines.append("== LLM 复核建议（默认未开启）==")
+            lines.append(
+                f"以下 {len(review_candidates)} 个标的的建议涉及仓位变化，"
+                f"建议在执行前对**信心不足 / 跟你判断不一致**的标的做一次人工复核："
+            )
+            for c in review_candidates:
+                lines.append(
+                    f"- {c['market'].upper()} {c['code']} {c['name']}：{c['action_label']}（{c['action']}）"
+                    + (f" @ {c['confidence']}" if c['confidence'] is not None else "")
+                )
+            lines.append("")
+            lines.append("直接告诉 agent 你要复核哪个标的即可，例如：")
+            lines.append(f"  \"帮我对 {review_candidates[0]['name']}（{review_candidates[0]['code']}）做一下人工复核\"")
+            lines.append("（agent 会调 stock-market-hub 拉最新数据，在当前 session 内给出复核结论）")
     return "\n".join(lines).strip()

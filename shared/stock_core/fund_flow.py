@@ -57,6 +57,68 @@ _FFLOW_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 _FFLOW_UT = "b2884a393a59ad64002292a3e90d46a5"
 
 
+def _market_session_start(market: str) -> time | None:
+    if market == "a":
+        return time(9, 30)
+    if market == "hk":
+        return time(9, 30)
+    return None
+
+
+def _market_session_close(market: str) -> time | None:
+    if market == "a":
+        return time(15, 0)
+    if market == "hk":
+        return time(16, 0)
+    return None
+
+
+def _market_day_started(market: str, now: datetime) -> bool:
+    start = _market_session_start(market)
+    if start is None:
+        return False
+    if now.weekday() >= 5:
+        return False
+    return now.time() >= start
+
+
+def _market_close_stamp(market: str, date_text: str) -> str | None:
+    close_t = _market_session_close(market)
+    if close_t is None or not date_text:
+        return None
+    try:
+        day = datetime.fromisoformat(str(date_text)).date()
+    except ValueError:
+        return None
+    return datetime.combine(day, close_t, tzinfo=CN_TZ).isoformat()
+
+
+def _infer_today_flow_mode(market: str, now: datetime) -> str:
+    """返回默认资金流口径。
+
+    - ``previous_close``：盘前，默认上一交易日完整资金流
+    - ``intraday_live``：盘中（含午休），默认今日盘中累计
+    - ``today_close``：盘后，默认今日收盘资金流
+    """
+    if not _market_day_started(market, now):
+        return "previous_close"
+    close_t = _market_session_close(market)
+    if close_t is None:
+        return "previous_close"
+    if now.time() <= close_t:
+        return "intraday_live"
+    return "today_close"
+
+
+def _flow_label(flow_mode: str, flow_as_of: str | None) -> str:
+    as_of = flow_as_of or "-"
+    if flow_mode == "intraday_live":
+        return f"今日盘中累计，截至 {as_of}"
+    if flow_mode == "today_close":
+        return f"今日收盘资金流，截至 {as_of}"
+    return f"上一交易日完整资金流，截至 {as_of}"
+
+
 def _ttl_for_moment(market: str, now: datetime) -> float:
     """按给定时刻计算资金流缓存 TTL。
 
@@ -560,6 +622,100 @@ def _xueqiu_symbol(market: str, code: str) -> str | None:
     return None  # 北交所 4/8 也跳过
 
 
+def _live_today_row_from_xueqiu(
+    market: str,
+    code: str,
+    *,
+    xq: XueqiuClient | None = None,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """构造一条"今日累计" synthetic 资金流日线。
+
+    仅 A 股可用；返回 ``(row, timestamp_iso, warnings)``。
+    ``timestamp_iso`` 优先取分钟级资金流最后一个点，拿不到再退回 assort 的日期戳。
+    """
+    warnings: list[str] = []
+    xq_sym = _xueqiu_symbol(market, code)
+    if not xq_sym:
+        return None, None, warnings
+
+    cli = xq or XueqiuClient()
+    if not cli.is_logged_in and not cli.cookie_expired:
+        return None, None, warnings
+
+    assort = cli.capital_assort(xq_sym)
+    if assort is None:
+        if cli.cookie_expired:
+            warnings.append(
+                "雪球登录 cookie 已过期，今日盘中资金流不可用；已回退到上一交易日完整资金流。"
+            )
+        return None, None, warnings
+
+    intraday_items = cli.capital_intraday(xq_sym)
+    last_ts_ms = None
+    if intraday_items:
+        last_ts_ms = intraday_items[-1].get("timestamp")
+    if not last_ts_ms:
+        last_ts_ms = assort.get("timestamp")
+
+    timestamp_iso = None
+    if last_ts_ms:
+        try:
+            timestamp_iso = datetime.fromtimestamp(float(last_ts_ms) / 1000, CN_TZ).isoformat()
+        except Exception:  # noqa: BLE001
+            timestamp_iso = None
+
+    def net(k_buy: str, k_sell: str) -> float | None:
+        b = assort.get(k_buy)
+        s = assort.get(k_sell)
+        if b is None or s is None:
+            return None
+        return float(b) - float(s)
+
+    big = net("buy_large", "sell_large")
+    xlarge = net("buy_xlarge", "sell_xlarge")
+    mid = net("buy_medium", "sell_medium")
+    small = net("buy_small", "sell_small")
+    main = (big or 0.0) + (xlarge or 0.0)
+    buy_total = assort.get("buy_total") or 0
+    sell_total = assort.get("sell_total") or 0
+    grand_total = float(buy_total) + float(sell_total)
+
+    def _pct(v: float | None) -> float | None:
+        if v is None or grand_total <= 0:
+            return None
+        return round(v / grand_total * 100, 2)
+
+    today_date = None
+    if timestamp_iso:
+        today_date = timestamp_iso[:10]
+    else:
+        stamp_ms = assort.get("timestamp")
+        if stamp_ms:
+            try:
+                today_date = datetime.fromtimestamp(float(stamp_ms) / 1000, CN_TZ).date().isoformat()
+            except Exception:  # noqa: BLE001
+                today_date = None
+    if not today_date:
+        today_date = datetime.now(CN_TZ).date().isoformat()
+
+    row = {
+        "date": today_date,
+        "main": main,
+        "small": small,
+        "mid": mid,
+        "big": big,
+        "super_big": xlarge,
+        "main_pct": _pct(main),
+        "small_pct": _pct(small),
+        "mid_pct": _pct(mid),
+        "big_pct": _pct(big),
+        "super_big_pct": _pct(xlarge),
+        "close": None,
+        "change_pct": None,
+    }
+    return row, timestamp_iso, warnings
+
+
 def _enrich_with_xueqiu_assort(summary: dict[str, Any], market: str, code: str,
                                 xq: XueqiuClient | None = None) -> None:
     """用雪球 capital/assort 补全 ``summary['today']`` 里东财新接口缺的占比 / 分层。
@@ -648,23 +804,44 @@ def get_fund_flow_summary(market: str, code: str) -> dict[str, Any]:
     失败时返回带 ``error`` 字段的占位字典；雪球 cookie 过期会在 ``warnings`` 列出，
     不阻塞主流程（决策树仍能正常工作）。
     """
+    now = datetime.now(CN_TZ)
+    flow_mode = _infer_today_flow_mode(market, now)
+
     try:
         rows = fetch_daily_fund_flow(market, code)
     except ValueError as e:
         return {"error": str(e), "as_of": None, "today": None, "rolling": {}, "regime": None, "reversal": None}
     if not rows:
         return {"error": "fflow 接口返回空", "as_of": None, "today": None, "rolling": {}, "regime": None, "reversal": None}
-    summary = summarize_fund_flow(rows)
-    summary["fetched_at"] = datetime.now(CN_TZ).isoformat()
+    effective_rows = rows
+    flow_as_of = _market_close_stamp(market, rows[-1].get("date") or "")
+    warnings: list[str] = []
 
-    # 雪球 enrich（A 股有 cookie 时生效；港股 / 无 cookie 自动跳过）
-    try:
-        _enrich_with_xueqiu_assort(summary, market, code)
-    except Exception as e:  # noqa: BLE001
-        # enrich 失败不应影响主流程；记录但不抛
-        print(f"[fund_flow] xueqiu assort enrich 失败（不影响主源数据）: {type(e).__name__}: {e}",
-              file=sys.stderr)
+    if flow_mode != "previous_close":
+        live_row, live_ts, live_warnings = _live_today_row_from_xueqiu(market, code)
+        warnings.extend(live_warnings)
+        if live_row is not None:
+            today_date = live_row["date"]
+            if rows and rows[-1].get("date") == today_date:
+                effective_rows = rows[:-1] + [live_row]
+            else:
+                effective_rows = rows + [live_row]
+            flow_as_of = live_ts or now.isoformat()
+        elif rows[-1].get("date") == now.date().isoformat():
+            flow_as_of = _market_close_stamp(market, rows[-1].get("date") or "") or now.isoformat()
+        else:
+            flow_mode = "previous_close"
+            warnings.append("今日资金流实时口径暂不可用，已回退到上一交易日完整资金流。")
 
+    summary = summarize_fund_flow(effective_rows)
+    summary["rolling_as_of"] = summary.get("as_of")
+    summary["fetched_at"] = now.isoformat()
+    summary["flow_mode"] = flow_mode
+    summary["flow_as_of"] = flow_as_of
+    summary["flow_label"] = _flow_label(flow_mode, flow_as_of)
+    if warnings:
+        summary.setdefault("warnings", [])
+        summary["warnings"].extend(warnings)
     return summary
 
 
@@ -674,7 +851,9 @@ def _render_text(market: str, code: str, summary: dict[str, Any]) -> str:
     if summary.get("error"):
         return f"# 主力资金动向 {market.upper()} {code}\n\n（暂无数据：{summary['error']}）"
     lines: list[str] = []
-    lines.append(f"# 主力资金动向 {market.upper()} {code} — 截至 {summary.get('as_of')}")
+    lines.append(f"# 主力资金动向 {market.upper()} {code}")
+    if summary.get("flow_label"):
+        lines.append(f"\n> 资金流口径：**{summary.get('flow_label')}**")
     regime = summary.get("regime")
     lines.append(f"\n> regime: **{regime or '-'}** ({regime_label(regime)})")
     reversal = summary.get("reversal")
@@ -733,7 +912,7 @@ def _render_text(market: str, code: str, summary: dict[str, Any]) -> str:
     chg_str = "-" if chg is None else f"{chg:+.2f}%"
     lines.append("")
     lines.append(
-        f"## 当日资金分层（{summary.get('as_of')}，收盘 {close_str}，涨跌 {chg_str}）"
+        f"## 当日资金分层（{summary.get('flow_label') or summary.get('as_of')}，收盘 {close_str}，涨跌 {chg_str}）"
     )
     lines.append("| 档位 | 净额 | 占成交比例 |")
     lines.append("|---|---|---|")

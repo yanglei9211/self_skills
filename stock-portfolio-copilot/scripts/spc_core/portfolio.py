@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from spc_core.ledger import latest_snapshots
+from spc_core.ledger import (
+    delete_position_peak,
+    latest_snapshots,
+    upsert_position_peak,
+)
 from spc_core.market_bridge import FXRateProvider, StockMarketHubProvider
 from spc_core.settings import ensure_defaults, get_decimal_setting
 from spc_core.utils import (
@@ -202,6 +206,34 @@ def sync_portfolio(conn, account_id: int, market: str | None = None, code: str |
                 snapshot["source"],
             ),
         )
+
+        # 维护 position_peak（trailing stop 用）
+        #   - qty > 0 + 有现价 → upsert peak
+        #   - qty == 0 → 清仓，删除 peak（下次再建仓会重新初始化）
+        if qty > 0 and last_price is not None and avg_cost > 0:
+            # 当前持仓阶段的开始时间 = 第一笔买入交易时间（或 seed 时间）
+            if trades:
+                position_open_time = trades[0]["trade_time"]
+            elif seed:
+                position_open_time = seed["seed_time"]
+            else:
+                position_open_time = utc_now_iso()
+            try:
+                upsert_position_peak(
+                    conn, account_id, sym_market, sym_code,
+                    last_price=last_price,
+                    avg_cost=avg_cost,
+                    position_open_time=position_open_time,
+                )
+            except Exception:  # noqa: BLE001
+                # peak 维护失败不阻塞 snapshot 写入（trailing stop 退化为不可用）
+                pass
+        elif qty == 0:
+            try:
+                delete_position_peak(conn, account_id, sym_market, sym_code)
+            except Exception:  # noqa: BLE001
+                pass
+
         snapshots.append(snapshot)
     conn.commit()
     return snapshots
