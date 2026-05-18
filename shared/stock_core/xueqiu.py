@@ -124,6 +124,15 @@ class XueqiuClient:
     # market / type 映射
     # market: cn / hk / us
     # type: sh_sz / kcb（科创板）/ gem（创业板）/ stib / hk / us / st
+    #
+    # ⚠️ 雪球 screener API 实测行为（2026-05 验证）：
+    #   - type=sh_sz / kcb / hk / us：服务端正确过滤
+    #   - type=gem / stib / st：**服务端 silently 失败**，返回全 A 数据
+    #     （count 字段一直是 5000 = 全 A 数量）
+    #
+    # 兼容方案：把 gem/stib/st 标记为"客户端 post-filter"，
+    # ``screener()`` 检测到这些 market 时，自动改用 type=sh_sz 拉全 A，
+    # 然后按代码前缀（gem/stib）或名称（st）在本地过滤。
     MARKETS = {
         "all_a": ("cn", "sh_sz"),
         "kcb": ("cn", "kcb"),
@@ -132,6 +141,28 @@ class XueqiuClient:
         "st": ("cn", "st"),
         "hk": ("hk", "hk"),
         "us": ("us", "us"),
+    }
+
+    # 需要客户端 post-filter 的 market：值为判定函数（接收 screener 单条 dict 返回 bool）
+    # 注意：这两个市场的标的都在雪球 ``type=sh_sz`` 大池里（沪深 A），
+    # 可以靠分页 + 前缀/名称过滤拿到正确子集。
+    _POST_FILTER: dict[str, "callable"] = {
+        "gem": lambda it: (it.get("symbol") or "").startswith(("SZ300", "SZ301")),
+        "st": lambda it: (
+            "ST" in (it.get("name") or "") or "*ST" in (it.get("name") or "")
+        ),
+    }
+
+    # post-filter 模式下分页拉取的上限（避免极端慢查询）
+    # 100 条/页 × 30 页 = 3000 只全 A 扫描；ST 股全 A ≈ 100-200 只，3000 足够
+    _POST_FILTER_MAX_PAGES = 30
+    _POST_FILTER_PAGE_SIZE = 100
+
+    # 验证型市场：走 native screener，但额外检测返回是否含目标前缀；
+    # 不含说明 native 此次不工作（雪球 API 不稳定），返回空 + warning 让 caller 知情。
+    # 用于"沪深 A 大池外"的市场（如北交所 BJ4/8/9）。
+    _VERIFY_PREFIX: dict[str, tuple[str, ...]] = {
+        "stib": ("BJ4", "BJ8", "BJ9"),
     }
 
     def __init__(self, impersonate: str = "chrome", user_cookie: str | None = None):
@@ -308,6 +339,34 @@ class XueqiuClient:
 
     # -------- 全市场筛选 -------- #
 
+    def _screener_raw(
+        self,
+        m: str,
+        t: str,
+        order_by: str,
+        order: str,
+        size: int,
+        page: int,
+        extras: dict | None = None,
+    ) -> dict:
+        """直接命中雪球 screener API（不做 post-filter），caller 必须传 native 的 m/t。"""
+        self._warmup()
+        url = f"{self.BASE}/service/v5/stock/screener/quote/list"
+        params = {
+            "order": order,
+            "order_by": order_by,
+            "market": m,
+            "type": t,
+            "size": size,
+            "page": page,
+        }
+        if extras:
+            params.update(extras)
+        r = self.session.get(url, params=params, headers=_HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("data") or {}
+
     def screener(
         self,
         market: str = "all_a",
@@ -326,26 +385,93 @@ class XueqiuClient:
                   / net_profit_cagr / income_cagr 等
         order: desc / asc
         extras: 附加筛选条件（如 {"market_capital_gte": 1e10}）
+
+        ⚠️ ``market in {"gem","stib","st"}`` 时走客户端 post-filter（雪球 API 服务端过滤
+        不可靠），内部会自动从全 A 分页拉取再按规则过滤。代价是多次 API call，但保证
+        结果正确。``page`` 参数在 post-filter 模式下被忽略（总是从第 1 页开始累积），
+        ``extras`` 也不会被透传（避免与 post-filter 语义打架）。
         """
         if market not in self.MARKETS:
             raise ValueError(f"unknown market: {market}; available: {list(self.MARKETS)}")
+
+        # ── 客户端 post-filter（gem/st，全 A 池里能查到）──
+        if market in self._POST_FILTER:
+            return self._screener_post_filter(market, order_by, order, size)
+
+        # ── native 模式（雪球服务端过滤 work 的市场，如 kcb/all_a/hk/us）──
         m, t = self.MARKETS[market]
-        self._warmup()
-        url = f"{self.BASE}/service/v5/stock/screener/quote/list"
-        params = {
-            "order": order,
-            "order_by": order_by,
-            "market": m,
-            "type": t,
-            "size": size,
-            "page": page,
+        data = self._screener_raw(m, t, order_by, order, size, page, extras)
+
+        # ── 验证型市场（stib 北交所，雪球过滤不稳定，需检测结果）──
+        if market in self._VERIFY_PREFIX:
+            wanted_prefixes = self._VERIFY_PREFIX[market]
+            items = data.get("list") or []
+            kept = [it for it in items if (it.get("symbol") or "").startswith(wanted_prefixes)]
+            dropped = len(items) - len(kept)
+            if dropped > 0:
+                print(
+                    f"[xueqiu] market={market} 雪球 native 返回 {len(items)} 条但"
+                    f"只有 {len(kept)} 条匹配前缀 {wanted_prefixes}；"
+                    f"已丢弃 {dropped} 条 spillover（雪球 API 在 {market}+{order_by} "
+                    "组合下过滤不可靠）",
+                    file=sys.stderr,
+                )
+            data["list"] = kept
+            data["count"] = len(kept)
+            data["_verified"] = True
+        return data
+
+    def _screener_post_filter(
+        self,
+        market: str,
+        order_by: str,
+        order: str,
+        size: int,
+    ) -> dict:
+        """对雪球不可靠过滤的市场（gem/stib/st）做客户端分页 + 过滤。
+
+        策略：从全 A（type=sh_sz）按 order_by 排序分页拉取，每页 100 条，
+        本地用 ``_POST_FILTER[market]`` 判定函数筛留，累计到 size 条或翻到
+        ``_POST_FILTER_MAX_PAGES`` 上限为止。
+
+        返回结构跟 ``_screener_raw`` 兼容，额外字段：
+          - ``_post_filter``: True   — 标记本次是 post-filter 模式（caller 可据此提示用户）
+          - ``_pages_scanned``: int  — 实际翻了多少页
+          - ``_truncated``: bool     — 是否因为 max_pages 上限而提前停（可能漏掉低排名的标的）
+        """
+        filter_fn = self._POST_FILTER[market]
+        accumulated: list[dict] = []
+        pages_scanned = 0
+        for page in range(1, self._POST_FILTER_MAX_PAGES + 1):
+            pages_scanned = page
+            raw = self._screener_raw(
+                "cn", "sh_sz", order_by, order,
+                self._POST_FILTER_PAGE_SIZE, page,
+            )
+            items = raw.get("list") or []
+            if not items:
+                break
+            accumulated.extend(it for it in items if filter_fn(it))
+            if len(accumulated) >= size:
+                break
+        truncated = (
+            pages_scanned >= self._POST_FILTER_MAX_PAGES
+            and len(accumulated) < size
+        )
+        if truncated:
+            print(
+                f"[xueqiu] market={market} post-filter 翻完 {pages_scanned} 页 "
+                f"仅找到 {len(accumulated)} 个匹配，目标 size={size}；"
+                "可能因为该过滤条件下符合条件的标的较少（如 ST 股的 followers 普遍偏低）",
+                file=sys.stderr,
+            )
+        return {
+            "count": len(accumulated),
+            "list": accumulated[:size],
+            "_post_filter": True,
+            "_pages_scanned": pages_scanned,
+            "_truncated": truncated,
         }
-        if extras:
-            params.update(extras)
-        r = self.session.get(url, params=params, headers=_HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("data") or {}
 
     # -------- 便捷封装 -------- #
 

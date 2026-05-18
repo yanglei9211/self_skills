@@ -1208,3 +1208,220 @@ def latest_snapshot_for_symbol(conn, account_id: int, market: str, code: str) ->
         (account_id, norm_market, norm_code),
     ).fetchone()
     return dict(row) if row else None
+
+
+# ── 持仓侧风控辅助查询（P2a / P2b）─────────────────────────────────
+
+def get_active_plan_levels(conn, account_id: int, market: str, code: str) -> dict | None:
+    """查指定 (account, market, code) 上"最近一条非终态 execution_plan"的预案价位。
+
+    用于持仓侧决策（``_decide_for_holding``）的 P2a 路径：
+      - status ∈ {planned, partially_filled} 才算"还在执行中的预案"
+      - 终态（cancelled / expired / filled）的 plan 价位不再生效
+      - 多条非终态时取最新一条（id DESC）
+
+    Returns:
+        ``{"plan_id": int, "stop_loss_price": Decimal | None,
+           "take_profit_price": Decimal | None}``，找不到时返回 None。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    row = conn.execute(
+        """
+        SELECT id, stop_loss_price, take_profit_price
+          FROM execution_plan
+         WHERE account_id = ? AND market = ? AND code = ?
+           AND status IN (?, ?)
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (account_id, norm_market, norm_code, PLAN_STATUS_PLANNED, PLAN_STATUS_PARTIAL),
+    ).fetchone()
+    if not row:
+        return None
+    out: dict = {"plan_id": row["id"], "stop_loss_price": None, "take_profit_price": None}
+    if row["stop_loss_price"]:
+        try:
+            out["stop_loss_price"] = to_decimal(row["stop_loss_price"], "plan.stop_loss_price")
+        except Exception:  # noqa: BLE001
+            pass
+    if row["take_profit_price"]:
+        try:
+            out["take_profit_price"] = to_decimal(row["take_profit_price"], "plan.take_profit_price")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def get_position_peak(conn, account_id: int, market: str, code: str) -> dict | None:
+    """读取当前持仓阶段的最高价记录（trailing stop 用）。
+
+    Returns:
+        dict 含 ``peak_price`` / ``peak_time`` / ``position_open_time`` /
+        ``last_trim_tier`` / ``last_trim_price`` / ``last_trim_time``（v5+），
+        无记录时返回 None。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    row = conn.execute(
+        """
+        SELECT peak_price, peak_time, position_open_time, updated_at,
+               last_trim_tier, last_trim_price, last_trim_time
+          FROM position_peak
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (account_id, norm_market, norm_code),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def set_position_trim_tier(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    *,
+    tier: str,
+    price: Decimal,
+) -> None:
+    """写入"已触发 tier 减仓"标记（P0a 分档幂等性）。
+
+    设计：
+      - 调用方负责保证 ``tier ∈ {"T1", "T2"}``（T3 是 sell，幂等性由 sell 守卫
+        天然保证，不进 last_trim_tier）
+      - 写入前要确保 peak 行存在；如果不存在（理论上不该发生，因为 sync 时已经
+        upsert），就什么都不做，把这条 trim 当作首次触发对待，下次 sync 后正常
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    now = utc_now_iso()
+    cur = conn.execute(
+        """
+        UPDATE position_peak
+           SET last_trim_tier = ?,
+               last_trim_price = ?,
+               last_trim_time = ?,
+               updated_at = ?
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (tier, decimal_str(price), now, now, account_id, norm_market, norm_code),
+    )
+    return cur.rowcount > 0
+
+
+def clear_position_trim_tier(conn, account_id: int, market: str, code: str) -> bool:
+    """清空 trim_tier 标记。
+
+    触发时机：
+      - portfolio.sync：浮亏回升至 T1 阈值以下 → 让标的重新有"再下跌一档"的容量
+      - delete_position_peak：清仓时整条删除，间接清掉 trim_tier
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    now = utc_now_iso()
+    cur = conn.execute(
+        """
+        UPDATE position_peak
+           SET last_trim_tier = NULL,
+               last_trim_price = NULL,
+               last_trim_time = NULL,
+               updated_at = ?
+         WHERE account_id = ? AND market = ? AND code = ?
+           AND last_trim_tier IS NOT NULL
+        """,
+        (now, account_id, norm_market, norm_code),
+    )
+    return cur.rowcount > 0
+
+
+def upsert_position_peak(
+    conn,
+    account_id: int,
+    market: str,
+    code: str,
+    *,
+    last_price: Decimal,
+    avg_cost: Decimal,
+    position_open_time: str,
+) -> dict:
+    """更新（或初始化）``position_peak`` 表。
+
+    规则：
+      - 没有记录时初始化为 ``max(avg_cost, last_price)``，避免"刚买入就立刻把
+        peak 锚定在低于成本的位置"导致 trailing stop 错误地立即触发
+      - 有记录时仅当 ``last_price > peak_price`` 才更新 peak
+      - position_open_time 只在首次初始化时写入；之后保持不变（直至清仓删除）
+
+    调用方负责保证 ``last_price > 0`` 和 ``avg_cost > 0``。
+    """
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    now = utc_now_iso()
+    row = conn.execute(
+        """
+        SELECT peak_price, peak_time, position_open_time
+          FROM position_peak
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (account_id, norm_market, norm_code),
+    ).fetchone()
+    if row is None:
+        # 初始化：peak = max(avg_cost, last_price)
+        initial_peak = last_price if last_price > avg_cost else avg_cost
+        conn.execute(
+            """
+            INSERT INTO position_peak
+              (account_id, market, code, peak_price, peak_time,
+               position_open_time, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id, norm_market, norm_code,
+                decimal_str(initial_peak), now, position_open_time, now,
+            ),
+        )
+        return {
+            "peak_price": decimal_str(initial_peak),
+            "peak_time": now,
+            "position_open_time": position_open_time,
+            "updated_at": now,
+        }
+    old_peak = to_decimal(row["peak_price"], "peak_price")
+    if last_price > old_peak:
+        conn.execute(
+            """
+            UPDATE position_peak
+               SET peak_price = ?, peak_time = ?, updated_at = ?
+             WHERE account_id = ? AND market = ? AND code = ?
+            """,
+            (
+                decimal_str(last_price), now, now,
+                account_id, norm_market, norm_code,
+            ),
+        )
+        return {
+            "peak_price": decimal_str(last_price),
+            "peak_time": now,
+            "position_open_time": row["position_open_time"],
+            "updated_at": now,
+        }
+    return {
+        "peak_price": row["peak_price"],
+        "peak_time": row["peak_time"],
+        "position_open_time": row["position_open_time"],
+        "updated_at": row["peak_time"],
+    }
+
+
+def delete_position_peak(conn, account_id: int, market: str, code: str) -> bool:
+    """清仓时调用：删除对应的 peak 记录。下次再建仓会重新初始化。"""
+    norm_market = normalize_market(market)
+    norm_code = normalize_code(norm_market, code)
+    cur = conn.execute(
+        """
+        DELETE FROM position_peak
+         WHERE account_id = ? AND market = ? AND code = ?
+        """,
+        (account_id, norm_market, norm_code),
+    )
+    return cur.rowcount > 0

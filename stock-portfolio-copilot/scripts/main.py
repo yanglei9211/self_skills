@@ -503,7 +503,30 @@ def cmd_portfolio_show(args, conn) -> None:
 
 def cmd_analyze_now(args, conn) -> None:
     acct = _resolve(conn, args)
-    payload = analyze_now(conn, acct["id"], acct["slug"], acct["display_name"], args.scope, args.market, args.code)
+
+    # LLM 复核进度提示（仅在非 JSON 输出 + 启用时显示，避免污染 JSON 输出）
+    def _progress(idx, total, result, review):
+        if args.format == "json":
+            return
+        sym = f"{result.get('market')}/{result.get('code')}"
+        action = (result.get("decision") or {}).get("action")
+        status = review.get("status")
+        verdict = review.get("verdict", "")
+        elapsed = review.get("elapsed_ms", 0) / 1000
+        print(
+            f"  [LLM 复核 {idx}/{total}] {sym} action={action} → "
+            f"status={status} verdict={verdict} ({elapsed:.1f}s)",
+            file=sys.stderr,
+        )
+
+    payload = analyze_now(
+        conn, acct["id"], acct["slug"], acct["display_name"],
+        args.scope, args.market, args.code,
+        llm_review_enabled=args.llm_review,
+        llm_review_backend=args.llm_backend if args.llm_backend != "auto" else None,
+        llm_review_timeout=args.llm_review_timeout,
+        llm_review_progress=_progress,
+    )
     if args.format == "json":
         print(pretty_json(payload))
     else:
@@ -904,6 +927,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze_now.add_argument("--market")
     p_analyze_now.add_argument("--code")
     p_analyze_now.add_argument("--format", choices=["text", "json"], default="text")
+    # ── LLM 复核（默认 OFF，按需开启）──
+    # 由于单次复核耗时 90-200s，默认关闭；普通 analyze 会在末尾列出"建议复核标的"
+    # 和现成命令，由用户自己挑哪些标的值得跑 LLM 二次确认。
+    p_analyze_now.add_argument(
+        "--llm-review", dest="llm_review", action="store_true", default=False,
+        help="开启 LLM 复核（默认关闭；推荐先看一遍规则建议，再对个别标的 spot-check）",
+    )
+    p_analyze_now.add_argument(
+        "--no-llm-review", dest="llm_review", action="store_false",
+        help="显式关闭 LLM 复核（与默认一致）",
+    )
+    p_analyze_now.add_argument(
+        "--llm-backend", choices=["prompt", "auto", "codex", "claude"], default="prompt",
+        help="LLM 复核后端：prompt 由当前 agent 直接复核（默认，最稳定）；auto/codex/claude 走 subprocess",
+    )
+    p_analyze_now.add_argument(
+        "--llm-review-timeout", type=int, default=180,
+        help="LLM 单次复核超时秒数（默认 180s）",
+    )
     p_analyze_now.set_defaults(func=cmd_analyze_now)
 
     # report
