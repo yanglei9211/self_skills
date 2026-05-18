@@ -168,6 +168,23 @@ GET https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get
 - 与雪球 `screener.main_net_inflows` 互补：雪球给"全市场榜单 + 当日累计"，东财 fflow 给"单只 120 日逐日序列 + 五档细分"
 
 
+### 6.6 决策辅助维度（v1.7+，spc 集成）✅
+
+封装在 `shared/stock_core/enrichment.py`，通过 `company_analysis.analyze()` 自动并发抓取，作为 spc 决策的辅助维度（不强制驱动 action，只贡献 reasons/risks 文案 + sources 展示）。
+
+| 维度 | 函数 | 数据源 | 用途 |
+|---|---|---|---|
+| **个股相关新闻** | `fetch_stock_news_relevance` | 财联社电报 `cls.cn` 单次 50 条 | 按公司名/简称/代码做关键词命中，识别"今日异动是否有公开归因" |
+| **板块强弱** | `fetch_sector_strength` | 雪球 quote API（基于 `analyze.peers` 字段同业对比） | 区分"个股 alpha 强弱" vs "板块 beta 共振"；leader/stronger/inline/weaker/laggard |
+| **散户拥挤度** | `fetch_xueqiu_attention` | 雪球 `screener_by_symbols`（拿 followers 字段） | very_hot/hot/moderate/low；与价格 regime 组合判定"拥挤交易顶部"或"散户接飞刀" |
+
+**集成位置**：`company_analysis.analyze()` 第二阶段调度（依赖前序结果），通过 `--skip stock_news,sector_strength,attention` 可关闭。
+
+**已知局限（v1）**：
+- `stock_news` 池子只有 50 条（cls.cn 不支持分页），命中率低（~5-10% 持仓个股能命中）；后续需融合新浪滚动 + 巨潮搜索扩大池子
+- `sector_strength` 依赖 `analyze.peers`，但 A 股 peers 接口（东财 push2 板块成分）经常被封，导致大多数 A 股标的返回 `n/a`；港股本来就没 peers 数据
+- `attention` 港股 symbol 需要剥掉 "HK" 前缀匹配 screener（已处理）
+
 ### 7. 风险信号源
 
 

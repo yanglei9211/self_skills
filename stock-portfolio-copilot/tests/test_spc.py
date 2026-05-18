@@ -467,6 +467,7 @@ class SPCTestCase(unittest.TestCase):
         self.assertEqual(detail["status"], "planned")
         self.assertEqual(detail["fill_summary"]["trade_count"], 0)
         self.assertEqual(detail["fill_summary"]["filled_qty"], "0.0000")
+        self.assertEqual(len(detail["trades"]), 0)
 
     def test_execution_review_does_not_override_plan_status(self):
         plan_id = create_execution_plan(
@@ -510,6 +511,76 @@ class SPCTestCase(unittest.TestCase):
         detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
         self.assertEqual(detail["status"], "partially_filled")
         self.assertEqual(len(detail["reviews"]), 1)
+
+    def test_target_cash_cny_plan_can_reach_filled(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "open",
+            "按金额建仓",
+            target_cash_cny="100000",
+        )
+        add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "400",
+            "250.00",
+            "2026-05-08 10:00:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            plan_id=plan_id,
+        )
+
+        detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
+        self.assertEqual(detail["status"], "filled")
+        self.assertEqual(detail["fill_summary"]["filled_cash_cny"], "100000.00")
+        self.assertEqual(detail["fill_summary"]["cash_completion_pct"], "100.00")
+
+    def test_target_position_pct_plan_can_reach_filled(self):
+        plan_id = create_execution_plan(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "open",
+            "按仓位建仓",
+            target_position_pct="20",
+        )
+        add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "300750",
+            "buy",
+            "400",
+            "250.00",
+            "2026-05-08 10:00:00",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            plan_id=plan_id,
+        )
+
+        detail = get_execution_plan_detail(self.conn, self.acct_id, plan_id)
+        self.assertEqual(detail["status"], "filled")
+        self.assertEqual(detail["fill_summary"]["filled_position_pct"], "20.00")
+        self.assertEqual(detail["fill_summary"]["position_completion_pct"], "100.00")
 
     def test_duplicate_attach_returns_value_error(self):
         plan_id = create_execution_plan(

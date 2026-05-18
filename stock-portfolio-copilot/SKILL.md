@@ -580,3 +580,30 @@ $SPC analyze now --account default --scope holdings
 - `stock-market-hub` 中的 `news / sector / risk / ann / timeline / supply / pdf` 不要求一次性全部抽到共享层。
 - 后续开发本 skill 时，如果新增功能明确需要调用 `stock-market-hub` 的某个能力，再把对应能力抽到 `shared/stock_core`。
 - 抽取顺序遵循“先有真实复用，再做共享沉淀”，避免为了预防性重构把两个 skill 一起拖重。
+
+## 决策辅助维度（v1.7+）
+
+除了核心 5 维度（价格 regime / 资金流 / 公告 / 大盘 regime / 持仓状态）外，
+现已加入 3 个**辅助维度**，由 `shared/stock_core/enrichment.py` 提供，
+通过 `analyze_company` 自动抓取。这些维度**只贡献 reasons/risks 文案 + sources
+展示，不直接改 action 触发条件**，目的是让人 / LLM 能看到更全面的归因信息。
+
+| 维度 | Features 字段 | 命中阈值 | 输出示例 |
+|---|---|---|---|
+| **stock_news** | `news_related`, `news_important`, `news_top_titles` | 财联社电报最近 50 条点名命中 | reasons：「近期财联社命中 X 条相关电报」 |
+| **sector_strength** | `sector_label`, `sector_diff_pct`, `sector_avg_pct` | leader/stronger/weaker/laggard | reasons/risks：「显著跑赢同板块（+3.2% vs 板块 -1.0%）」 |
+| **xueqiu_attention** | `attention_followers`, `attention_level`, `attention_crowded` | hot ≥ 50 万 / very_hot ≥ 150 万 | risks：「散户关注度极高（雪球 155 万）+ 价格破位，警惕散户接飞刀」 |
+
+**实战命中示例**（2026-05-15 验证）：
+- A 000568 泸州老窖（**sell**）：散户 154.8 万 + 价格 NEW_ALL_TIME_LOW → 触发"散户接飞刀"风险
+- A 600276 恒瑞医药（**avoid**）：散户 197.9 万 + 主力 20d -17.92 亿 → 触发"市场情绪密集"风险
+- HK 01810 小米：散户 163.7 万 + RISK_OFF + NEAR_YTD_LOW → 触发"散户接飞刀"
+- HK 09988 阿里：散户 55.3 万 + crowded → 触发"市场情绪密集"
+
+**已知局限（v1）**：
+- `stock_news` 池子只有 50 条（cls.cn 单源 + 不支持分页），命中率约 5-10%
+- `sector_strength` 依赖 `analyze.peers`，A 股 peers 接口（东财 push2）经常被封，
+  大多数 A 股 标的返回 `n/a`；港股本来就没 peers 数据
+- 后续 v2 计划：cls + 新浪滚动 + 巨潮搜索融合扩大新闻池；sector_strength 自己拉同业不依赖 peers
+
+详见 `shared/stock_core/enrichment.py` 和 `stock-market-hub/references/data_sources.md` §6.6。

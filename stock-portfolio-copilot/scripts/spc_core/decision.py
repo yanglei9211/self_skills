@@ -297,6 +297,20 @@ class Features:
     # 无预案时为 None。如果有多条非终态 plan，取最近一条。
     plan_stop_loss_price: Decimal | None
     plan_take_profit_price: Decimal | None
+    # ── Enrichment 维度（v1，仅贡献 reasons/risks 文案 + sources 展示）──
+    # 这些字段的语义见 shared/stock_core/enrichment.py，缺数据时为 None / 0
+    # ① 个股相关新闻（最近 7 天财联社电报命中数）
+    news_related: int           # 命中条数
+    news_important: int         # 其中 level=A 重磅条数
+    news_top_titles: list[str]  # 最近 1-2 条标题，用于 sources 展示
+    # ② 板块强弱（个股 vs 同板块 peers 平均涨跌）
+    sector_avg_pct: float | None
+    sector_diff_pct: float | None  # 个股涨跌 - 板块平均
+    sector_label: str | None       # leader/stronger/inline/weaker/laggard
+    # ③ 雪球关注度（散户拥挤度）
+    attention_followers: int | None
+    attention_level: str | None    # low/moderate/hot/very_hot
+    attention_crowded: bool        # level >= hot
     # P0a 分档幂等性（schema v5）：上次已触发的 trim tier 标记，避免重复建议同档减仓。
     # None 表示尚未在本 lifecycle 触发过 trim；"T1" / "T2" 表示已触发。
     # T3 (sell) 不进 last_trim_tier，因为 sell 守卫天然防重复。
@@ -357,6 +371,27 @@ def _extract_features(
     amount_yi = (amount / 1e8) if isinstance(amount, (int, float)) and amount else None
     market_cap_yi = (market_cap / 1e8) if isinstance(market_cap, (int, float)) and market_cap else None
 
+    # Enrichment 字段（缺失时优雅降级）
+    stock_news = analysis.get("stock_news") or {}
+    sector = analysis.get("sector_strength") or {}
+    attention = analysis.get("attention") or {}
+
+    news_related = int(stock_news.get("related_count") or 0) if isinstance(stock_news, dict) else 0
+    news_important = int(stock_news.get("important_count") or 0) if isinstance(stock_news, dict) else 0
+    news_titles: list[str] = []
+    for it in (stock_news.get("items") or [])[:2] if isinstance(stock_news, dict) else []:
+        title = it.get("title") if isinstance(it, dict) else None
+        if title:
+            news_titles.append(str(title))
+
+    sector_avg_pct = sector.get("sector_avg_pct") if isinstance(sector, dict) else None
+    sector_diff_pct = sector.get("stock_vs_sector_pct") if isinstance(sector, dict) else None
+    sector_label = sector.get("label") if isinstance(sector, dict) else None
+
+    attention_followers = attention.get("followers") if isinstance(attention, dict) else None
+    attention_level = attention.get("level") if isinstance(attention, dict) else None
+    attention_crowded = bool(attention.get("crowded")) if isinstance(attention, dict) else False
+
     return Features(
         market=target_market,
         code=target_code,
@@ -386,6 +421,15 @@ def _extract_features(
         peak_price=peak_price,
         plan_stop_loss_price=plan_stop_loss_price,
         plan_take_profit_price=plan_take_profit_price,
+        news_related=news_related,
+        news_important=news_important,
+        news_top_titles=news_titles,
+        sector_avg_pct=sector_avg_pct,
+        sector_diff_pct=sector_diff_pct,
+        sector_label=sector_label,
+        attention_followers=attention_followers,
+        attention_level=attention_level,
+        attention_crowded=attention_crowded,
         last_trim_tier=last_trim_tier,
         last_trim_price=last_trim_price,
         last_trim_time=last_trim_time,
@@ -452,11 +496,85 @@ def _ff_suffix(label: str | None) -> str:
     return f"（资金流口径：{label}）" if label else ""
 
 
+def _collect_news_signals(f: Features) -> tuple[list[str], list[str]]:
+    """个股相关新闻（财联社电报命中）。
+
+    单纯展示信息，不直接驱动 action 触发——重磅命中会出现在 reasons 里
+    引起人/LLM 注意，但具体动作仍由公告/资金/价格 regime 决定。
+    """
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.news_important > 0:
+        reasons.append(f"近期财联社命中 {f.news_important} 条重磅相关电报，关注事件影响")
+    elif f.news_related > 0:
+        reasons.append(f"近期财联社命中 {f.news_related} 条相关电报")
+    return reasons, risks
+
+
+def _collect_sector_signals(f: Features) -> tuple[list[str], list[str]]:
+    """板块强弱（个股 vs 同板块 peers）。
+
+    用于区分"个股 alpha 强弱" vs "板块 beta 共振"：
+    - leader / stronger：个股明显跑赢板块 → 真正的 alpha 信号，加 reasons
+    - laggard / weaker：个股明显跑输板块 → 个股自身弱（不是板块拖累）→ 加 risks
+    - inline：与板块同跌同涨 → 板块系统性，不归因到个股本身（不加文案）
+    """
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.sector_label is None or f.sector_diff_pct is None:
+        return reasons, risks
+    diff = f.sector_diff_pct
+    avg = f.sector_avg_pct if f.sector_avg_pct is not None else 0.0
+    if f.sector_label == "leader":
+        reasons.append(f"显著跑赢同板块（个股相对板块 +{diff:.2f}%，板块均值 {avg:+.2f}%）")
+    elif f.sector_label == "stronger":
+        reasons.append(f"小幅跑赢同板块（+{diff:.2f}% vs 板块 {avg:+.2f}%）")
+    elif f.sector_label == "weaker":
+        risks.append(f"小幅跑输同板块（{diff:+.2f}% vs 板块 {avg:+.2f}%）")
+    elif f.sector_label == "laggard":
+        risks.append(f"显著跑输同板块（{diff:+.2f}% vs 板块 {avg:+.2f}%），警惕个股独立风险")
+    # inline：与板块同步，不加文案（已经在 sources 里展示）
+    return reasons, risks
+
+
+def _collect_attention_signals(f: Features) -> tuple[list[str], list[str]]:
+    """雪球关注度（散户拥挤度）。
+
+    高关注度本身不是买卖信号，但作为辅助警告：
+    - very_hot + 价格 NEW_HIGH = 拥挤交易顶部信号 → 明确风险提示
+    - very_hot + 价格 NEW_LOW = 散户大量抄底情绪 → 不一定反转，但要警惕"接飞刀"
+    - hot + 价格震荡 = 仅作信息展示
+    """
+    reasons: list[str] = []
+    risks: list[str] = []
+    if not f.attention_crowded or f.attention_followers is None:
+        return reasons, risks
+    followers_man = f.attention_followers / 10000
+    level_label = {"hot": "高", "very_hot": "极高"}.get(f.attention_level or "", "高")
+    if f.regime in HIGH_REGIMES:
+        risks.append(
+            f"散户关注度{level_label}（雪球 {followers_man:.0f} 万）+ 价格创新高，"
+            "警惕拥挤交易顶部"
+        )
+    elif f.regime in LOW_REGIMES:
+        risks.append(
+            f"散户关注度{level_label}（雪球 {followers_man:.0f} 万）+ 价格破位，"
+            "警惕散户接飞刀"
+        )
+    elif f.attention_level == "very_hot":
+        # 关注度极高但价格中性，给一个轻提示（避免噪音）
+        risks.append(f"散户关注度极高（雪球 {followers_man:.0f} 万），市场情绪密集")
+    return reasons, risks
+
+
 _SIGNAL_COLLECTORS = (
     _collect_macro_signals,
     _collect_price_signals,
     _collect_announcement_signals,
     _collect_fund_flow_signals,
+    _collect_news_signals,
+    _collect_sector_signals,
+    _collect_attention_signals,
 )
 
 
@@ -1360,6 +1478,25 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
             )
     if f.market_regime is not None:
         sources.append(f"market_regime={f.market_regime}")
+    # ── Enrichment 维度（v1） ──
+    if f.news_related > 0:
+        sources.append(
+            f"stock_news.related={f.news_related} (important={f.news_important})"
+        )
+        for title in f.news_top_titles[:2]:
+            sources.append(f"  · {title[:80]}")
+    if f.sector_label is not None:
+        sources.append(
+            f"sector_strength.label={f.sector_label} "
+            f"(stock_vs_sector={f.sector_diff_pct:+.2f}%, peer_avg={f.sector_avg_pct:+.2f}%)"
+            if f.sector_diff_pct is not None and f.sector_avg_pct is not None
+            else f"sector_strength.label={f.sector_label}"
+        )
+    if f.attention_followers is not None:
+        sources.append(
+            f"xueqiu_attention.followers={f.attention_followers/10000:.1f}wan "
+            f"(level={f.attention_level}, crowded={f.attention_crowded})"
+        )
     return sources
 
 

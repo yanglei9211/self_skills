@@ -465,10 +465,28 @@ def _refresh_execution_plan_status(conn, account_id: int, plan_id: int) -> None:
     summary = execution_plan_fill_summary(conn, account_id, plan_id)
     filled_qty = to_decimal(summary["filled_qty"], "filled-qty")
     target_qty_str = summary["target_qty"]
+    filled_cash_cny_str = summary.get("filled_cash_cny")
+    target_cash_cny_str = summary.get("target_cash_cny")
+    filled_position_pct_str = summary.get("filled_position_pct")
+    target_position_pct_str = summary.get("target_position_pct")
 
     if filled_qty <= 0:
         new_status = PLAN_STATUS_PLANNED
     elif target_qty_str is not None and filled_qty >= to_decimal(target_qty_str, "target-qty"):
+        new_status = PLAN_STATUS_FILLED
+    elif (
+        filled_cash_cny_str is not None
+        and target_cash_cny_str is not None
+        and to_decimal(filled_cash_cny_str, "filled-cash-cny")
+        >= to_decimal(target_cash_cny_str, "target-cash-cny")
+    ):
+        new_status = PLAN_STATUS_FILLED
+    elif (
+        filled_position_pct_str is not None
+        and target_position_pct_str is not None
+        and to_decimal(filled_position_pct_str, "filled-position-pct")
+        >= to_decimal(target_position_pct_str, "target-position-pct")
+    ):
         new_status = PLAN_STATUS_FILLED
     else:
         new_status = PLAN_STATUS_PARTIAL
@@ -785,7 +803,7 @@ def execution_plan_fill_summary(conn, account_id: int, plan_id: int) -> dict:
     plan = _require_execution_plan(conn, account_id, plan_id)
     rows = conn.execute(
         """
-        SELECT t.id, t.qty, t.price
+        SELECT t.id, t.qty, t.price, t.currency, t.fx_rate
           FROM trade_execution_link l
           JOIN trade_ledger t
             ON t.id = l.trade_id
@@ -797,11 +815,25 @@ def execution_plan_fill_summary(conn, account_id: int, plan_id: int) -> dict:
 
     filled_qty = Decimal("0")
     filled_amount = Decimal("0")
+    filled_cash_cny = Decimal("0")
+    cash_convertible = True
     for row in rows:
         qty_d = to_decimal(row["qty"], "qty")
         price_d = to_decimal(row["price"], "price")
         filled_qty += qty_d
         filled_amount += qty_d * price_d
+        trade_amount = qty_d * price_d
+        currency = str(row["currency"] or "").upper()
+        if currency == "CNY":
+            filled_cash_cny += trade_amount
+        elif currency == "HKD":
+            fx_rate = row["fx_rate"]
+            if fx_rate in (None, ""):
+                cash_convertible = False
+            else:
+                filled_cash_cny += trade_amount * to_decimal(fx_rate, "fx-rate")
+        else:
+            cash_convertible = False
     avg_price = None
     if filled_qty > 0:
         avg_price = decimal_str(q_price(filled_amount / filled_qty))
@@ -812,12 +844,45 @@ def execution_plan_fill_summary(conn, account_id: int, plan_id: int) -> dict:
         if target_qty > 0:
             completion_pct = decimal_str(q_price((filled_qty / target_qty) * Decimal("100")))
 
+    filled_cash_cny_str = decimal_str(q_money(filled_cash_cny)) if cash_convertible else None
+    target_cash_cny = plan["target_cash_cny"]
+    cash_completion_pct = None
+    if target_cash_cny and cash_convertible:
+        target_cash = to_decimal(target_cash_cny, "target-cash-cny")
+        if target_cash > 0:
+            cash_completion_pct = decimal_str(q_pct((filled_cash_cny / target_cash) * Decimal("100")))
+
+    filled_position_pct_str = None
+    target_position_pct = plan["target_position_pct"]
+    position_completion_pct = None
+    if target_position_pct and cash_convertible:
+        try:
+            from spc_core.settings import capital_settings
+
+            caps = capital_settings(conn, account_id)
+            total_cny = to_decimal(caps["total_cny"], "capital.total_cny")
+            if total_cny > 0:
+                filled_position_pct = (filled_cash_cny / total_cny) * Decimal("100")
+                filled_position_pct_str = decimal_str(q_pct(filled_position_pct))
+                target_pct = to_decimal(target_position_pct, "target-position-pct")
+                if target_pct > 0:
+                    position_completion_pct = decimal_str(q_pct((filled_position_pct / target_pct) * Decimal("100")))
+        except Exception:  # noqa: BLE001
+            filled_position_pct_str = None
+            position_completion_pct = None
+
     return {
         "trade_count": len(rows),
         "filled_qty": decimal_str(q_qty(filled_qty)),
         "avg_price": avg_price,
         "target_qty": plan["target_qty"],
         "completion_pct": completion_pct,
+        "filled_cash_cny": filled_cash_cny_str,
+        "target_cash_cny": target_cash_cny,
+        "cash_completion_pct": cash_completion_pct,
+        "filled_position_pct": filled_position_pct_str,
+        "target_position_pct": target_position_pct,
+        "position_completion_pct": position_completion_pct,
     }
 
 
@@ -830,7 +895,7 @@ def get_execution_plan_detail(conn, account_id: int, plan_id: int) -> dict:
           FROM trade_execution_link l
           JOIN trade_ledger t
             ON t.id = l.trade_id
-         WHERE l.account_id = ? AND l.plan_id = ?
+         WHERE l.account_id = ? AND l.plan_id = ? AND t.is_deleted = 0
          ORDER BY t.trade_time, t.id
         """,
         (account_id, plan_id),
