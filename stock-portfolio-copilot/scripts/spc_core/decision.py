@@ -2291,6 +2291,21 @@ def render_analysis_text(payload: dict) -> str:
             lines.append(
                 f"持仓：{position.get('qty')} 股，摊薄成本 {position.get('avg_cost_price')} {position.get('currency')}"
             )
+            # 用实时报价重算浮盈，避免展示快照里的旧盈亏和实时价格并列造成混淆
+            qty_val = position.get("qty")
+            cost_val = position.get("avg_cost_price")
+            lp_val = md.get("last_price")
+            if qty_val is not None and cost_val is not None and lp_val is not None:
+                try:
+                    _q = Decimal(str(qty_val))
+                    _c = Decimal(str(cost_val))
+                    _lp = Decimal(str(lp_val))
+                    _pnl = (_lp - _c) * _q
+                    _pct = (float(_lp - _c) / float(_c)) * 100 if _c != 0 else 0
+                    _pnl_str = f"+{_pnl:.2f}" if _pnl >= 0 else f"{_pnl:.2f}"
+                    lines.append(f"浮盈：{_pnl_str} {position.get('currency', '')}（{'+' if _pct >= 0 else ''}{_pct:.2f}%）")
+                except Exception:
+                    pass
         lines.append(f"置信度：{decision['confidence']}")
         lines.append("理由：")
         for reason in decision["reasoning"]:
