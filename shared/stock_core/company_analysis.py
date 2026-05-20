@@ -66,6 +66,7 @@ from stock_core.announcements import (
     _parse_a_share_symbol,
 )
 from stock_core.cache import cached
+from stock_core.eastmoney import eastmoney_a_code, fetch_a_core_conception_raw
 from stock_core.enrichment import (
     fetch_sector_strength,
     fetch_stock_news_relevance,
@@ -108,6 +109,7 @@ def get_quote(symbol: str, market: str, xq_sym: str) -> dict:
                 "amount": q.get("amount"),
                 "volume": q.get("volume"),
                 "turnover_rate": q.get("turnover_rate"),
+                "volume_ratio": q.get("volume_ratio"),
                 "market_capital": q.get("market_capital"),
                 "float_market_capital": q.get("float_market_capital"),
                 "current_year_percent": q.get("current_year_percent"),
@@ -423,17 +425,9 @@ def get_a_concepts(code: str, top: int = 20) -> list[str]:
 
     返回示例：['电池', '锂电池', '电力设备', '新能源车', '储能', ...]
     """
-    # 东财代码格式：300750 → SZ300750（深市）/ SH600519（沪市）/ BJ430047
-    if code.startswith("6"):
-        em_code = f"SH{code}"
-    elif code.startswith(("4", "8")):
-        em_code = f"BJ{code}"
-    else:
-        em_code = f"SZ{code}"
-    url = f"https://emweb.securities.eastmoney.com/PC_HSF10/CoreConception/PageAjax?code={em_code}"
+    em_code = eastmoney_a_code(code)
     try:
-        r = fetch(url, retries=1, timeout=10)
-        data = r.json()
+        data = fetch_a_core_conception_raw(em_code)
     except Exception as e:  # noqa: BLE001
         print(f"[concepts] eastmoney F10 failed: {e}", file=sys.stderr)
         return []
@@ -676,6 +670,8 @@ def render_text(data: dict) -> str:
         lines.append(f"- 总市值：{cap_yi:,.0f} 亿")
         if q.get("turnover_rate") is not None:
             lines.append(f"- 换手率：{q.get('turnover_rate')}%")
+        if q.get("volume_ratio") is not None:
+            lines.append(f"- 量比：{q.get('volume_ratio')}")
         if q.get("current_year_percent") is not None:
             lines.append(f"- 年初至今：{q.get('current_year_percent', 0):+.2f}%")
         lines.append("")
@@ -762,6 +758,26 @@ def render_text(data: dict) -> str:
                      else "52 周新高" if breakout.get("new_52w_high")
                      else "年内新高")
             lines.append(f"> 🚀 **重要提示**：今日已盘中**创出{level}**，处于强势突破阶段。")
+        # BOLL / 量价信号
+        boll_data = ph.get("boll") or {}
+        if boll_data:
+            lines.append("")
+            lines.append("### BOLL（布林带 20,2）")
+            lines.append(f"- 中轨：{boll_data.get('middle')}，上轨：{boll_data.get('upper')}，下轨：{boll_data.get('lower')}")
+            lines.append(f"- 带宽：{boll_data.get('bandwidth_pct')}%，现价位于带内 {boll_data.get('position_pct'):.1f}% 处")
+            squeeze_label = "⚠️ 带宽挤压（即将变盘）" if boll_data.get('squeeze') else "正常"
+            lines.append(f"- 波动率：{boll_data.get('volatility_pct')}%，挤压状态：{squeeze_label}")
+        vol_data = ph.get("volume") or {}
+        if vol_data and vol_data.get("label") not in (None, "insufficient"):
+            label_map = {
+                "rising_with_volume": "🟢 放量上涨（健康）",
+                "rising_shrinking": "🟡 缩量上涨（动能减弱）",
+                "falling_with_volume": "🔴 放量下跌（真实出货）",
+                "falling_shrinking": "🟡 缩量下跌（抛压不足）",
+                "sideways": "⚪️ 量价平",
+            }
+            vol_label = label_map.get(vol_data.get("label"), vol_data.get("label"))
+            lines.append(f"- **近 5 日量价配合**：{vol_label}（量比 {vol_data.get('vol_ratio')}，价格变动 {vol_data.get('price_5d_chg_pct'):+.2f}%）")
         lines.append("")
 
     # 主力资金动向（仅 A 股沪深 + 港股有数据；北交所 / 美股自动跳过本章节）

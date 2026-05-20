@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -729,6 +730,35 @@ class SPCTestCase(unittest.TestCase):
             f"sources={decision['sources']}",
         )
 
+    def test_fund_flow_sources_surface_xueqiu_fallback_warning(self):
+        """如果资金流降级到雪球，sources 里必须明确暴露来源和风险提示。"""
+        add_watch(self.conn, self.acct_id, "a", "300308", "")
+        ff = _ff(
+            regime="OSCILLATING",
+            m3=2.0,
+            m5=3.0,
+            m20=4.0,
+            main_today_yi=1.2,
+        )
+        ff["flow_source"] = "xueqiu_intraday_fallback"
+        ff["flow_label"] = "今日盘中累计（雪球兜底，东财盘中不可用，数据不完全准确），截至 2026-05-08T11:15:00+08:00"
+        ff["warnings"] = ["当前盘中资金流已降级为雪球兜底口径，数据不完全准确。"]
+        provider = FakeProvider(fund_flow_overrides={
+            ("a", "300308"): ff,
+        })
+
+        payload = analyze_now(self.conn, self.acct_id, self.acct_slug, self.acct_name, "watchlist", analysis_provider=provider)
+        decision = payload["results"][0]["decision"]
+
+        self.assertTrue(
+            any("fund_flow.source=xueqiu_intraday_fallback" == s for s in decision["sources"]),
+            f"sources={decision['sources']}",
+        )
+        self.assertTrue(
+            any("fund_flow.warning=" in s and "数据不完全准确" in s for s in decision["sources"]),
+            f"sources={decision['sources']}",
+        )
+
     def test_fund_flow_persistent_outflow_forces_avoid(self):
         """自选 + 强趋势 + 正向公告，但主力 20 日持续净流出 → 直接 avoid，不能 buy/focus。"""
         add_watch(self.conn, self.acct_id, "a", "300308", "")
@@ -1266,6 +1296,92 @@ class SPCTestCase(unittest.TestCase):
         cross = summary["cross_validation"]
         self.assertEqual(set(cross["periods"]), {"1d", "5d", "10d", "20d"})
         self.assertIn("verdict", cross)
+
+    def test_get_fund_flow_summary_prefers_eastmoney_intraday(self):
+        """盘中优先使用东财分时，不应静默混入雪球口径。"""
+        from stock_core.fund_flow import get_fund_flow_summary
+
+        today = datetime.now(CN_TZ).date().isoformat()
+        rows = [
+            {"date": "2026-05-18", "main": 1e8, "small": None, "mid": None, "big": None, "super_big": None,
+             "main_pct": None, "small_pct": None, "mid_pct": None, "big_pct": None, "super_big_pct": None,
+             "close": 100.0, "change_pct": 1.0},
+            {"date": "2026-05-19", "main": 2e8, "small": None, "mid": None, "big": None, "super_big": None,
+             "main_pct": None, "small_pct": None, "mid_pct": None, "big_pct": None, "super_big_pct": None,
+             "close": 101.0, "change_pct": 1.0},
+        ]
+        em_live = {
+            "date": today,
+            "main": -3e8,
+            "small": 1e8,
+            "mid": 1e8,
+            "big": -2e8,
+            "super_big": -1e8,
+            "main_pct": None,
+            "small_pct": None,
+            "mid_pct": None,
+            "big_pct": None,
+            "super_big_pct": None,
+            "close": None,
+            "change_pct": None,
+        }
+        xq_live = dict(em_live)
+        xq_live["main"] = 9e8
+
+        with (
+            mock.patch("stock_core.fund_flow.fetch_daily_fund_flow", return_value=rows),
+            mock.patch("stock_core.fund_flow._infer_today_flow_mode", return_value="intraday_live"),
+            mock.patch("stock_core.fund_flow._live_today_row_from_eastmoney", return_value=(em_live, f"{today}T11:20:00+08:00", [])),
+            mock.patch("stock_core.fund_flow._live_today_row_from_xueqiu", return_value=(xq_live, f"{today}T11:20:00+08:00", [])) as xq_mock,
+        ):
+            summary = get_fund_flow_summary("a", "000021")
+
+        self.assertEqual(summary["flow_source"], "eastmoney_intraday")
+        self.assertIn("东财分时", summary["flow_label"])
+        self.assertAlmostEqual(summary["today"]["main_yi"], -3.0)
+        xq_mock.assert_not_called()
+
+    def test_get_fund_flow_summary_marks_xueqiu_fallback(self):
+        """东财盘中不可用时，允许降级雪球，但必须显式打标并提示不完全准确。"""
+        from stock_core.fund_flow import get_fund_flow_summary
+
+        today = datetime.now(CN_TZ).date().isoformat()
+        rows = [
+            {"date": "2026-05-18", "main": 1e8, "small": None, "mid": None, "big": None, "super_big": None,
+             "main_pct": None, "small_pct": None, "mid_pct": None, "big_pct": None, "super_big_pct": None,
+             "close": 100.0, "change_pct": 1.0},
+            {"date": "2026-05-19", "main": 2e8, "small": None, "mid": None, "big": None, "super_big": None,
+             "main_pct": None, "small_pct": None, "mid_pct": None, "big_pct": None, "super_big_pct": None,
+             "close": 101.0, "change_pct": 1.0},
+        ]
+        xq_live = {
+            "date": today,
+            "main": 1.2e8,
+            "small": 0.1e8,
+            "mid": 0.2e8,
+            "big": 1.0e8,
+            "super_big": 0.2e8,
+            "main_pct": 1.5,
+            "small_pct": 0.1,
+            "mid_pct": 0.2,
+            "big_pct": 1.3,
+            "super_big_pct": 0.2,
+            "close": None,
+            "change_pct": None,
+        }
+
+        with (
+            mock.patch("stock_core.fund_flow.fetch_daily_fund_flow", return_value=rows),
+            mock.patch("stock_core.fund_flow._infer_today_flow_mode", return_value="intraday_live"),
+            mock.patch("stock_core.fund_flow._live_today_row_from_eastmoney", return_value=(None, None, ["东财盘中资金流不可用：test"])),
+            mock.patch("stock_core.fund_flow._live_today_row_from_xueqiu", return_value=(xq_live, f"{today}T11:21:00+08:00", [])),
+        ):
+            summary = get_fund_flow_summary("a", "000021")
+
+        self.assertEqual(summary["flow_source"], "xueqiu_intraday_fallback")
+        self.assertIn("雪球兜底", summary["flow_label"])
+        self.assertAlmostEqual(summary["today"]["main_yi"], 1.2)
+        self.assertTrue(any("数据不完全准确" in w for w in summary.get("warnings", [])))
 
 
 class SPCCrossValidationDecisionTestCase(SPCTestCase):
@@ -2710,6 +2826,105 @@ class SPCSelectTargetsTestCase(SPCTestCase):
         codes_analyzed = {r["code"] for r in payload["results"]}
         self.assertIn("000568", codes_analyzed,
                       "单标的 spot-check 应允许查询已清仓标的")
+
+    def test_watchlist_non_holding_skips_fund_flow_on_first_pass(self):
+        """普通自选先不拉资金流，若初判只是 watch，则不做二次复评。"""
+        add_watch(self.conn, self.acct_id, "a", "301391", "")
+
+        class DeferredFFProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                self.calls.append({"market": market, "code": code, "skip": skip})
+                quote = self.fetch_quote(market, code)
+                return {
+                    "fetched_at": quote["fetched_at"],
+                    "info": {"name": "卡莱特"},
+                    "quote": {"current": quote["current"], "percent": 0.5},
+                    "price_history": {"regime": "IN_RANGE"},
+                    "announcements": [],
+                    "peers": [],
+                    "concepts": [],
+                }
+
+        provider = DeferredFFProvider()
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "watch")
+        self.assertEqual(len(provider.calls), 1, provider.calls)
+        self.assertEqual(provider.calls[0]["skip"], "fund_flow")
+
+    def test_watchlist_non_holding_second_pass_fetches_fund_flow_for_candidate(self):
+        """自选初判若进入 buy/focus/probe 候选，应补资金流做二次复评。"""
+        add_watch(self.conn, self.acct_id, "a", "300308", "")
+
+        class DeferredFFProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                self.calls.append({"market": market, "code": code, "skip": skip})
+                quote = self.fetch_quote(market, code)
+                payload = {
+                    "fetched_at": quote["fetched_at"],
+                    "info": {"name": "中际旭创"},
+                    "quote": {"current": quote["current"], "percent": 3.2},
+                    "price_history": {"regime": "NEW_ALL_TIME_HIGH"},
+                    "announcements": [
+                        {"date": "2026-05-03", "title": "新品合作公告", "pdf_url": "https://example.com/b1.pdf"},
+                    ],
+                    "peers": [],
+                    "concepts": ["通信", "光模块"],
+                }
+                if skip != "fund_flow":
+                    payload["fund_flow"] = _ff(
+                        regime="PERSISTENT_OUTFLOW",
+                        m3=-4.0, m5=-8.0, m20=-22.0, main_today_yi=-2.5,
+                        super_big_yi=-1.8, big_yi=-0.7,
+                    )
+                return payload
+
+        provider = DeferredFFProvider()
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "avoid")
+        self.assertEqual(len(provider.calls), 2, provider.calls)
+        self.assertEqual(provider.calls[0]["skip"], "fund_flow")
+        self.assertEqual(provider.calls[1]["skip"], "")
+
+    def test_holdings_still_fetch_fund_flow_directly(self):
+        """持仓默认直接带资金流，不走无资金流初筛。"""
+        add_position_seed(self.conn, self.acct_id, "a", "300750", "1000", "245.30", None, "2026-05-01 09:30:00", "")
+
+        class DeferredFFProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                self.calls.append({"market": market, "code": code, "skip": skip})
+                return super().analyze(market, code, ann_days=ann_days, with_peers=with_peers, skip=skip)
+
+        provider = DeferredFFProvider()
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "holdings", analysis_provider=provider,
+        )
+
+        self.assertEqual(payload["results"][0]["code"], "300750")
+        self.assertTrue(provider.calls, "应至少分析一次持仓")
+        self.assertTrue(all(call["skip"] == "" for call in provider.calls), provider.calls)
 
 
 class SPCLLMReviewTestCase(SPCTestCase):

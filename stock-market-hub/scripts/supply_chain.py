@@ -32,6 +32,11 @@ if str(_SHARED) not in sys.path:
     sys.path.insert(0, str(_SHARED))
 
 from stock_core.http import fetch  # noqa: E402
+from stock_core.eastmoney import (  # noqa: E402
+    eastmoney_a_code,
+    fetch_a_core_conception_raw,
+    fetch_board_constituents,
+)
 from stock_core.tz import CN_TZ  # noqa: E402
 from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
@@ -146,23 +151,12 @@ def _get_board_constituents_em(board_code: str, top: int = 30) -> list[str]:
 
     board_code: 'BK1033'（电池）等
     """
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1, "pz": top, "po": 1, "np": 1,
-        "fields": "f12,f14,f3,f6,f20",
-        "fs": f"b:{board_code}",
-    }
     try:
-        from stock_core.http import fetch as _fetch
-        r = _fetch(url, params=params, timeout=10, retries=1)
-        data = r.json()
+        rows = fetch_board_constituents(board_code)
     except Exception as e:  # noqa: BLE001
         print(f"[supply_chain] em board {board_code} failed: {e}", file=sys.stderr)
         return []
-    rows = (data.get("data") or {}).get("diff") or {}
-    if isinstance(rows, dict):
-        rows = list(rows.values())
-    return [row.get("f12") for row in rows if row.get("f12")]
+    return rows[:top]
 
 
 def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
@@ -179,19 +173,9 @@ def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
         return []
 
     # 直接用东财 ssbk 拿所属板块（含 BOARD_CODE，可直接查成分股）
-    if code.startswith("6"):
-        em_code = f"SH{code}"
-    elif code.startswith(("4", "8")):
-        em_code = f"BJ{code}"
-    else:
-        em_code = f"SZ{code}"
+    em_code = eastmoney_a_code(code)
     try:
-        from stock_core.http import fetch as _fetch
-        r = _fetch(
-            f"https://emweb.securities.eastmoney.com/PC_HSF10/CoreConception/PageAjax?code={em_code}",
-            timeout=10, retries=1,
-        )
-        f10 = r.json()
+        f10 = fetch_a_core_conception_raw(em_code)
     except Exception as e:  # noqa: BLE001
         print(f"[supply_chain] em F10 failed: {e}", file=sys.stderr)
         return []

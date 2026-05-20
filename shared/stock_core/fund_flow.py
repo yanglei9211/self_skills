@@ -1,6 +1,6 @@
-"""个股主力资金流：东方财富 fflow kline 接口。
+"""个股主力资金流：优先东方财富，必要时显式降级雪球。
 
-为什么用东财而不是雪球？
+为什么主用东财而不是雪球？
   - 雪球 screener 的 ``main_net_inflows`` 只有"今日累计"一个数字，无分层、无历史
   - 东财 ``push2his.eastmoney.com/api/qt/stock/fflow/kline/get`` 提供：
         近 ~120 个交易日的逐日「主力 / 超大单 / 大单 / 中单 / 小单」净额
@@ -23,6 +23,14 @@
     上层 ``_render_text`` 和决策树都已能容忍 6 列输入（缺的字段为 ``None``），
     因此 fallback 安全；只是 ``render_analysis_text`` 的 "当日资金分层占比" 表
     在走 kline 路径时会显示 "-"。
+
+盘中优先级（2026-05-20 起）：
+  1. 东方财富分时资金流（push2 ``fflow/kline/get`` + ``klt=1``）
+  2. 东方财富日资金流（上一交易日完整 / 收盘后当天最终日线）
+  3. 雪球 ``capital/assort`` 仅作为 **显式兜底**
+     - 只在 A 股且东财盘中分时不可用时使用
+     - 必须在输出里明确标注“雪球兜底，数据不完全准确”
+     - 不允许静默把雪球口径混成东财口径给上游决策
 
 字段对应（接口返回 ``klines`` 的逗号分隔字符串）：
   f51 日期 / f52 主力净额(元) / f53 小单 / f54 中单 / f55 大单 / f56 超大单
@@ -51,6 +59,7 @@ _FFLOW_URLS: tuple[str, ...] = (
     # 备用路径：kline（6 列）—— 2026-05 初切上来的，目前被反爬封禁
     "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get",
 )
+_FFLOW_INTRADAY_URL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
 # 仍按 13 列向后端要，6 列路径解析层会容忍少列。
 _FFLOW_FIELDS1 = "f1,f2,f3,f7"
 _FFLOW_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
@@ -110,13 +119,15 @@ def _infer_today_flow_mode(market: str, now: datetime) -> str:
     return "today_close"
 
 
-def _flow_label(flow_mode: str, flow_as_of: str | None) -> str:
+def _flow_label(flow_mode: str, flow_as_of: str | None, flow_source: str | None = None) -> str:
     as_of = flow_as_of or "-"
+    if flow_source == "xueqiu_intraday_fallback":
+        return f"今日盘中累计（雪球兜底，东财盘中不可用，数据不完全准确），截至 {as_of}"
     if flow_mode == "intraday_live":
-        return f"今日盘中累计，截至 {as_of}"
+        return f"今日盘中累计（东财分时），截至 {as_of}"
     if flow_mode == "today_close":
-        return f"今日收盘资金流，截至 {as_of}"
-    return f"上一交易日完整资金流，截至 {as_of}"
+        return f"今日收盘资金流（东财日线），截至 {as_of}"
+    return f"上一交易日完整资金流（东财日线），截至 {as_of}"
 
 
 def _ttl_for_moment(market: str, now: datetime) -> float:
@@ -158,6 +169,8 @@ def _ttl_for_call(market: str, code: str, cached_data: list[dict] | None = None)
     if cached_data:
         last_date = str((cached_data[-1] or {}).get("date") or "")
         today = now.date().isoformat()
+        if " " in last_date:
+            last_date = last_date.split(" ", 1)[0]
         if last_date and last_date != today:
             return 4 * 3600.0
     return _ttl_for_moment(market, now)
@@ -246,6 +259,29 @@ def fetch_daily_fund_flow(market: str, code: str) -> list[dict]:
     if last_err is not None:
         raise last_err
     return []
+
+
+@cached(
+    ttl=lambda market, code: _ttl_for_moment(market, datetime.now(CN_TZ)),
+    key_prefix="ffi",
+    schema_version=1,
+)
+def fetch_intraday_fund_flow(market: str, code: str) -> list[dict]:
+    """拉东财分时资金流（分钟级累计）。"""
+    secid = eastmoney_secid(market, code)
+    params = {
+        "lmt": 0,
+        "klt": 1,
+        "fields1": _FFLOW_FIELDS1,
+        "fields2": _FFLOW_FIELDS2,
+        "secid": secid,
+        "ut": _FFLOW_UT,
+    }
+    r = fetch(_FFLOW_INTRADAY_URL, params=params, timeout=10)
+    payload = r.json() or {}
+    klines = ((payload.get("data") or {}).get("klines") or [])
+    rows = [_parse_kline_row(k) for k in klines]
+    return [row for row in rows if row is not None and row.get("date")]
 
 
 def _to_yi(value: float | None) -> float | None:
@@ -622,6 +658,81 @@ def _xueqiu_symbol(market: str, code: str) -> str | None:
     return None  # 北交所 4/8 也跳过
 
 
+def _normalize_flow_timestamp(date_text: str | None) -> tuple[str | None, str | None]:
+    """把日线 / 分时日期统一拆成 ``(YYYY-MM-DD, ISO时间戳)``。"""
+    if not date_text:
+        return None, None
+    raw = str(date_text).strip()
+    try:
+        if " " in raw:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=CN_TZ)
+            return dt.date().isoformat(), dt.isoformat()
+        dt = datetime.fromisoformat(raw).replace(tzinfo=CN_TZ)
+        return dt.date().isoformat(), dt.isoformat()
+    except ValueError:
+        if " " in raw:
+            return raw.split(" ", 1)[0], None
+        return raw, None
+
+
+def _validate_flow_balance(row: dict[str, Any]) -> bool:
+    """校验资金流分档平衡：主力/中单/小单不能全部同号。
+
+    每一笔成交都有买卖双方，三个档位（主力=超大+大单、中单、小单）
+    的净额加起来应趋近于 0。三个档位全部同号（全正或全负）在物理上
+    不可能，说明接口返回了垃圾数据（多见于港股 push2.eastmoney.com
+    分时接口字段映射错误）。
+    """
+    main = row.get("main")
+    mid = row.get("mid")
+    small = row.get("small")
+    if main is None or mid is None or small is None:
+        return False  # 缺字段，不可靠
+    if main > 0 and mid > 0 and small > 0:
+        return False
+    if main < 0 and mid < 0 and small < 0:
+        return False
+    return True
+
+
+def _live_today_row_from_eastmoney(
+    market: str,
+    code: str,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """优先实时主源：东财分时累计资金流最后一个分钟点。
+
+    港股 push2.eastmoney.com 分时接口字段映射不可靠，会返回全正/全负
+    的物理不可能数据，因此增加 _validate_flow_balance 校验；
+    校验失败时自动拒绝，由上层 fallback 到雪球兜底或上一交易日。
+    """
+    warnings: list[str] = []
+    try:
+        rows = fetch_intraday_fund_flow(market, code)
+    except Exception as e:  # noqa: BLE001
+        warnings.append(f"东财盘中资金流不可用：{e}")
+        return None, None, warnings
+    if not rows:
+        warnings.append("东财盘中资金流接口返回空。")
+        return None, None, warnings
+
+    last = rows[-1]
+    today_date, timestamp_iso = _normalize_flow_timestamp(last.get("date"))
+    if not today_date:
+        warnings.append("东财盘中资金流最后一条时间戳缺失。")
+        return None, None, warnings
+    row = dict(last)
+    row["date"] = today_date
+
+    if not _validate_flow_balance(row):
+        warnings.append(
+            "东财盘中资金流分档失衡（主力/中单/小单全同号，物理不可能），"
+            "疑似接口字段映射错误，已拒绝此数据。"
+        )
+        return None, None, warnings
+
+    return row, timestamp_iso, warnings
+
+
 def _live_today_row_from_xueqiu(
     market: str,
     code: str,
@@ -794,16 +905,7 @@ def _enrich_with_xueqiu_assort(summary: dict[str, Any], market: str, code: str,
 
 
 def get_fund_flow_summary(market: str, code: str) -> dict[str, Any]:
-    """组合调用：拉东财日 K + 生成摘要 + 雪球 assort 补全字段。
-
-    数据源分工：
-      - 东财 ``fflow/kline/get``：主源，提供 ~120 天主力净额 + 4 分层金额 → rolling/regime/reversal
-      - 雪球 ``capital/assort.json``：A 股 + 有 cookie 时补全当日的占比 + 4 分层档位金额
-      - 港股 / 北交所 / 无 cookie：只跑东财主源，summary['today'] 的占比和分层档位为 None
-
-    失败时返回带 ``error`` 字段的占位字典；雪球 cookie 过期会在 ``warnings`` 列出，
-    不阻塞主流程（决策树仍能正常工作）。
-    """
+    """组合调用：东财日线 + 东财分时优先 + 雪球显式兜底。"""
     now = datetime.now(CN_TZ)
     flow_mode = _infer_today_flow_mode(market, now)
 
@@ -816,29 +918,68 @@ def get_fund_flow_summary(market: str, code: str) -> dict[str, Any]:
     effective_rows = rows
     flow_as_of = _market_close_stamp(market, rows[-1].get("date") or "")
     warnings: list[str] = []
+    today = now.date().isoformat()
+    have_today_daily_row = bool(rows and rows[-1].get("date") == today)
+    flow_source = "eastmoney_previous_close"
 
-    if flow_mode != "previous_close":
-        live_row, live_ts, live_warnings = _live_today_row_from_xueqiu(market, code)
+    if flow_mode == "intraday_live":
+        live_row, live_ts, live_warnings = _live_today_row_from_eastmoney(market, code)
         warnings.extend(live_warnings)
         if live_row is not None:
+            flow_source = "eastmoney_intraday"
             today_date = live_row["date"]
             if rows and rows[-1].get("date") == today_date:
                 effective_rows = rows[:-1] + [live_row]
             else:
                 effective_rows = rows + [live_row]
             flow_as_of = live_ts or now.isoformat()
-        elif rows[-1].get("date") == now.date().isoformat():
+        else:
+            live_row, live_ts, live_warnings = _live_today_row_from_xueqiu(market, code)
+            warnings.extend(live_warnings)
+            if live_row is not None:
+                flow_source = "xueqiu_intraday_fallback"
+                warnings.append("当前盘中资金流已降级为雪球兜底口径，数据不完全准确。")
+                today_date = live_row["date"]
+                if rows and rows[-1].get("date") == today_date:
+                    effective_rows = rows[:-1] + [live_row]
+                else:
+                    effective_rows = rows + [live_row]
+                flow_as_of = live_ts or now.isoformat()
+            else:
+                flow_mode = "previous_close"
+                flow_source = "eastmoney_previous_close"
+                warnings.append("东财盘中资金流不可用，雪球兜底也不可用；已回退到上一交易日完整资金流。")
+    elif flow_mode == "today_close":
+        if have_today_daily_row:
+            flow_source = "eastmoney_today_close"
             flow_as_of = _market_close_stamp(market, rows[-1].get("date") or "") or now.isoformat()
         else:
-            flow_mode = "previous_close"
-            warnings.append("今日资金流实时口径暂不可用，已回退到上一交易日完整资金流。")
+            live_row, live_ts, live_warnings = _live_today_row_from_eastmoney(market, code)
+            warnings.extend(live_warnings)
+            if live_row is not None:
+                flow_source = "eastmoney_intraday"
+                effective_rows = rows + [live_row]
+                flow_as_of = live_ts or now.isoformat()
+            else:
+                live_row, live_ts, live_warnings = _live_today_row_from_xueqiu(market, code)
+                warnings.extend(live_warnings)
+                if live_row is not None:
+                    flow_source = "xueqiu_intraday_fallback"
+                    warnings.append("东财收盘日线尚未刷新，暂用雪球盘中资金兜底，数据不完全准确。")
+                    effective_rows = rows + [live_row]
+                    flow_as_of = live_ts or now.isoformat()
+                else:
+                    flow_mode = "previous_close"
+                    flow_source = "eastmoney_previous_close"
+                    warnings.append("东财收盘日线尚未刷新，实时兜底也不可用；已回退到上一交易日完整资金流。")
 
     summary = summarize_fund_flow(effective_rows)
     summary["rolling_as_of"] = summary.get("as_of")
     summary["fetched_at"] = now.isoformat()
     summary["flow_mode"] = flow_mode
+    summary["flow_source"] = flow_source
     summary["flow_as_of"] = flow_as_of
-    summary["flow_label"] = _flow_label(flow_mode, flow_as_of)
+    summary["flow_label"] = _flow_label(flow_mode, flow_as_of, flow_source)
     if warnings:
         summary.setdefault("warnings", [])
         summary["warnings"].extend(warnings)
