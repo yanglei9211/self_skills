@@ -16,6 +16,7 @@ K 线数据 + 历史价位统计（基于腾讯免费接口）。
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from datetime import datetime
@@ -157,6 +158,123 @@ def fetch_daily_kline(symbol: str, market: str, count: int = 1500) -> list[dict]
     return out
 
 
+def compute_bollinger_bands(
+    kline: list[dict],
+    period: int = 20,
+    multiplier: float = 2.0,
+    lookback: int = 60,
+) -> dict | None:
+    """计算 BOLL 指标。返回带宽、当前位置、是否挤压。
+
+    返回字段：
+      middle:         MA(period) 中轨
+      upper:          middle + multiplier * std
+      lower:          middle - multiplier * std
+      bandwidth_pct:  (upper - lower) / middle * 100  —— 带宽百分比
+      position_pct:   当前收盘价在带内的相对位置（0=下轨, 100=上轨）
+      squeeze:        当前带宽是否处于 lookback 日内的最低位（即将变盘）
+      volatility_pct: std / middle * 100（年化前日波动率）
+
+    kline 不足 period 根时返回 None。
+    """
+    if len(kline) < period:
+        return None
+    close_prices = [k["close"] for k in kline[-lookback:]] if len(kline) >= lookback else [k["close"] for k in kline]
+    recent = close_prices[-period:]
+    middle_val = sum(recent) / period
+    if middle_val <= 0:
+        return None
+    variance = sum((c - middle_val) ** 2 for c in recent) / period
+    std_val = math.sqrt(variance)
+    upper = middle_val + multiplier * std_val
+    lower = middle_val - multiplier * std_val
+    bandwidth_pct = (upper - lower) / middle_val * 100
+    current_close = close_prices[-1]
+    position_pct = (current_close - lower) / (upper - lower) * 100 if upper > lower else 50.0
+    position_pct = max(0.0, min(100.0, position_pct))
+
+    squeeze = False
+    if len(close_prices) >= lookback:
+        historical_bandwidths = []
+        for i in range(period, len(close_prices) + 1):
+            window = close_prices[i - period:i]
+            m = sum(window) / period
+            if m <= 0:
+                continue
+            v = sum((c - m) ** 2 for c in window) / period
+            s = math.sqrt(v)
+            bw = (m + multiplier * s - (m - multiplier * s)) / m * 100
+            historical_bandwidths.append(bw)
+        if historical_bandwidths:
+            min_bw = min(historical_bandwidths)
+            squeeze = bandwidth_pct <= min_bw * 1.05
+
+    volatility_pct = std_val / middle_val * 100
+
+    return {
+        "middle": round(middle_val, 4),
+        "upper": round(upper, 4),
+        "lower": round(lower, 4),
+        "bandwidth_pct": round(bandwidth_pct, 2),
+        "position_pct": round(position_pct, 1),
+        "squeeze": squeeze,
+        "volatility_pct": round(volatility_pct, 2),
+    }
+
+
+def compute_volume_analysis(kline: list[dict]) -> dict | None:
+    """量价关系分析。返回成交量趋势、量价配合判断。
+
+    返回字段：
+      vol_5d_avg:       近 5 日均量
+      vol_20d_avg:      近 20 日均量
+      vol_ratio:        近 5 日均量 / 近 20 日均量
+      price_5d_chg_pct: 近 5 日价格涨跌
+      label:            量价配合标签（见下文）
+      recent_days:      可用数据天数
+
+    label 可选值：
+      rising_with_volume:  放量上涨（最健康）
+      rising_shrinking:    缩量上涨（动能减弱，警惕）
+      falling_with_volume: 放量下跌（真实出货，最危险）
+      falling_shrinking:   缩量下跌（抛压不足，可能是假摔）
+      sideways:            量价平（无明显方向）
+      insufficient:        数据不足
+    """
+    if len(kline) < 5:
+        return {"label": "insufficient", "recent_days": len(kline)}
+    recent_5 = kline[-5:]
+    recent_20 = kline[-20:] if len(kline) >= 20 else kline
+    vol_5 = [k.get("volume", 0) for k in recent_5]
+    vol_20 = [k.get("volume", 0) for k in recent_20]
+    avg_vol_5 = sum(vol_5) / len(vol_5) if vol_5 else 0
+    avg_vol_20 = sum(vol_20) / len(vol_20) if vol_20 else 0
+    vol_ratio_val = avg_vol_5 / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    price_5d_chg = (kline[-1]["close"] / kline[-5]["close"] - 1) * 100 if len(kline) >= 5 and kline[-5]["close"] > 0 else 0
+    price_up = price_5d_chg > 1.0
+    price_down = price_5d_chg < -1.0
+    vol_expanding = vol_ratio_val > 1.2
+    vol_shrinking = vol_ratio_val < 0.8
+    if vol_expanding and price_up:
+        label = "rising_with_volume"
+    elif vol_shrinking and price_up:
+        label = "rising_shrinking"
+    elif vol_expanding and price_down:
+        label = "falling_with_volume"
+    elif vol_shrinking and price_down:
+        label = "falling_shrinking"
+    else:
+        label = "sideways"
+    return {
+        "label": label,
+        "vol_5d_avg": round(avg_vol_5, 0),
+        "vol_20d_avg": round(avg_vol_20, 0),
+        "vol_ratio": round(vol_ratio_val, 2),
+        "price_5d_chg_pct": round(price_5d_chg, 2),
+        "recent_days": len(kline),
+    }
+
+
 def summarize_price_history(kline: list[dict], current_price: float | None = None) -> dict:
     """
     输出结构化的"历史价位摘要"，专门给 agent/LLM 写技术分析时提供事实依据。
@@ -170,6 +288,8 @@ def summarize_price_history(kline: list[dict], current_price: float | None = Non
       position:        当前价相对：年内高/低、历史 52w 高/低、历史最低/最高 的相对位置 % + 绝对差
       regime:          'NEAR_YTD_HIGH' / 'NEAR_YTD_LOW' / 'IN_RANGE' / 'NEW_LOW' / 'NEW_HIGH'
       breakout:        当前价是否盘中创出 YTD 新低/新高（True/False + 类型）
+      boll:            BOLL(20,2) 指标 {middle, upper, lower, bandwidth_pct, position_pct, squeeze, volatility_pct}
+      volume:          量价分析 {label, vol_5d_avg, vol_20d_avg, vol_ratio, price_5d_chg_pct, recent_days}
     """
     if not kline:
         return {"error": "kline empty"}
@@ -343,5 +463,13 @@ def summarize_price_history(kline: list[dict], current_price: float | None = Non
         else:
             regime = "IN_RANGE"
     out["regime"] = regime
+
+    boll = compute_bollinger_bands(kline)
+    if boll:
+        out["boll"] = boll
+
+    vol = compute_volume_analysis(kline)
+    if vol:
+        out["volume"] = vol
 
     return out

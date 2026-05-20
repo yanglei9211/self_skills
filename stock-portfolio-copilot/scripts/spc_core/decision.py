@@ -22,7 +22,7 @@ from spc_core.utils import (
 
 
 RISK_KEYWORDS = ("立案", "处罚", "诉讼", "减持", "退市", "停牌", "风险", "问询", "亏损", "爆雷")
-POSITIVE_KEYWORDS = ("回购", "增持", "中标", "分红", "合作", "增长", "预增", "扭亏", "新品")
+POSITIVE_KEYWORDS = ("回购", "增持", "中标", "分红", "合作", "增长", "预增", "扭亏", "新品", "获批", "獲批", "临床试验", "臨床試驗", "新药", "新藥")
 LOW_REGIMES = {"NEW_YTD_LOW", "NEW_52W_LOW", "NEW_ALL_TIME_LOW"}
 HIGH_REGIMES = {"NEW_YTD_HIGH", "NEW_52W_HIGH", "NEW_ALL_TIME_HIGH"}
 # 中间区间：既不创新低也不创新高的"非破位非右侧追高"位置。
@@ -62,6 +62,7 @@ ACTION_DESCRIPTIONS = {
     "trim": "仓位、风险、止盈或价格结构触发减仓条件",
     "watch": "继续跟踪，等待更清晰的触发条件",
 }
+WATCHLIST_FUND_FLOW_SECOND_PASS_ACTIONS = {"focus", "buy", "probe"}
 
 # ─────────────────────────────────────────────────────────────────
 # P0/P1/P2 持仓侧策略默认参数
@@ -207,6 +208,19 @@ def _extract_security_name(analysis: dict) -> str:
     return str(info.get("公司名称") or info.get("中文名称") or "").strip()
 
 
+def _extract_lot_size(analysis: dict) -> int | None:
+    """从 company info 提取每手股数（港股关键约束，A 股固定 100）。"""
+    info = analysis.get("info") or {}
+    for key in ("最小交易单位", "每手股数", "board_lot", "lot_size"):
+        val = info.get(key)
+        if val is not None:
+            try:
+                return int(str(val).replace(",", ""))
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
 def _select_targets(conn, account_id: int, scope: str, market: str | None, code: str | None) -> list[tuple[str, str, str]]:
     """挑出本次 analyze 要跑的标的。
 
@@ -319,6 +333,15 @@ class Features:
     last_trim_time: str | None = None
     # 持仓豁免硬止损（P0a / L4），用于历史遗留深套仓位等场景
     exempt_hard_stop: bool = False
+    # ── BOLL 布林带（一级：价格+波动率）──
+    boll_bandwidth_pct: float | None = None  # 带宽百分比，反映波动率状态
+    boll_position_pct: float | None = None   # 现价在带内相对位置（0=下轨，100=上轨）
+    boll_squeeze: bool = False               # 带宽挤压（即将变盘）
+    boll_volatility_pct: float | None = None # 日波动率 %
+    # ── 量价配合（一级：量+价）──
+    volume_ratio: float | None = None        # 量比（当日量 / 5 日均量，来自 quote，可能为 None）
+    volume_kline_ratio: float | None = None  # 量比（5 日均量 / 20 日均量，来自 kline 分析，更稳定）
+    volume_price_label: str | None = None    # 近 5 日量价配合标签（来自 kline volume 分析）
 
 
 def _extract_features(
@@ -392,6 +415,25 @@ def _extract_features(
     attention_level = attention.get("level") if isinstance(attention, dict) else None
     attention_crowded = bool(attention.get("crowded")) if isinstance(attention, dict) else False
 
+    # BOLL / 量价（一级信号）
+    boll_data = price_history.get("boll") or {}
+    vol_data = price_history.get("volume") or {}
+    boll_bandwidth_pct = boll_data.get("bandwidth_pct") if isinstance(boll_data, dict) else None
+    boll_position_pct = boll_data.get("position_pct") if isinstance(boll_data, dict) else None
+    boll_squeeze = bool(boll_data.get("squeeze")) if isinstance(boll_data, dict) else False
+    boll_volatility_pct = boll_data.get("volatility_pct") if isinstance(boll_data, dict) else None
+    volume_ratio_val = quote.get("volume_ratio")
+    try:
+        volume_ratio_val = float(volume_ratio_val) if volume_ratio_val is not None else None
+    except (TypeError, ValueError):
+        volume_ratio_val = None
+    volume_price_label = vol_data.get("label") if isinstance(vol_data, dict) else None
+    volume_kline_ratio_val = vol_data.get("vol_ratio") if isinstance(vol_data, dict) else None
+    try:
+        volume_kline_ratio_val = float(volume_kline_ratio_val) if volume_kline_ratio_val is not None else None
+    except (TypeError, ValueError):
+        volume_kline_ratio_val = None
+
     return Features(
         market=target_market,
         code=target_code,
@@ -434,6 +476,13 @@ def _extract_features(
         last_trim_price=last_trim_price,
         last_trim_time=last_trim_time,
         exempt_hard_stop=exempt_hard_stop,
+        boll_bandwidth_pct=boll_bandwidth_pct,
+        boll_position_pct=boll_position_pct,
+        boll_squeeze=boll_squeeze,
+        boll_volatility_pct=boll_volatility_pct,
+        volume_ratio=volume_ratio_val,
+        volume_kline_ratio=volume_kline_ratio_val,
+        volume_price_label=volume_price_label,
     )
 
 
@@ -567,11 +616,73 @@ def _collect_attention_signals(f: Features) -> tuple[list[str], list[str]]:
     return reasons, risks
 
 
+def _collect_boll_signals(f: Features) -> tuple[list[str], list[str]]:
+    """BOLL 布林带信号（二级：趋势确认 + 波动率维度）。
+
+    不直接触发 action，只贡献 reasons/risks 文案：
+    - squeeze（带宽挤压）：即将变盘，方向不确定 → 对 buy/add 信号降 confidence 的提示
+    - 上轨附近（position > 80）+ 放量：强势突破确认 → 正向
+    - 下轨附近（position < 20）+ 缩量：可能触底 → 反转关注
+    - 带宽扩张 + 趋势同向：趋势健康
+    """
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.boll_bandwidth_pct is None:
+        return reasons, risks
+    boll_info = f"（BOLL 带宽 {f.boll_bandwidth_pct:.1f}%"
+    if f.boll_position_pct is not None:
+        boll_info += f"，现价位于带内 {f.boll_position_pct:.0f}%"
+    boll_info += "）"
+    if f.boll_squeeze:
+        risks.append(f"BOLL 带宽处于近期低位（{f.boll_bandwidth_pct:.1f}%），即将变盘，方向不确定{boll_info}")
+    if f.boll_position_pct is not None and f.boll_position_pct > 80 and f.regime in HIGH_REGIMES:
+        reasons.append(f"BOLL 现价接近上轨 + 价格创新高，趋势强势{boll_info}")
+    elif f.boll_position_pct is not None and f.boll_position_pct < 20 and f.regime in LOW_REGIMES:
+        risks.append(f"BOLL 现价接近下轨 + 价格破位，弱势延续{boll_info}")
+    elif f.boll_position_pct is not None and f.boll_position_pct < 20:
+        reasons.append(f"BOLL 现价接近下轨，可能形成技术反弹支撑{boll_info}")
+    return reasons, risks
+
+
+def _collect_volume_signals(f: Features) -> tuple[list[str], list[str]]:
+    """量价配合信号（一级：量 + 价）。
+
+    label 可选值及其含义：
+      rising_with_volume:  放量上涨 → 突破有效，趋势健康
+      rising_shrinking:    缩量上涨 → 动能减弱，警惕假突破
+      falling_with_volume: 放量下跌 → 真实出货，最危险信号
+      falling_shrinking:   缩量下跌 → 抛压不足，可能是假摔
+      sideways:            量价平 → 无明显方向
+
+    不直接触发 action，但可通过 P1b 软提示影响决策：
+    - falling_with_volume + regime 破位 → 加重 trim/sell 风险提示
+    - rising_shrinking → 不建议追买（提示动能减弱）
+    """
+    reasons: list[str] = []
+    risks: list[str] = []
+    if f.volume_price_label is None:
+        return reasons, risks
+    label = f.volume_price_label
+    display_ratio = f.volume_ratio if f.volume_ratio is not None else f.volume_kline_ratio
+    vol_ratio_str = f"量比 {display_ratio:.1f}" if display_ratio is not None else ""
+    if label == "rising_with_volume":
+        reasons.append(f"近 5 日放量上涨（{vol_ratio_str}），量价配合健康，趋势确认有效")
+    elif label == "rising_shrinking":
+        risks.append(f"近 5 日缩量上涨（{vol_ratio_str}），动能减弱，追高风险加大")
+    elif label == "falling_with_volume":
+        risks.append(f"近 5 日放量下跌（{vol_ratio_str}），真实出货信号，不宜抄底")
+    elif label == "falling_shrinking":
+        reasons.append(f"近 5 日缩量下跌（{vol_ratio_str}），抛压不足，可能是假摔，关注企稳信号")
+    return reasons, risks
+
+
 _SIGNAL_COLLECTORS = (
     _collect_macro_signals,
     _collect_price_signals,
     _collect_announcement_signals,
     _collect_fund_flow_signals,
+    _collect_boll_signals,
+    _collect_volume_signals,
     _collect_news_signals,
     _collect_sector_signals,
     _collect_attention_signals,
@@ -1458,8 +1569,11 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
 
     sources.append(f"price_history.regime={f.regime or '-'}")
     if f.ff_available:
+        fund_flow = analysis.get("fund_flow") or {}
         if f.ff_time_label:
             sources.append(f"fund_flow.time={f.ff_time_label}")
+        if fund_flow.get("flow_source"):
+            sources.append(f"fund_flow.source={fund_flow.get('flow_source')}")
         def _fmt(v: float | None) -> str:
             return "-" if v is None else f"{v:+.2f}yi"
         sources.append(
@@ -1476,6 +1590,8 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
                 f"fund_flow.cross_validation={verdict} "
                 f"(reversal_confirmed={confirmed}, short_long_conflict={conflict})"
             )
+        for warning in (fund_flow.get("warnings") or [])[:2]:
+            sources.append(f"fund_flow.warning={warning}")
     if f.market_regime is not None:
         sources.append(f"market_regime={f.market_regime}")
     # ── Enrichment 维度（v1） ──
@@ -1497,6 +1613,18 @@ def _build_sources(analysis: dict, f: Features) -> list[str]:
             f"xueqiu_attention.followers={f.attention_followers/10000:.1f}wan "
             f"(level={f.attention_level}, crowded={f.attention_crowded})"
         )
+    if f.boll_bandwidth_pct is not None:
+        sources.append(
+            f"boll.bandwidth={f.boll_bandwidth_pct:.1f}% "
+            f"pos={f.boll_position_pct:.0f}% "
+            f"squeeze={f.boll_squeeze} "
+            f"vol={f.boll_volatility_pct:.1f}%"
+            if f.boll_position_pct is not None and f.boll_volatility_pct is not None
+            else f"boll.bandwidth={f.boll_bandwidth_pct:.1f}%"
+        )
+    if f.volume_price_label is not None:
+        _vr = f.volume_ratio if f.volume_ratio is not None else f.volume_kline_ratio
+        sources.append(f"volume_price.label={f.volume_price_label} (ratio={_vr})")
     return sources
 
 
@@ -2073,9 +2201,20 @@ def analyze_now(
             market_regime_label[mkt] = None
 
     for tgt_market, tgt_code, tgt_scope in targets:
-        analysis = provider.analyze(tgt_market, tgt_code, with_peers=(tgt_market == "a"))
-        analysis_cache[(tgt_market, tgt_code)] = analysis
         snapshot = snapshots.get((tgt_market, tgt_code))
+        is_live_holding = (
+            snapshot is not None
+            and to_decimal(snapshot.get("qty") or "0", "snapshot.qty") > 0
+        )
+        should_stage_watchlist = not is_live_holding
+
+        analyze_kwargs = {
+            "with_peers": (tgt_market == "a"),
+        }
+        if should_stage_watchlist:
+            analysis = provider.analyze(tgt_market, tgt_code, skip="fund_flow", **analyze_kwargs)
+        else:
+            analysis = provider.analyze(tgt_market, tgt_code, **analyze_kwargs)
 
         # P2a: 查 execution_plan 上的预案价位（仅持仓侧用）
         plan_stop_loss = None
@@ -2145,6 +2284,33 @@ def analyze_now(
             exempt_hard_stop=exempt_hard_stop,
         )
 
+        # 非持仓（自选 / single 的 qty=0 场景）先做无资金流初筛；
+        # 只有进入关注名单时才补资金流做二次复评，减少东财接口消耗。
+        if (
+            should_stage_watchlist
+            and decision["action"] in WATCHLIST_FUND_FLOW_SECOND_PASS_ACTIONS
+        ):
+            analysis = provider.analyze(tgt_market, tgt_code, **analyze_kwargs)
+            decision = _decision_from_analysis(
+                tgt_market,
+                tgt_code,
+                snapshot,
+                analysis,
+                capital_total,
+                max_single_pct,
+                market_regime=market_regime_label.get(tgt_market),
+                peak_price=peak_price,
+                plan_stop_loss_price=plan_stop_loss,
+                plan_take_profit_price=plan_take_profit,
+                last_trim_tier=last_trim_tier,
+                last_trim_price=last_trim_price,
+                last_trim_time=last_trim_time,
+                decision_params=decision_params,
+                exempt_hard_stop=exempt_hard_stop,
+            )
+
+        analysis_cache[(tgt_market, tgt_code)] = analysis
+
         # ── P0a 分档幂等性：根据本次 trace 维护 last_trim_tier 状态 ──
         # 触发或升档时：写入新 tier；浮亏回升至 T1 以下时：清空
         if snapshot is not None and peak_row is not None:
@@ -2167,6 +2333,7 @@ def analyze_now(
                     "last_price": analysis.get("quote", {}).get("current"),
                     "change_pct": analysis.get("quote", {}).get("percent"),
                     "as_of": analysis.get("fetched_at"),
+                    "lot_size": _extract_lot_size(analysis),
                 },
                 "decision": decision,
             }
@@ -2285,12 +2452,29 @@ def render_analysis_text(payload: dict) -> str:
             if md.get("change_pct") is not None:
                 price_str += f"（{'涨' if float(md['change_pct']) >= 0 else '跌'}{abs(float(md['change_pct'])):.2f}%）"
             lines.append(price_str)
+        if md.get("lot_size") and md["lot_size"] != 100:
+            lines.append(f"每手：{md['lot_size']} 股")
         if md.get("as_of"):
             lines.append(f"时间：截至 {md['as_of']}")
         if position:
             lines.append(
                 f"持仓：{position.get('qty')} 股，摊薄成本 {position.get('avg_cost_price')} {position.get('currency')}"
             )
+            # 用实时报价重算浮盈，避免展示快照里的旧盈亏和实时价格并列造成混淆
+            qty_val = position.get("qty")
+            cost_val = position.get("avg_cost_price")
+            lp_val = md.get("last_price")
+            if qty_val is not None and cost_val is not None and lp_val is not None:
+                try:
+                    _q = Decimal(str(qty_val))
+                    _c = Decimal(str(cost_val))
+                    _lp = Decimal(str(lp_val))
+                    _pnl = (_lp - _c) * _q
+                    _pct = (float(_lp - _c) / float(_c)) * 100 if _c != 0 else 0
+                    _pnl_str = f"+{_pnl:.2f}" if _pnl >= 0 else f"{_pnl:.2f}"
+                    lines.append(f"浮盈：{_pnl_str} {position.get('currency', '')}（{'+' if _pct >= 0 else ''}{_pct:.2f}%）")
+                except Exception:
+                    pass
         lines.append(f"置信度：{decision['confidence']}")
         lines.append("理由：")
         for reason in decision["reasoning"]:
