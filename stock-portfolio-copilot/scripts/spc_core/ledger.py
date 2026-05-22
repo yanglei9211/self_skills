@@ -1240,17 +1240,30 @@ def latest_snapshots(conn, account_id: int, market: str | None = None) -> list[d
     if market:
         filter_sql = " AND s.market = ?"
         params.append(normalize_market(market))
+    # 优先级表达式：source 以 'manual_' 开头（手工截图真值）权重 1，普通 sync 权重 0。
+    # 选行规则 = (manual_priority DESC, id DESC) 的第一行，
+    # 用 NOT EXISTS 表达 "不存在更优的同 (account, market, code) 候选"。
+    manual_priority_self = "CASE WHEN s.source LIKE 'manual_%' THEN 1 ELSE 0 END"
+    manual_priority_new = "CASE WHEN newer.source LIKE 'manual_%' THEN 1 ELSE 0 END"
     rows = conn.execute(
         f"""
         SELECT s.*
           FROM portfolio_snapshot s
-          JOIN (
-            SELECT account_id, market, code, MAX(id) AS max_id
-              FROM portfolio_snapshot
-             WHERE account_id = ?
-             GROUP BY account_id, market, code
-          ) latest ON latest.max_id = s.id
-         WHERE 1=1
+         WHERE s.account_id = ?
+           AND NOT EXISTS (
+             SELECT 1
+               FROM portfolio_snapshot newer
+              WHERE newer.account_id = s.account_id
+                AND newer.market = s.market
+                AND newer.code = s.code
+                AND (
+                  ({manual_priority_new} > {manual_priority_self})
+                  OR (
+                    {manual_priority_new} = {manual_priority_self}
+                    AND newer.id > s.id
+                  )
+                )
+           )
         {filter_sql}
          ORDER BY s.market, s.code
         """,
@@ -1267,7 +1280,7 @@ def latest_snapshot_for_symbol(conn, account_id: int, market: str, code: str) ->
         SELECT *
           FROM portfolio_snapshot
          WHERE account_id = ? AND market = ? AND code = ?
-         ORDER BY id DESC
+         ORDER BY CASE WHEN source LIKE 'manual_%' THEN 1 ELSE 0 END DESC, id DESC
          LIMIT 1
         """,
         (account_id, norm_market, norm_code),

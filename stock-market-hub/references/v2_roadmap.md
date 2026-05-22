@@ -75,15 +75,16 @@
 - **工作量**：~2 小时
 - **价值**：用户问"为什么大跌"时一表呈现因果关系
 
-### P1-5. CLI 入口统一封装
+### P1-5. CLI 入口统一封装 ✅ 已落地（2026-05-22 补完 `--deep`）
 - **背景**：当前 8 个脚本独立调用，agent 要记住一堆参数。一个统一的 `smh` 命令更方便
 - **方案**：写 `bin/smh.py`，子命令模式：
-  - `smh company SZ300750 --deep`
-  - `smh sector "AI PC"`
-  - `smh news --today`
-  - `smh risk --rules R1,R2,R5`
-  - `smh announcements SZ300750 --keyword "立案"`
-- **工作量**：~1 小时（argparse 子命令包装）
+  - `smh company SZ300750 --deep` ✅ 已实现：编排 `analyze_symbol(with_peers=True)` + `supply_chain.build_supply_chain_payload`，
+    在速查卡片末尾追加 §6 商业模式 / 上下游、§7 风险提示、§8 同业对比。
+    降级契约（HK/US/PDF/peers 失败均不阻断）见 SKILL.md §2.C 与 `tests/test_company_api_deep.py`
+  - `smh sector "AI PC"` ✅
+  - `smh news --today` ✅
+  - `smh risk --rules R1,R2,R5` ✅
+  - `smh announcements SZ300750 --keyword "立案"` ✅
 - **额外**：在 SKILL.md 里把所有调用例子统一改成 `smh xxx`
 
 ### P1-6. 增量缓存层

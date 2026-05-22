@@ -88,7 +88,9 @@ $SMH cache clear --prefix kline
 
 ```bash
 VPY="$SELF_SKILLS_HOME/.venv/bin/python3"   # 或：./.venv/bin/python3
-$VPY scripts/analyze_company.py --symbol SZ300750 --with-peers
+$VPY scripts/company_api.py --symbol SZ300750 --with-peers
+# 也支持深度模式：$VPY scripts/company_api.py --symbol SZ300750 --deep
+# 历史脚本 scripts/analyze_company.py 仍然可用（thin wrapper），但所有新调用统一走 smh / company_api
 ```
 
 ## 1. 数据源全景
@@ -160,17 +162,28 @@ $VPY scripts/scan_sector.py --list  # 列出所有可用板块
 
 > 用户语境："分析一下宁德时代 300750"、"腾讯 0700 财务怎么样"、"阿里巴巴 BABA 商业模式"
 
-**核心脚本**：`analyze_company.py`（速查模式）/ `analyze_company.py --deep`（含 PDF 年报 + 上下游）
+**入口**：`smh company`（推荐）/ 等价直调：`scripts/company_api.py`
 
 ```bash
 # 速查卡片（基本信息 + 财报 + 高管 + 主要股东 + 概念归属 + 近 30 天公告）
-$VPY scripts/analyze_company.py --symbol SZ300750
-$VPY scripts/analyze_company.py --symbol HK00700
-$VPY scripts/analyze_company.py --symbol BABA   # 中概股
+$SMH company SZ300750
+$SMH company HK00700
+$SMH company BABA   # 中概股
 
-# 深度模式（再加：年报 PDF 解析的业务概要 / 主要客户供应商 / 风险因素 / 上下游图谱 / 同业对比）
-$VPY scripts/analyze_company.py --symbol SZ300750 --deep
+# 深度模式：在速查卡片末尾追加 §6 商业模式 / 上下游、§7 风险提示、§8 同业对比
+# 内部编排：analyze_symbol(with_peers=True) + supply_chain.build_supply_chain_payload(...)
+# 自动启用 --with-peers；失败降级见下方"--deep 行为契约"
+$SMH company SZ300750 --deep
+$SMH company SZ300750 --deep --deep-report-type semi   # 用半年报代替年报
+$SMH company SZ300750 --deep --format json             # data["deep"] 字段含完整 PDF 章节
 ```
+
+**`--deep` 行为契约（agent 必读）**：
+
+- **支持范围**：当前仅 A 股年报抽取链路成熟（巨潮 PDF）。HK / US 调用会返回 `deep.error = "未找到 ... 报告"`，**速查卡片仍然完整输出**，agent 应按速查模式输出 §1-§5，§6-§8 标注"非 A 股暂不支持"。
+- **PDF 失败**：`deep.pdf_error` 字段会标注异常（HTTP 503 / pdfplumber 解析失败等），已经抽到的章节仍保留，未抽到的章节渲染为"未找到"。
+- **peers 失败**：`deep.peers_error` 字段标注异常，§8 输出"⚠️ peers 拉取失败"，其它章节不受影响。
+- **永不阻断**：`smh company --deep` 任何深度模式失败都不会让进程退出非 0；agent 仍能拿到速查 + 已抽到的深度章节。
 
 **Agent 输出模板（中文 Markdown）**：
 
@@ -200,14 +213,16 @@ $VPY scripts/analyze_company.py --symbol SZ300750 --deep
 ## 五、近 30 天关键公告
 - YYYY-MM-DD **公告标题** [PDF](url)
 
-## 六、商业模式 / 上下游 (--deep 才有)
-{基于年报"业务概要"章节 + 主要客户/供应商列表 + LLM 整合}
+## 六、商业模式 / 上下游 （--deep 才有，仅 A 股）
+{基于年报"业务概要 / 主要客户 / 主要供应商 / MD&A"章节 + 启发式实体抽取 + LLM 整合}
+{HK/US 或巨潮无对应年报时，本节标注"非 A 股暂不支持深度模式"并跳过}
 
-## 七、风险提示 (--deep 才有)
-{年报"风险因素"章节摘要 + 当前公告中的风险关键词命中}
+## 七、风险提示 （--deep 才有，仅 A 股）
+{年报"风险因素"章节抽取摘要 + 当前公告里的风险关键词命中}
 
-## 八、同业对比 (--deep 才有)
-{同板块 5 家公司的 PE/PB/营收增速/净利润增速对比}
+## 八、同业对比 （--deep 才有；--deep 会自动启用 --with-peers）
+{基于东财 ssbk 板块成分股 + 雪球 screener 拉到的同板块前 8 家公司：PE_TTM / PB / ROE_TTM / 营收 CAGR / 净利 CAGR 横向对比}
+{peers 失败时本节渲染"⚠️ peers 拉取失败"，不影响其它章节}
 ```
 
 ## 3. Agent 行为约束（核心摘要）
@@ -300,7 +315,7 @@ $VPY scripts/analyze_company.py --symbol SZ300750 --deep
 
 ```
 用户："分析一下宁德时代 300750"
-→ Agent 调用 analyze_company.py --symbol SZ300750，按 §2.C 模板输出
+→ Agent 调用 `smh company SZ300750`，按 §2.C 模板输出（如用户进一步要求"深度 / 商业模式 / 上下游"再追加 `--deep`）
 
 用户："今天 A 股有什么异动"
 → Agent 调用 xueqiu_market.py --board all --top 5 + fetch_market_news.py --limit 30，按 §2.A 模板输出

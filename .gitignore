@@ -50,6 +50,10 @@ credentials.json
 *.db-journal
 *.sqlite
 *.sqlite3
+# 数据库本地备份（如 portfolio.db.bak-20260521-...）一律不入库
+*.db.bak
+*.db.bak-*
+*.db.bak.*
 
 # newsboat-news-hub: 抓取结果、生成的卡片
 news_cn.json

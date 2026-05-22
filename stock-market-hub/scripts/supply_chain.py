@@ -346,18 +346,32 @@ def _format_peers(full: list[dict]) -> list[dict]:
 
 # ============ 主流程 ============ #
 
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--symbol", required=True, help="股票代码（仅 A 股 v1）")
-    ap.add_argument("--report-type", choices=["annual", "semi"], default="annual")
-    ap.add_argument("--max-pdf-pages", type=int, default=300, help="PDF 解析最大页数")
-    ap.add_argument("--format", choices=["json", "text"], default="json")
-    args = ap.parse_args()
 
+# PDF 章节文本写进 payload 时的截断长度。LLM 拿这些再 summarize 已经够用；
+# 真要原文可单独调 pdf_extract --format json --sections xxx。
+_SECTION_TEXT_LIMIT = 6000
+
+
+def build_supply_chain_payload(
+    symbol: str,
+    *,
+    report_type: str = "annual",
+    max_pdf_pages: int = 300,
+    include_peers: bool = True,
+    peers_top: int = 8,
+) -> dict:
+    """编排"找年报 → PDF 抽章节 → 实体抽取 → 同业 peers"的完整流程。
+
+    供 ``main()`` 和 ``company_api.py --deep`` 共用。所有失败点都被吃掉，
+    只在返回的 payload 里以 ``error`` / ``pdf_error`` / ``peers_error`` 标注，
+    不会抛异常——保证 ``--deep`` 出问题时也不阻断 ``company_api`` 主流程。
+
+    Returns:
+        ``{symbol, fetched_at, report, sections, extracted_entities, amount_pairs, peers, [error/pdf_error/peers_error]}``
+        当不支持的市场（HK / US）或没找到年报时仅返回 ``error``。
+    """
     out: dict = {
-        "symbol": args.symbol,
+        "symbol": symbol,
         "fetched_at": datetime.now(CN_TZ).isoformat(),
         "report": None,
         "sections": {},
@@ -370,14 +384,20 @@ def main() -> None:
         "peers": [],
     }
 
-    # 1. 找最新年报
-    print(f"[supply_chain] 找最新 {args.report_type} 报告...", file=sys.stderr)
-    report = find_latest_report(args.symbol, args.report_type)
+    # 1. 找最新年报（HK/US 当前会返回 None → out.error）
+    print(f"[supply_chain] 找最新 {report_type} 报告 ({symbol})...", file=sys.stderr)
+    try:
+        report = find_latest_report(symbol, report_type)
+    except Exception as e:  # noqa: BLE001
+        # find_latest_report 自己已经吞了大部分异常，这里再兜一层防御
+        print(f"[supply_chain] 报告查找异常: {type(e).__name__}: {e}", file=sys.stderr)
+        report = None
+
     if not report:
-        out["error"] = f"未找到 {args.symbol} 的最新 {args.report_type} 报告"
-        json.dump(out, sys.stdout, ensure_ascii=False, indent=2, default=str)
-        print()
-        return
+        out["error"] = (
+            f"未找到 {symbol} 的最新 {report_type} 报告（A 股以外或巨潮无对应记录）"
+        )
+        return out
 
     out["report"] = {
         "title": report.get("title"),
@@ -386,14 +406,14 @@ def main() -> None:
     }
     print(f"[supply_chain] 找到：{report['title']} ({report['date']})", file=sys.stderr)
 
-    # 2. 抽 PDF 章节
+    # 2. PDF 抽章节 + 3. 实体抽取
     pdf_url = report.get("pdf_url")
     if pdf_url:
         try:
             from pdf_extract import download_pdf, extract_full_text, find_section  # type: ignore
 
             pdf_path = download_pdf(pdf_url)
-            pages_text, pages_num = extract_full_text(pdf_path, max_pages=args.max_pdf_pages)
+            pages_text, pages_num = extract_full_text(pdf_path, max_pages=max_pdf_pages)
             for sec in ("business", "customers", "suppliers", "mda", "risks"):
                 info = find_section(pages_text, pages_num, sec)
                 out["sections"][sec] = {
@@ -402,11 +422,9 @@ def main() -> None:
                     "start_page": info.get("start_page"),
                     "end_page": info.get("end_page"),
                     "char_count": info.get("char_count", 0),
-                    # 截短 PDF 文本（避免 JSON 太大；agent 真要全文可单独调 pdf_extract）
-                    "text_snippet": (info.get("text") or "")[:6000],
+                    "text_snippet": (info.get("text") or "")[:_SECTION_TEXT_LIMIT],
                 }
 
-            # 3. 实体抽取
             cust_text = out["sections"].get("customers", {}).get("text_snippet", "")
             supp_text = out["sections"].get("suppliers", {}).get("text_snippet", "")
             biz_text = out["sections"].get("business", {}).get("text_snippet", "")
@@ -420,37 +438,96 @@ def main() -> None:
 
         except Exception as e:  # noqa: BLE001
             print(f"[supply_chain] PDF 解析失败: {type(e).__name__}: {e}", file=sys.stderr)
-            out["pdf_error"] = str(e)
+            out["pdf_error"] = f"{type(e).__name__}: {e}"
 
     # 4. 同业公司
-    try:
-        out["peers"] = get_peers_from_concept(args.symbol, top=8)
-    except Exception as e:  # noqa: BLE001
-        print(f"[supply_chain] peers 失败: {e}", file=sys.stderr)
-        out["peers"] = []
+    if include_peers:
+        try:
+            out["peers"] = get_peers_from_concept(symbol, top=peers_top)
+        except Exception as e:  # noqa: BLE001
+            print(f"[supply_chain] peers 失败: {e}", file=sys.stderr)
+            out["peers"] = []
+            out["peers_error"] = f"{type(e).__name__}: {e}"
+
+    return out
+
+
+def _render_supply_chain_text(payload: dict) -> str:
+    """供 supply_chain.py CLI 直接打印的 text 渲染。
+
+    `company_api.py --deep` 的渲染不走这里，那边走 ``render_deep_text``，
+    以适应"卡片末尾追加 §6-§8"的版式。
+    """
+    symbol = payload.get("symbol", "")
+    lines: list[str] = []
+    lines.append(f"# {symbol} 上下游图谱原料\n")
+    report = payload.get("report") or {}
+    if payload.get("error"):
+        lines.append(f"_错误：{payload['error']}_\n")
+        return "\n".join(lines)
+    lines.append(f"_最新报告：{report.get('title', '-')} ({report.get('date', '-')})_")
+    lines.append(f"_PDF：{report.get('pdf_url', '-')}_\n")
+    if payload.get("pdf_error"):
+        lines.append(f"_⚠️ PDF 解析失败：{payload['pdf_error']}_\n")
+
+    sections = payload.get("sections") or {}
+    for sec_key in ("business", "customers", "suppliers", "mda"):
+        sec = sections.get(sec_key, {})
+        if sec.get("found"):
+            lines.append(
+                f"## {sec['label']}（第 {sec['start_page']}-{sec['end_page']} 页, "
+                f"{sec['char_count']:,} 字）\n"
+            )
+            snippet = sec.get("text_snippet", "")
+            lines.append(snippet[:2000])
+            if sec.get("char_count", 0) > 2000:
+                lines.append(
+                    f"\n_...(已截断，完整 {sec['char_count']:,} 字请用 --format json)_\n"
+                )
+            lines.append("")
+        else:
+            lines.append(f"## {sec.get('label', sec_key)}: 未找到\n")
+    entities = payload.get("extracted_entities") or {}
+    lines.append(f"## 抽取的客户实体: {entities.get('from_customers', [])}\n")
+    lines.append(f"## 抽取的供应商实体: {entities.get('from_suppliers', [])}\n")
+    amount_pairs = payload.get("amount_pairs") or {}
+    lines.append(f"## 客户金额对：{amount_pairs.get('customers', [])}\n")
+    peers = payload.get("peers") or []
+    lines.append("## 同业公司（前 8）:")
+    for p in peers:
+        try:
+            lines.append(
+                f"  {p['symbol']}  现价 {p['current']}  涨跌 {p['percent']:+.2f}%  "
+                f"市值 {p['market_cap_yi']:.0f}亿"
+            )
+        except Exception:  # noqa: BLE001
+            # peers 里偶有字段缺失，最多跳过这一行
+            lines.append(f"  {p}")
+    if payload.get("peers_error"):
+        lines.append(f"_⚠️ peers 失败：{payload['peers_error']}_")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--symbol", required=True, help="股票代码（仅 A 股 v1）")
+    ap.add_argument("--report-type", choices=["annual", "semi"], default="annual")
+    ap.add_argument("--max-pdf-pages", type=int, default=300, help="PDF 解析最大页数")
+    ap.add_argument("--format", choices=["json", "text"], default="json")
+    args = ap.parse_args()
+
+    payload = build_supply_chain_payload(
+        args.symbol,
+        report_type=args.report_type,
+        max_pdf_pages=args.max_pdf_pages,
+    )
 
     if args.format == "text":
-        print(f"# {args.symbol} 上下游图谱原料\n")
-        print(f"_最新报告：{out['report']['title']} ({out['report']['date']})_")
-        print(f"_PDF：{out['report']['pdf_url']}_\n")
-        for sec_key in ("business", "customers", "suppliers", "mda"):
-            sec = out["sections"].get(sec_key, {})
-            if sec.get("found"):
-                print(f"## {sec['label']}（第 {sec['start_page']}-{sec['end_page']} 页, {sec['char_count']:,} 字）\n")
-                print(sec["text_snippet"][:2000])
-                if sec["char_count"] > 2000:
-                    print(f"\n_...(已截断，完整 {sec['char_count']:,} 字请用 --format json)_\n")
-                print()
-            else:
-                print(f"## {sec.get('label', sec_key)}: 未找到\n")
-        print(f"## 抽取的客户实体: {out['extracted_entities']['from_customers']}\n")
-        print(f"## 抽取的供应商实体: {out['extracted_entities']['from_suppliers']}\n")
-        print(f"## 客户金额对：{out['amount_pairs']['customers']}\n")
-        print(f"## 同业公司（前 8）:")
-        for p in out["peers"]:
-            print(f"  {p['symbol']}  现价 {p['current']}  涨跌 {p['percent']:+.2f}%  市值 {p['market_cap_yi']:.0f}亿")
+        print(_render_supply_chain_text(payload))
     else:
-        json.dump(out, sys.stdout, ensure_ascii=False, indent=2, default=str)
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, default=str)
         print()
 
 

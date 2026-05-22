@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from spc_core.ledger import (
     delete_position_peak,
+    latest_snapshot_for_symbol,
     latest_snapshots,
     upsert_position_peak,
 )
@@ -282,12 +283,9 @@ def check_portfolio_consistency(conn, account_id: int) -> list[dict]:
             "ORDER BY trade_time, id",
             (account_id, sym_market, sym_code),
         ).fetchall()
-        snap = conn.execute(
-            "SELECT qty, avg_cost_price, last_price FROM portfolio_snapshot "
-            "WHERE account_id = ? AND market = ? AND code = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (account_id, sym_market, sym_code),
-        ).fetchone()
+        snap = latest_snapshot_for_symbol(conn, account_id, sym_market, sym_code)
+        snap_source = (snap or {}).get("source") or ""
+        snap_is_manual = snap_source.startswith("manual_")
 
         # 推算理论 qty / 摊薄成本
         qty = Decimal(seed["qty"]) if seed else Decimal("0")
@@ -328,11 +326,20 @@ def check_portfolio_consistency(conn, account_id: int) -> list[dict]:
         if snap and snap["qty"] is not None:
             snap_qty = to_decimal(snap["qty"], "snap.qty")
             if abs(snap_qty - qty) > Decimal("0.0001"):
-                status = max(status, "WARN", key=["OK", "WARN", "FAIL"].index)
-                messages.append(
-                    f"STALE_SNAPSHOT: snapshot qty={snap_qty} 与 seed+trade 推算 qty={qty} 不一致，"
-                    f"请运行 'spc portfolio sync'"
-                )
+                if snap_is_manual:
+                    # 用户已用 manual_* 截图覆盖了当前真值，跟 seed+trade 推算不一致是预期行为：
+                    # trade_ledger 只服务于"买点/卖点/复盘"，当前持仓真值以截图为准。
+                    messages.append(
+                        f"MANUAL_SNAPSHOT_OVERRIDE: snapshot qty={snap_qty} (source={snap_source}) "
+                        f"与 seed+trade 推算 qty={qty} 不一致；当前持仓真值以用户截图为准，"
+                        f"trade_ledger 仅用于复盘买卖点"
+                    )
+                else:
+                    status = max(status, "WARN", key=["OK", "WARN", "FAIL"].index)
+                    messages.append(
+                        f"STALE_SNAPSHOT: snapshot qty={snap_qty} 与 seed+trade 推算 qty={qty} 不一致，"
+                        f"请运行 'spc portfolio sync'"
+                    )
 
         if snap and snap["last_price"] is not None and qty > 0 and avg_cost > 0:
             last_price = to_decimal(snap["last_price"], "last_price")

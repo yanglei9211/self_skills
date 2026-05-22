@@ -303,6 +303,7 @@ class Features:
     # 多周期交叉验证（来自 shared/stock_core/fund_flow.py::cross_validate）
     # 缺数据 / 老缓存没这个字段时为 None；决策树读到 None 时退化为只看 regime/reversal。
     ff_cross: dict | None
+    ff_flow_source: str | None  # 数据来源：eastmoney_intraday / xueqiu_intraday_fallback / eastmoney_previous_close 等
     # 大盘
     market_regime: str | None
     # 持仓期间最高价（trailing stop 用）。无持仓 / 缺数据时为 None。
@@ -459,6 +460,7 @@ def _extract_features(
         ff_10d=_ff_yi("10d"),
         ff_20d=_ff_yi("20d"),
         ff_cross=(fund_flow.get("cross_validation") if ff_available else None),
+        ff_flow_source=fund_flow.get("flow_source") if ff_available else None,
         market_regime=market_regime,
         peak_price=peak_price,
         plan_stop_loss_price=plan_stop_loss_price,
@@ -538,6 +540,11 @@ def _collect_fund_flow_signals(f: Features) -> tuple[list[str], list[str]]:
         risks.append(f"近 5 日主力资金由流入转为流出，趋势可能在切换{ff_suffix}")
     elif f.ff_reversal == FUND_REVERSAL_UP:
         reasons.append(f"近 5 日主力资金由流出转为流入，下跌动能在衰竭{ff_suffix}")
+    if f.ff_flow_source == "xueqiu_intraday_fallback":
+        risks.append(
+            "⚠️ 当前资金流数据为雪球兜底口径（东财盘中不可用），数据不完全准确，"
+            "加仓/买入决策需交叉验证独立数据源"
+        )
     return reasons, risks
 
 
@@ -1479,22 +1486,27 @@ def _evaluate_holding_add(
     if market_regime == MARKET_REGIME_RISK_OFF:
         return None
 
+    ff_degraded = f.ff_flow_source == "xueqiu_intraday_fallback"
     if buy_path == "trend":
-        return (
-            "add",
-            Decimal("0.68"),
+        base_conf = Decimal("0.63") if ff_degraded else Decimal("0.68")
+        msg = (
             "【持仓加仓-趋势】持仓未亏损 + 趋势仍成立（创新高 + 资金不撤离 + 正向公告）"
             "+ 仓位距上限仍有空间 → 可分批加仓，但不要一次顶满"
-            + _ff_suffix(f.ff_time_label),
+            + _ff_suffix(f.ff_time_label)
         )
+        if ff_degraded:
+            msg += "；⚠️ 资金流数据为雪球兜底口径（东财不可用），仅作方向参考，需交叉验证独立数据源"
+        return ("add", base_conf, msg)
     if buy_path == "reversal":
-        return (
-            "add",
-            Decimal("0.64"),
+        base_conf = Decimal("0.59") if ff_degraded else Decimal("0.64")
+        msg = (
             "【持仓加仓-反转】持仓未亏损 + 反转买入条件依然成立（资金已反向流入 + 多重正向公告）"
             "+ 仓位距上限仍有空间 → 可分批加仓，反转加仓更激进，建议比趋势加仓再保守 1/2"
-            + _ff_suffix(f.ff_time_label),
+            + _ff_suffix(f.ff_time_label)
         )
+        if ff_degraded:
+            msg += "；⚠️ 资金流数据为雪球兜底口径（东财不可用），仅作方向参考，需交叉验证独立数据源"
+        return ("add", base_conf, msg)
     return None
 
 
@@ -1519,6 +1531,7 @@ def _decide_for_watching(f: Features) -> tuple[str, Decimal, list[str], list[str
     buy_eval = _evaluate_self_select_buy(
         f.market, f.regime, f.risk_hits, f.positive_hits, f.change_pct,
         f.ff_regime, f.ff_3d, f.ff_5d, f.ff_reversal, f.ff_cross, f.market_regime, f.ff_time_label,
+        f.ff_flow_source,
     )
     if buy_eval is not None:
         action, confidence, buy_reason = buy_eval
@@ -1969,6 +1982,7 @@ def _evaluate_self_select_buy(
     ff_cross: dict | None,
     market_regime: str | None,
     ff_time_label: str | None,
+    ff_flow_source: str | None = None,
 ) -> tuple[str, Decimal, str] | None:
     """自选侧 buy 决策评估，返回 (action, confidence, reason_msg) 或 None。
 
@@ -2016,6 +2030,11 @@ def _evaluate_self_select_buy(
         base = Decimal("0.72")
         if trend_decelerating:
             base = Decimal("0.67")
+        if ff_flow_source == "xueqiu_intraday_fallback":
+            base -= Decimal("0.05")
+            trend_msg += (
+                "；⚠️ 资金流数据为雪球兜底口径（东财不可用），仅作方向参考，confidence -0.05"
+            )
         return "buy", base, trend_msg + _ff_suffix(ff_time_label)
     if buy_path == "reversal":
         reversal_msg = (
@@ -2036,7 +2055,14 @@ def _evaluate_self_select_buy(
                 Decimal("0.62"),
                 reversal_msg + _ff_suffix(ff_time_label) + "；大盘 RISK_OFF，先降级为 focus 等大盘修复",
             )
-        return "buy", Decimal("0.68"), reversal_msg + _ff_suffix(ff_time_label)
+        base_rev = Decimal("0.68")
+        if ff_flow_source == "xueqiu_intraday_fallback":
+            base_rev = Decimal("0.63")
+            reversal_msg += (
+                "；⚠️ 资金流数据为雪球兜底口径（东财不可用），反转路径对短期数据准确性要求更高，"
+                "confidence -0.05"
+            )
+        return "buy", base_rev, reversal_msg + _ff_suffix(ff_time_label)
     return None
 
 

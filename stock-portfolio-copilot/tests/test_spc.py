@@ -32,6 +32,7 @@ from spc_core.ledger import (  # noqa: E402
     delete_trade,
     get_execution_plan_detail,
     latest_analysis_run,
+    latest_snapshot_for_symbol,
     latest_snapshots,
     list_trades,
     list_watch,
@@ -302,6 +303,44 @@ class SPCTestCase(unittest.TestCase):
         self.assertEqual(snap["avg_cost_price"], "18.7241")
         self.assertEqual(snap["total_fees_ccy"], "20.36")
         self.assertEqual(snap["position_value_cny"], "44252.00")
+
+    def test_manual_snapshot_preferred_over_newer_sync_snapshot(self):
+        self.conn.execute(
+            """
+            INSERT INTO portfolio_snapshot(
+              account_id, market, code, qty, avg_cost_price, currency, gross_cost_ccy, total_fees_ccy,
+              realized_pnl_ccy, last_price, last_price_time, unrealized_pnl_ccy,
+              fx_rate_to_cny, position_value_cny, snapshot_time, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.acct_id, "a", "300750", "1000.0000", "245.3000", "CNY", "245300.00", "0.00",
+                "0.00", "250.0000", "2026-05-08T10:30:00+08:00", "4700.00",
+                "1", "250000.00", "2026-05-08T02:30:00+00:00", "manual_screenshot_calibration",
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO portfolio_snapshot(
+              account_id, market, code, qty, avg_cost_price, currency, gross_cost_ccy, total_fees_ccy,
+              realized_pnl_ccy, last_price, last_price_time, unrealized_pnl_ccy,
+              fx_rate_to_cny, position_value_cny, snapshot_time, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.acct_id, "a", "300750", "800.0000", "245.3000", "CNY", "196240.00", "0.00",
+                "0.00", "260.0000", "2026-05-08T14:31:00+08:00", "11760.00",
+                "1", "208000.00", "2026-05-08T06:31:00+00:00", "sync",
+            ),
+        )
+        self.conn.commit()
+
+        snap = latest_snapshots(self.conn, self.acct_id)[0]
+        one = latest_snapshot_for_symbol(self.conn, self.acct_id, "a", "300750")
+        self.assertEqual(snap["source"], "manual_screenshot_calibration")
+        self.assertEqual(snap["qty"], "1000.0000")
+        self.assertEqual(one["source"], "manual_screenshot_calibration")
+        self.assertEqual(one["qty"], "1000.0000")
 
     def test_watch_capital_and_analysis(self):
         add_position_seed(self.conn, self.acct_id, "a", "300750", "1000", "245.30", None, "2026-05-01 09:30:00", "")
@@ -757,6 +796,92 @@ class SPCTestCase(unittest.TestCase):
         self.assertTrue(
             any("fund_flow.warning=" in s and "数据不完全准确" in s for s in decision["sources"]),
             f"sources={decision['sources']}",
+        )
+
+    def test_xueqiu_fallback_trend_buy_subtracts_confidence_and_emits_risk(self):
+        """趋势 buy 路径 + 资金流降级为雪球兜底 → confidence 从 0.72 扣到 0.67，
+        risks 标注 ⚠️ 雪球口径不可靠，reasoning 标注 confidence -0.05。"""
+        add_watch(self.conn, self.acct_id, "a", "300308", "")
+        ff = _ff(
+            regime="PERSISTENT_INFLOW",
+            m3=2.0, m5=3.0, m20=4.0,
+            main_today_yi=1.2,
+        )
+        ff["flow_source"] = "xueqiu_intraday_fallback"
+        provider = FakeProvider(fund_flow_overrides={
+            ("a", "300308"): ff,
+        })
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "buy")
+        # 0.72 (trend baseline) - 0.05 (xueqiu fallback) = 0.67
+        self.assertEqual(
+            decision["confidence"], "0.67",
+            f"trend buy + xueqiu_fallback 应 -0.05 → 0.67，实际 {decision['confidence']}",
+        )
+        self.assertTrue(
+            any("雪球兜底口径" in r for r in decision["risks"]),
+            f"risks 应含雪球兜底提示；risks={decision['risks']}",
+        )
+        self.assertTrue(
+            any("confidence -0.05" in r and "雪球" in r for r in decision["reasoning"]),
+            f"reasoning 应标注 confidence -0.05；reasoning={decision['reasoning']}",
+        )
+
+    def test_xueqiu_fallback_reversal_buy_subtracts_confidence_and_emits_risk(self):
+        """反转 buy 路径 + 资金流降级为雪球兜底 → confidence 从 0.68 扣到 0.63，
+        risks 标注雪球不可靠，reasoning 标注 confidence -0.05。"""
+        add_watch(self.conn, self.acct_id, "hk", "00700", "")
+
+        class ReversalProvider(FakeProvider):
+            def analyze(self, market, code, ann_days=30, with_peers=False, skip=""):
+                quote = self.fetch_quote(market, code)
+                if (market, code) == ("hk", "00700"):
+                    return self._attach_fund_flow(market, code, {
+                        "fetched_at": quote["fetched_at"],
+                        "info": {"name": "腾讯控股"},
+                        "quote": {"current": quote["current"], "percent": 1.5},
+                        "price_history": {"regime": "NEAR_YTD_LOW"},
+                        "announcements": [
+                            {"date": "2026-05-01", "title": "回购股份公告", "pdf_url": "h1"},
+                            {"date": "2026-05-02", "title": "新品发布合作", "pdf_url": "h2"},
+                        ],
+                    })
+                return super().analyze(market, code, ann_days, with_peers, skip)
+
+        ff = _ff(
+            regime="PERSISTENT_INFLOW", reversal="OUTFLOW_TO_INFLOW",
+            m3=2.0, m5=4.0, m20=15.0, main_today_yi=1.2,
+        )
+        ff["flow_source"] = "xueqiu_intraday_fallback"
+        provider = ReversalProvider(fund_flow_overrides={
+            ("hk", "00700"): ff,
+        })
+
+        payload = analyze_now(
+            self.conn, self.acct_id, self.acct_slug, self.acct_name,
+            "watchlist", analysis_provider=provider,
+        )
+        decision = payload["results"][0]["decision"]
+
+        self.assertEqual(decision["action"], "buy")
+        # 0.68 (reversal baseline) - 0.05 (xueqiu fallback) = 0.63
+        self.assertEqual(
+            decision["confidence"], "0.63",
+            f"reversal buy + xueqiu_fallback 应 -0.05 → 0.63，实际 {decision['confidence']}",
+        )
+        self.assertTrue(
+            any("雪球兜底口径" in r for r in decision["risks"]),
+            f"risks 应含雪球兜底提示；risks={decision['risks']}",
+        )
+        self.assertTrue(
+            any("confidence -0.05" in r and "雪球" in r for r in decision["reasoning"]),
+            f"reasoning 应标注 confidence -0.05；reasoning={decision['reasoning']}",
         )
 
     def test_fund_flow_persistent_outflow_forces_avoid(self):
