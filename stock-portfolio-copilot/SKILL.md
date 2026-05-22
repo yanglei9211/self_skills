@@ -25,7 +25,7 @@ description: >-
   - `buy` 表示买入候选：可由两条独立路径触发（详见下文「buy 候选双路径」），任一满足即可
   - `add` 表示**持仓加仓候选**：仅在已持仓 + 未亏损 + 仓位距上限仍有 ≥ 15% 空间 + 趋势/反转 buy 条件依然成立时触发，置信度低于自选 `buy`
   - `trim` 表示减仓：触发来源包括"风险公告/破位"、"主力持续流出"、"仓位超限"、"分级止盈"、"trailing stop"、"execution_plan 止盈价"、"P0a T1/T2 分级硬止损"
-  - `sell` 表示卖出：触发来源包括"硬止损 T3 硬底线"、"L4 跌 8% + 风险公告升档"、"execution_plan 止损价"、"分级止盈 + 顶部信号"、"trailing stop 重度回撤"等
+  - `sell` 表示卖出：触发来源包括"硬止损 T3 硬底线"、"L4 风险公告直接卖出"、"execution_plan 止损价"、"分级止盈 + 顶部信号"、"trailing stop 重度回撤"等
   - `probe` 仅港股 RISK_OFF + 反转买入路径下出现，是首仓概念，不适用于已持仓的加仓
 
 ## CLI 入口
@@ -221,7 +221,7 @@ LLM 在 prompt 里只需引用 `cross_validation` 字段做结论（短长冲突
 |---|---|---|---|---|---|
 | 1 | 风险/破位 | `risk_hits ≥ 2` **或** `regime ∈ LOW_REGIMES` | trim | 0.72 | 旧规则 |
 | 2 | 主力资金弱 + 短期续出 | `ff_regime=PERSISTENT_OUTFLOW` + `5d<0` （+ `3d<0` / `regime ∈ LOW`） | trim / sell | 0.65 / 0.78 | 旧规则 |
-| 3 | L4 升档规则 | 跌 8% **且** 命中 ≥ 1 条风险公告 → 跨过分档 trim 直接 sell | sell | 0.80 | 旧规则，confidence 由 0.78 升至 0.80 |
+| 3 | L4 风险公告规则 | 命中 ≥ 1 条风险公告 → 跨过分档 trim 直接 sell | sell | 0.80 |
 | **4** | **P0a 分级硬止损** | 浮亏命中 T1/T2/T3 三档之一；confidence 按大盘 regime 软联动 | **trim** (T1/T2) / **sell** (T3) | **见下表** | 新规则 |
 | **5** | **P2a 预案止损/止盈** | active `execution_plan` 的 `stop_loss_price` / `take_profit_price` 被现价穿越 | **sell** / **trim** | **0.82 / 0.78** | 新规则 |
 | 6 | 仓位超限 + 浮盈 | `weight_pct > max_single_pct` 且现价 > 成本 | trim | 0.70 | 旧规则 |
@@ -253,7 +253,7 @@ LLM 在 prompt 里只需引用 `cross_validation` 字段做结论（短长冲突
 
 > RISK_OFF 时所有档 confidence 下调，因为弱市集中下跌往往是 beta 而非 alpha 问题，留更多人工判断空间；RISK_ON 时同样跌幅更可能是个股专属风险，confidence 反而上调。
 >
-> L4 旧规则（跌 8% + 风险公告 → sell @ 0.80）依然生效，且会**跨过 T1/T2** 直接 sell：等价于"普通 8% 跌只是 T1 trim；8% 跌 + 风险公告 = 立刻全退"。
+> L4 规则（风险公告 → sell @ 0.80）：不做分级，不依赖跌幅。只要有风险公告就直接跨过 T1/T2/T3 卖出，
 
 **设计原则**：
 

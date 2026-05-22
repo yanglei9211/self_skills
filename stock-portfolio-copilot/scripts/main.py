@@ -35,6 +35,12 @@ from spc_core.settings import (
     show_settings_json,
 )
 from spc_core.utils import pretty_json, render_table, to_local_display, utc_now_iso
+from stock_core.demon_stop import (
+    DemonStopResult,
+    compute_demon_stop,
+    find_swing_bottom,
+    render_demon_stop_text,
+)
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -764,6 +770,67 @@ def cmd_diff(args, conn) -> None:
     print(text)
 
 
+def cmd_demon_check(args, conn) -> None:
+    """妖股止盈检查：独立仓位管理提醒（从股票自身底部算）."""
+    acct = _resolve(conn, args)
+    snapshots = latest_snapshots(conn, acct["id"])
+    if not snapshots:
+        print("暂无持仓快照，请先运行 portfolio sync")
+        return
+
+    from stock_core.kline import fetch_daily_kline
+
+    results: list[DemonStopResult] = []
+    for snap in snapshots:
+        qty = float(snap["qty"])
+        if qty <= 0:
+            continue
+        last_price = float(snap["last_price"] or 0)
+        if last_price <= 0:
+            continue
+
+        code = snap["code"]
+        market = snap["market"]
+        xq_sym = code if market == "hk" else code
+
+        # 拉 K 线找底部 + 今日涨跌
+        day_chg = None
+        bottom_price = 0.0
+        bottom_date = ""
+        try:
+            kline = fetch_daily_kline(xq_sym, market, count=150)
+            if kline and len(kline) >= 20:
+                # 今日涨跌幅
+                if len(kline) >= 2:
+                    today_close = kline[-1]["close"]
+                    yesterday_close = kline[-2]["close"]
+                    if yesterday_close > 0:
+                        day_chg = (today_close - yesterday_close) / yesterday_close * 100
+
+                # 找 swing 底部
+                bottom_price, bottom_date = find_swing_bottom(kline, lookback=120)
+        except Exception:
+            pass
+
+        if bottom_price <= 0:
+            continue
+
+        result = compute_demon_stop(
+            bottom_price=bottom_price,
+            bottom_date=bottom_date,
+            current_price=last_price,
+            current_qty=qty,
+            day_change_pct=day_chg,
+        )
+        result.symbol = snap["market"].upper() + snap["code"]
+        result.name = ""
+        result.account_slug = acct["slug"]
+        result.position_value = qty * last_price
+        results.append(result)
+
+    print(render_demon_stop_text(results))
+
+
 # ── parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1121,6 +1188,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="显式指定两个时点附近的 run 对比，覆盖 --since/--until",
     )
     p_diff.set_defaults(func=cmd_diff)
+
+    # demon — 妖股止盈提醒（独立仓位管理，非买卖建议）
+    p_demon = sub.add_parser(
+        "demon",
+        help="妖股止盈提醒：独立仓位管理，跟踪累计涨幅触发减仓阈值",
+    )
+    p_demon_sub = p_demon.add_subparsers(dest="action", required=True)
+    p_demon_check = p_demon_sub.add_parser("check", help="检查当前持仓是否触发妖股止盈阈值")
+    _add_account_arg(p_demon_check)
+    p_demon_check.set_defaults(func=cmd_demon_check)
 
     return ap
 

@@ -68,3 +68,7 @@ stock-portfolio-copilot/docs/
 
 # ===== Playwright 浏览器缓存 =====
 .playwright/
+*.json
+.claude
+.cursor
+

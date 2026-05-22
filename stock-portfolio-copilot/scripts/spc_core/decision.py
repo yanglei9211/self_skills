@@ -191,7 +191,23 @@ def _resolve_decision_params(conn, account_id: int) -> dict:
         "trail_severe_pct": _account_decimal_setting(
             conn, account_id, "decision.trailing_stop.severe_pct", _TRAILING_STOP_SEVERE_PCT,
         ),
+        "l4_enabled": _account_bool_setting(conn, account_id, "decision.l4_enabled", True),
     }
+
+
+def _account_bool_setting(conn, account_id: int, key: str, default: bool) -> bool:
+    """Read a boolean account_setting. 值 \"0\" / \"false\" / \"no\" → False，缺失 → default."""
+    import sys
+    if conn is None or account_id is None:
+        return default
+    try:
+        from spc_core.settings import get_account_setting
+        raw = get_account_setting(conn, account_id, key)
+    except Exception:
+        return default
+    if raw is None or raw == "":
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _extract_security_name(analysis: dict) -> str:
@@ -1194,20 +1210,19 @@ def _decide_for_holding(
             t2 = p["hard_stop_a_t2"]
             t3 = p["hard_stop_a_t3"]
 
-        # ── 3. L4 旧规则升档：跌 8% + 风险公告 → sell @ 0.80 ─────
-        # 旧规则保留触发条件（跌 8% + 风险公告），但 confidence 从 0.78 升到 0.80：
-        # 有公告佐证时这条 sell 应"跨过"P0a 的 T1/T2 trim 防线直接到位，
-        # 等价于"普通 8% 跌 是 T1 trim；8% 跌 + 风险公告 = 立刻全退"。
+        # ── 3. L4 风险公告直接卖出：有风险公告 → sell @ 0.80 ─────
+        # 风险公告是最高优先级卖出信号，跨过 P0a T1/T2/T3 分档直接到位。
         if f.exempt_hard_stop:
             extra_reasons.append(
                 "⏸️ 该标的已豁免硬止损（P0a / L4），系统不自动发出止损/卖出信号；"
                 "止损纪律由人工判断"
             )
-        elif cur_price < f.avg_cost * Decimal("0.92") and f.risk_hits:
-            record("price_loss+risk_announce", "sell", Decimal("0.80"),
-                   f"现价 {cur_price} < 92% 成本 {f.avg_cost} 且有风险公告 → 跨档 sell")
+        elif p["l4_enabled"] and f.risk_hits:
+            record("risk_announce", "sell", Decimal("0.80"),
+                   f"有风险公告，跳过分档止损直接全退"
+                   + (f"（现价 {cur_price}，成本 {f.avg_cost}）" if cur_price is not None else ""))
             extra_reasons.append(
-                "现价已明显低于持仓成本且伴随风险公告，跳过分档 trim 直接全退"
+                "持仓标的存在风险公告，直接触发全退"
             )
 
         # ── 4. P0a 分级硬止损：T1/T2 trim、T3 sell ──────────────

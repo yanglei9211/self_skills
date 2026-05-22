@@ -683,7 +683,7 @@ def render_text(data: dict) -> str:
         pos = ph["position"]
         breakout = ph.get("breakout", {})
         regime = ph.get("regime", "")
-        regime_label = {
+        price_regime_text = {
             "NEW_ALL_TIME_HIGH": "🔥 创历史新高",
             "NEW_ALL_TIME_LOW": "❄️ 创历史新低",
             "NEW_YTD_HIGH": "🟢 创年内新高",
@@ -693,7 +693,7 @@ def render_text(data: dict) -> str:
             "IN_RANGE": "⚪️ 区间内运行",
         }.get(regime, regime)
         lines.append("## 二、历史价位摘要（K 线驱动，杜绝凭印象）")
-        lines.append(f"- **当前 K 线状态**：{regime_label}")
+        lines.append(f"- **当前 K 线状态**：{price_regime_text}")
         lines.append(
             f"- **YTD（{ytd['year']} 年初至今）**：起 {ytd['start_close']} → 当前 {ph.get('current_price')}，"
             f"涨跌 **{ytd['ytd_change_pct']:+.2f}%**（{ytd['trading_days']} 个交易日）"
