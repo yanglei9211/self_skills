@@ -25,12 +25,8 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.symbols import normalize_symbol  # noqa: E402
 from stock_core.xueqiu import XueqiuClient  # noqa: E402
 

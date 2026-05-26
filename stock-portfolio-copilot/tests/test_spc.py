@@ -1759,6 +1759,133 @@ def render_text(data):
         self.assertEqual(text, "TEXT::HK01810")
         self.assertEqual(direct["symbol"], "HK01810")
 
+    def test_bulk_load_seeds_and_trades_drops_to_two_queries(self):
+        """``_bulk_load_seeds_and_trades`` 必须只用 2 次 SQL 拉全部数据，
+        消灭 ``sync_portfolio`` / ``check_portfolio_consistency`` 的 N+1。
+        """
+        from spc_core.portfolio import _bulk_load_seeds_and_trades
+
+        # 准备 3 只持仓 + 各种 trade
+        add_position_seed(self.conn, self.acct_id, "a", "300750", "1000", "245.30",
+                          None, "2026-05-01 09:30:00", "")
+        add_position_seed(self.conn, self.acct_id, "hk", "01810", "500", "20.00",
+                          None, "2026-05-01 09:30:00", "")
+        add_trade(self.conn, self.acct_id, "a", "300750", "buy", "100", "250.00",
+                  "2026-05-05 10:00:00", None, None, None, None, None, None, "")
+        add_trade(self.conn, self.acct_id, "a", "300750", "sell", "50", "260.00",
+                  "2026-05-06 10:00:00", None, None, None, None, None, None, "")
+
+        symbols = [("a", "300750"), ("hk", "01810"), ("a", "300308")]
+
+        # 用 sqlite3 的 trace 回调监听 SQL 数量，避免 monkeypatch Connection.execute
+        calls: list[str] = []
+
+        def _trace(sql: str) -> None:
+            calls.append(sql.strip().split("\n")[0][:60])
+
+        self.conn.set_trace_callback(_trace)
+        try:
+            seeds, trades = _bulk_load_seeds_and_trades(self.conn, self.acct_id, symbols)
+        finally:
+            self.conn.set_trace_callback(None)
+
+        # 必须只 2 次 SELECT（不应按 symbol 数量发 SELECT）
+        select_calls = [c for c in calls if c.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(
+            len(select_calls), 2,
+            f"批量加载应只用 2 次 SELECT；实际：{select_calls}",
+        )
+        # 命中数据正确（qty 是 sqlite 里原样的字符串，q_qty 写入时是 4 位精度）
+        self.assertEqual(seeds[("a", "300750")]["qty"], "1000.0000")
+        self.assertEqual(seeds[("hk", "01810")]["qty"], "500.0000")
+        self.assertNotIn(("a", "300308"), seeds)  # 该 symbol 没 seed
+        self.assertEqual(len(trades[("a", "300750")]), 2)
+        self.assertNotIn(("hk", "01810"), trades)  # 没 trade
+        self.assertNotIn(("a", "300308"), trades)
+
+    def test_execution_plan_fill_summaries_lite_one_query(self):
+        """批量 fill summary 只用一次 GROUP BY 聚合 SQL，消灭 exec plan list 的 N+1。"""
+        from spc_core.ledger import (
+            create_execution_plan,
+            attach_trade_to_plan,
+            execution_plan_fill_summaries_lite,
+            list_execution_plans,
+        )
+
+        # 建 3 个 plan + 若干 trade
+        plan_a = create_execution_plan(
+            self.conn, self.acct_id, market="a", code="300750", side="buy",
+            action_type="open", thesis="test", target_qty="1000",
+        )
+        plan_b = create_execution_plan(
+            self.conn, self.acct_id, market="a", code="300308", side="buy",
+            action_type="open", thesis="test", target_qty="500",
+        )
+        plan_c = create_execution_plan(
+            self.conn, self.acct_id, market="hk", code="01810", side="buy",
+            action_type="open", thesis="test", target_cash_cny="50000",  # 用 cash 凑数
+        )
+        trade1 = add_trade(self.conn, self.acct_id, "a", "300750", "buy",
+                           "300", "250.0", "2026-05-05 10:00:00",
+                           None, None, None, None, None, None, "")
+        attach_trade_to_plan(self.conn, self.acct_id, plan_a, trade1)
+        trade2 = add_trade(self.conn, self.acct_id, "a", "300750", "buy",
+                           "200", "248.0", "2026-05-06 10:00:00",
+                           None, None, None, None, None, None, "")
+        attach_trade_to_plan(self.conn, self.acct_id, plan_a, trade2)
+        trade3 = add_trade(self.conn, self.acct_id, "a", "300308", "buy",
+                           "100", "920.0", "2026-05-05 10:00:00",
+                           None, None, None, None, None, None, "")
+        attach_trade_to_plan(self.conn, self.acct_id, plan_b, trade3)
+
+        plans = list_execution_plans(self.conn, self.acct_id, limit=10)
+
+        # 用 sqlite3 的 trace 回调监听 SQL 数量
+        calls: list[str] = []
+
+        def _trace(sql: str) -> None:
+            calls.append(sql.strip().split("\n")[0][:60])
+
+        self.conn.set_trace_callback(_trace)
+        try:
+            out = execution_plan_fill_summaries_lite(
+                self.conn, self.acct_id, [dict(p) for p in plans]
+            )
+        finally:
+            self.conn.set_trace_callback(None)
+
+        # 必须只一次 SELECT（GROUP BY 聚合）
+        select_calls = [c for c in calls if c.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(
+            len(select_calls), 1,
+            f"批量 fill summary 应只用 1 次 SELECT；实际：{select_calls}",
+        )
+
+        # plan_a: 300 + 200 = 500 / 1000 = 50%
+        self.assertEqual(out[plan_a]["filled_qty"], "500.0000")
+        self.assertEqual(out[plan_a]["completion_pct"], "50.0000")
+        # plan_b: 100 / 500 = 20%
+        self.assertEqual(out[plan_b]["filled_qty"], "100.0000")
+        self.assertEqual(out[plan_b]["completion_pct"], "20.0000")
+        # plan_c: 没 trade，0 filled；没 target_qty（仅 target_cash），qty 维度的 pct=None
+        self.assertEqual(out[plan_c]["filled_qty"], "0.0000")
+        self.assertIsNone(out[plan_c]["completion_pct"])
+
+    def test_provider_init_no_longer_requires_script_file(self):
+        """Regression: ``StockMarketHubProvider.__init__`` 不应再硬要求
+        ``<hub_dir>/scripts/analyze_company.py`` 文件存在。
+
+        历史包袱：旧版会把 script_path 校验放到 __init__，但 ``analyze_symbol()``
+        默认走 in-process 的 ``stock_core.company_analysis.analyze``，根本不读这个
+        文件；脚本被改名/挪走后会触发误导性的 "找不到分析脚本" 错误。
+        """
+        empty_hub = Path(self.tmp.name) / "empty-hub"
+        empty_hub.mkdir(parents=True)
+        # 不创建 scripts/analyze_company.py，按旧实现这里会抛 FileNotFoundError
+        provider = StockMarketHubProvider(hub_dir=str(empty_hub))
+        self.assertEqual(provider.hub_dir, empty_hub)
+        self.assertFalse(hasattr(provider, "script_path"))
+
     def test_openai_yaml_metadata_files(self):
         portfolio_yaml = (REPO_ROOT / "stock-portfolio-copilot" / "agents" / "openai.yaml").read_text(encoding="utf-8")
         market_yaml = (REPO_ROOT / "stock-market-hub" / "agents" / "openai.yaml").read_text(encoding="utf-8")

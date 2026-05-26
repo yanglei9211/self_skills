@@ -21,21 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
-
-def _ensure_paths() -> None:
-    current = Path(__file__).resolve()
-    scripts_dir = current.parent
-    shared_dir = current.parents[2] / "shared"
-    for p in (shared_dir, scripts_dir):
-        sp = str(p)
-        if sp not in sys.path:
-            sys.path.insert(0, sp)
-
-
-_ensure_paths()
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 和 scripts/ 加入 sys.path
 from stock_core.stock_market_hub import analyze_symbol, render_analysis_text  # noqa: E402
 
 

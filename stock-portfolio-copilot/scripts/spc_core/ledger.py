@@ -799,6 +799,72 @@ def list_execution_plans(
     return [dict(row) for row in rows]
 
 
+def execution_plan_fill_summaries_lite(
+    conn,
+    account_id: int,
+    plans: list[dict],
+) -> dict[int, dict]:
+    """批量算多个 plan 的填充进度（只算 ``filled_qty`` + ``completion_pct``），
+    供 ``spc exec plan list`` 这种"列表页只读两个字段"的场景使用。
+
+    旧实现：``cmd_exec_plan_list`` 会对每个 plan 调一次 ``get_execution_plan_detail``，
+    内部又触发完整的 ``execution_plan_fill_summary``（含 trades / reviews / cash /
+    position pct / 走 ``capital_settings`` 等等），属于典型 N+1：100 个 plan = 600+
+    SQL 往返。
+
+    这里只做最便宜的一次 ``GROUP BY plan_id`` 聚合，然后用入参里的 ``target_qty``
+    现算 ``completion_pct``。需要完整 detail 的调用方（show / detail / fill_summary）
+    继续走 :func:`execution_plan_fill_summary`。
+
+    Args:
+        plans: ``list_execution_plans`` 返回的行（dict-like，至少包含 ``id`` 和
+            ``target_qty``）。
+
+    Returns:
+        ``{plan_id: {"filled_qty": str, "completion_pct": str | None}}``
+    """
+    if not plans:
+        return {}
+    plan_ids = [int(p["id"]) for p in plans]
+    target_by_id: dict[int, str | None] = {int(p["id"]): p["target_qty"] for p in plans}
+    placeholders = ",".join(["?"] * len(plan_ids))
+    rows = conn.execute(
+        f"""
+        SELECT l.plan_id AS plan_id, SUM(t.qty) AS filled_qty
+          FROM trade_execution_link l
+          JOIN trade_ledger t ON t.id = l.trade_id
+         WHERE l.account_id = ?
+           AND l.plan_id IN ({placeholders})
+           AND t.is_deleted = 0
+         GROUP BY l.plan_id
+        """,
+        [account_id, *plan_ids],
+    ).fetchall()
+    filled_by_id: dict[int, Decimal] = {}
+    for row in rows:
+        filled_raw = row["filled_qty"]
+        if filled_raw is None:
+            continue
+        filled_by_id[int(row["plan_id"])] = to_decimal(filled_raw, "filled_qty")
+
+    out: dict[int, dict] = {}
+    for plan_id in plan_ids:
+        filled_qty = filled_by_id.get(plan_id, Decimal("0"))
+        target_qty_raw = target_by_id.get(plan_id)
+        completion_pct: str | None = None
+        if target_qty_raw:
+            target_qty = to_decimal(target_qty_raw, "target-qty")
+            if target_qty > 0:
+                completion_pct = decimal_str(
+                    q_price((filled_qty / target_qty) * Decimal("100"))
+                )
+        out[plan_id] = {
+            "filled_qty": decimal_str(q_qty(filled_qty)),
+            "completion_pct": completion_pct,
+        }
+    return out
+
+
 def execution_plan_fill_summary(conn, account_id: int, plan_id: int) -> dict:
     plan = _require_execution_plan(conn, account_id, plan_id)
     rows = conn.execute(

@@ -1,0 +1,53 @@
+---
+description: 本工作区强制走 superpowers skill 工作流：开 session / 改代码 / 收 review 前先 Read 对应 SKILL.md，多步独立任务派 subagent 并行
+alwaysApply: true
+---
+
+# Superpowers 工作流强制约束（本工作区）
+
+本工作区是 `self_skills` 仓库——管理一组对 stock / lark / 算卦 等领域至关重要的 skill。代码质量直接被多人复用，因此 agent 在这里工作时**必须按 superpowers 规范走**，不可以"凭感觉直接动手"。
+
+## 硬性入口（任何 session 开头）
+
+新 session 的**第一次助手响应之前**，必须用 `Read` 工具读：
+
+```
+/Users/dp/.cursor/plugins/local/superpowers/skills/using-superpowers/SKILL.md
+```
+
+读完后按它的 Red Flags / Priority 表自检；其后所有任务都遵循它给出的 skill 选择流程。
+
+⚠️ 本工作区是 Cursor IDE 环境，没有 `Skill` 工具。**用 `Read` 读 SKILL.md 即可**（system prompt 已经允许这种用法）。不要用 Cursor 找不存在的 `Skill` 工具。
+
+## 任务类型 → 必读 skill 映射
+
+收到用户请求后，先按下表判断是否要读对应 skill；命中即 `Read`，再开干。
+
+| 触发场景 | 必读 SKILL.md | 关键纪律 |
+|---|---|---|
+| 收到 code review / 反馈 / "看看这个报告" | `superpowers/.../receiving-code-review/SKILL.md` | 每条都先验真伪再改；报告可能不准 |
+| 多步实现 / 大重构 / 跨多个 skill 改动 | `superpowers/.../writing-plans/SKILL.md` | 先写 plan 文档，再执行 |
+| ≥2 个互相**独立**的任务（不同 skill / 不同 perf hotspot 等） | `superpowers/.../dispatching-parallel-agents/SKILL.md` | 用 `Task` 并发派 subagent，串行做是浪费 |
+| 实现新功能 / 修 bug（非紧急） | `superpowers/.../test-driven-development/SKILL.md` | 先写 failing test，再写实现 |
+| 任何 bug / 测试失败 / 异常现象 | `superpowers/.../systematic-debugging/SKILL.md` | 按四阶段（重现→隔离→定位→修复）走 |
+| 在 claim "已完成 / 已修复 / 测试都通过" 之前 | `superpowers/.../verification-before-completion/SKILL.md` | 必须有 evidence（命令输出），不能仅凭"看起来对" |
+| 创建 / 修改 skill 自身 | `superpowers/.../writing-skills/SKILL.md` + 本工作区 `skills-layout.mdc` | 真身在 `self_skills/`，`~/.cursor/skills/` 只能是软链接 |
+| 新功能、需求模糊、有多种实现路径 | `superpowers/.../brainstorming/SKILL.md` | 先和用户对齐 intent 再编码 |
+| 要开新分支 / 隔离改动 | `superpowers/.../using-git-worktrees/SKILL.md` | 优先 worktree，不要污染主工作区 |
+
+skill 实际路径前缀：`/Users/dp/.cursor/plugins/local/superpowers/skills/`（或 `/Users/dp/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/`，二者内容等价，任选其一）。
+
+## 完成自检
+
+在说"完成"前，必须能口头回答：
+
+1. 这个 session 用了哪几条 skill？分别在哪一步用的？
+2. 跑了哪些验证命令？输出贴在哪里？
+3. 有没有独立任务被串行做了（应该并发但没并发）？
+
+任何一项答不上来，就回头补齐再 claim 完成。
+
+## 例外
+
+- 用户**显式说**"不用 superpowers / 直接改 / 快速 hack" → 用户指令优先，按用户来
+- 完全不涉及代码的纯闲聊问答 → 跳过 skill 检查

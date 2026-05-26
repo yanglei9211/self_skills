@@ -29,14 +29,10 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from pathlib import Path
 
 # 让本脚本无论是通过 bin/smh 还是直接 `python3 scripts/xueqiu_market.py` 执行，
 # 都能 import 到 ``shared/stock_core``。
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.market_snapshot import BOARDS, enrich, fmt_amount  # noqa: E402,F401
 from stock_core.tz import CN_TZ  # noqa: E402
 from stock_core.xueqiu import XueqiuClient  # noqa: E402

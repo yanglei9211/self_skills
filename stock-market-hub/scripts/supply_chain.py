@@ -25,12 +25,8 @@ import json
 import re
 import sys
 from datetime import datetime
-from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.http import fetch  # noqa: E402
 from stock_core.eastmoney import (  # noqa: E402
     eastmoney_a_code,
@@ -163,7 +159,7 @@ def _get_board_constituents_em(board_code: str, top: int = 30) -> list[str]:
 def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
     """通过东财所属板块找同业公司，输出 PE/PB/ROE 等横向对比数据。"""
     try:
-        from stock_core.company_analysis import normalize_symbol  # type: ignore
+        from stock_core.symbols import normalize_symbol  # type: ignore
     except ImportError as e:
         print(f"[supply_chain] import peers deps failed: {e}", file=sys.stderr)
         return []
@@ -220,7 +216,8 @@ def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
 def get_peers_legacy(symbol: str, top: int = 8) -> list[dict]:
     """旧版：通过同花顺映射找同业（保留作 fallback）。"""
     try:
-        from stock_core.company_analysis import get_a_concepts, normalize_symbol  # type: ignore
+        from stock_core.company_analysis import get_a_concepts  # type: ignore
+        from stock_core.symbols import normalize_symbol  # type: ignore
         from scan_sector import get_sector_map, get_sector_constituents  # type: ignore
     except ImportError as e:
         print(f"[supply_chain] import peers deps failed: {e}", file=sys.stderr)
@@ -298,9 +295,6 @@ def get_peers_legacy(symbol: str, top: int = 8) -> list[dict]:
         return []
 
     print(f"[supply_chain] 同业概念：{target_name} (code={target_code})", file=sys.stderr)
-    consts = get_sector_constituents("concept", target_code)
-    consts = [c for c in consts if c != code][:top]
-
     consts = get_sector_constituents(sector_kind, target_code)
     consts = [x for x in consts if x != code][:top]
     print(f"[supply_chain] peers 概念={target_name} 成分={len(consts)}", file=sys.stderr)

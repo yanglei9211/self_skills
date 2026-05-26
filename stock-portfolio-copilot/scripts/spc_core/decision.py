@@ -894,6 +894,291 @@ def _decide_etf_for_watching(
     return "watch", Decimal("0.55"), extra_reasons, extra_risks, trace
 
 
+# ── 共享持仓价格风控 helper（股票 / ETF 同源） ────────────────────────
+#
+# P2a 预案价 / 权重超限 / P0b 分级止盈 / P2b trailing stop 这四块在股票分支
+# (_decide_for_holding) 和 ETF 分支 (_decide_etf_for_holding) 里以前是各写一份
+# （~200 行重复）。逻辑结构完全相同，仅 trace step 前缀（"" vs "etf_"）和文案
+# （"现价 …" vs "ETF 现价 …"）有差异，参数化后两分支共享。
+#
+# 注意 P0a 分级硬止损（T1/T2/T3 + 幂等保护）逻辑差异较多（exempt_hard_stop、
+# market_regime 软联动等），且测试断言对 confidence 数值非常敏感，故保留两份。
+
+def _hard_stop_thresholds(f: "Features", p: dict) -> tuple[Decimal, Decimal, Decimal]:
+    """根据标的类型 / 市场返回 P0a 三档硬止损阈值。"""
+    if f.is_etf:
+        return p["hard_stop_etf_t1"], p["hard_stop_etf_t2"], p["hard_stop_etf_t3"]
+    if f.market == MARKET_HK:
+        return p["hard_stop_hk_t1"], p["hard_stop_hk_t2"], p["hard_stop_hk_t3"]
+    return p["hard_stop_a_t1"], p["hard_stop_a_t2"], p["hard_stop_a_t3"]
+
+
+def _apply_p2a_plan_price(
+    f: "Features",
+    cur_price: Decimal,
+    *,
+    is_etf: bool,
+    record,
+    raise_to,
+    current,
+    extra_reasons: list[str],
+) -> None:
+    """P2a execution_plan 预案止损 / 止盈：sell @ 0.82 / trim @ 0.78。"""
+    prefix = "etf_" if is_etf else ""
+    px_label = "ETF 现价" if is_etf else "现价"
+    plan_suffix = "" if is_etf else "（execution_plan 配置）"
+
+    if f.plan_stop_loss_price is not None and cur_price <= f.plan_stop_loss_price:
+        record(
+            f"{prefix}plan_stop_loss", "sell", Decimal("0.82"),
+            f"{px_label} {cur_price} ≤ 预案止损价 {f.plan_stop_loss_price} → "
+            f"按计划 sell{plan_suffix}",
+        )
+        if is_etf:
+            extra_reasons.append(
+                f"ETF 现价已触及预案止损价 {f.plan_stop_loss_price}，按既定纪律退出"
+            )
+        else:
+            extra_reasons.append(
+                f"现价已触及预案止损价 {f.plan_stop_loss_price}，按既定纪律退出，"
+                "事后请走 exec review 复盘"
+            )
+    if (
+        f.plan_take_profit_price is not None
+        and cur_price >= f.plan_take_profit_price
+        and current()[0] != "sell"
+    ):
+        raise_to(
+            f"{prefix}plan_take_profit", "trim", Decimal("0.78"),
+            f"{px_label} {cur_price} ≥ 预案止盈价 {f.plan_take_profit_price} → "
+            f"按计划 trim{plan_suffix}",
+        )
+        if is_etf:
+            extra_reasons.append(
+                f"ETF 现价已达到预案止盈价 {f.plan_take_profit_price}，建议至少分批兑现"
+            )
+        else:
+            extra_reasons.append(
+                f"现价已达到预案止盈价 {f.plan_take_profit_price}，"
+                "建议至少分批兑现一部分利润"
+            )
+
+
+def _apply_weight_cap_trim(
+    f: "Features",
+    cur_price: Decimal,
+    max_single_pct: Decimal,
+    *,
+    is_etf: bool,
+    raise_to,
+    current,
+    extra_reasons: list[str],
+) -> None:
+    """仓位超单票上限 + 浮盈 → trim @ 0.70。"""
+    if not (
+        f.weight_pct > max_single_pct
+        and cur_price > f.avg_cost
+        and current()[0] != "sell"
+    ):
+        return
+    prefix = "etf_" if is_etf else ""
+    weight_label = "ETF 持仓权重" if is_etf else "持仓权重"
+    raise_to(
+        f"{prefix}weight_over_cap", "trim", Decimal("0.70"),
+        f"{weight_label} {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim",
+    )
+    if is_etf:
+        extra_reasons.append("ETF 仓位超过单票上限且已有浮盈，建议减仓")
+    else:
+        extra_reasons.append("当前仓位超过单票上限且已有浮盈")
+
+
+def _apply_p0b_take_profit(
+    f: "Features",
+    p: dict,
+    cur_price: Decimal,
+    *,
+    is_etf: bool,
+    record,
+    raise_to,
+    current,
+    extra_reasons: list[str],
+) -> None:
+    """P0b 分级止盈：按 gain_pct 分 T1/T2/T3 三档，叠加顶部/反转信号升 sell。"""
+    if not (cur_price > f.avg_cost and current()[0] != "sell"):
+        return
+    prefix = "etf_" if is_etf else ""
+    px_label = "ETF " if is_etf else ""
+    gain_pct = (cur_price - f.avg_cost) / f.avg_cost
+    top_signal = (
+        f.regime in HIGH_REGIMES
+        and f.ff_regime == FUND_PERSISTENT_OUTFLOW
+    )
+    ff_turning_down = (f.ff_reversal == FUND_REVERSAL_DOWN)
+    top_or_turning = top_signal or ff_turning_down
+
+    if gain_pct >= p["tp_t3"]:
+        pct_disp = gain_pct * Decimal("100")
+        if top_or_turning:
+            record(
+                f"{prefix}take_profit_t3+top", "sell", Decimal("0.82"),
+                f"{px_label}浮盈 ≥{p['tp_t3'] * 100:.0f}%（{pct_disp:.1f}%）+ "
+                "顶部信号 → sell" if is_etf else
+                f"浮盈 ≥{p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
+                "顶部/资金反转信号 → 升级 sell",
+            )
+            if is_etf:
+                extra_reasons.append(
+                    f"ETF 浮盈已超过 {p['tp_t3'] * 100:.0f}% 且出现顶部 / 资金反转，"
+                    "建议大幅止盈退出"
+                )
+            else:
+                extra_reasons.append(
+                    f"浮盈已超过 {p['tp_t3'] * 100:.0f}% 且出现顶部 / 资金反转信号，"
+                    "建议大幅止盈（如 2/3 以上）退出"
+                )
+        else:
+            raise_to(
+                f"{prefix}take_profit_t3", "trim", Decimal("0.78"),
+                f"{px_label}浮盈 ≥{p['tp_t3'] * 100:.0f}%（{pct_disp:.1f}%）→ 大幅止盈"
+                if is_etf else
+                f"浮盈 ≥{p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ 分批止盈锁定利润",
+            )
+            if is_etf:
+                extra_reasons.append(
+                    f"ETF 浮盈已超过 {pct_disp:.1f}%，建议至少减半锁定利润"
+                )
+            else:
+                extra_reasons.append(
+                    f"浮盈已超过 {p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%），"
+                    "建议至少减半锁定利润，剩余仓位用 trailing stop 跟踪"
+                )
+    elif gain_pct >= p["tp_t2"]:
+        pct_disp = gain_pct * Decimal("100")
+        if top_or_turning:
+            record(
+                f"{prefix}take_profit_t2+top", "sell", Decimal("0.80"),
+                f"{px_label}浮盈 ≥{p['tp_t2'] * 100:.0f}%（{pct_disp:.1f}%）+ "
+                "顶部信号 → sell" if is_etf else
+                f"浮盈 ≥{p['tp_t2'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
+                "顶部/资金反转信号 → 升级 sell",
+            )
+            if is_etf:
+                extra_reasons.append(
+                    f"ETF 浮盈已达 {pct_disp:.1f}% + 顶部信号，建议升级为 sell"
+                )
+            else:
+                extra_reasons.append(
+                    f"浮盈已达 {pct_disp:.1f}% 且出现顶部 / 资金反转信号，"
+                    "建议升级为 sell 锁定大部分利润"
+                )
+        else:
+            raise_to(
+                f"{prefix}take_profit_t2", "trim", Decimal("0.75"),
+                f"{px_label}浮盈 ≥{p['tp_t2'] * 100:.0f}%（{pct_disp:.1f}%）→ 分批止盈"
+                if is_etf else
+                f"浮盈 ≥{p['tp_t2'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ 分批止盈",
+            )
+            if is_etf:
+                extra_reasons.append(f"ETF 浮盈已达 {pct_disp:.1f}%，建议分批止盈")
+            else:
+                extra_reasons.append(
+                    f"浮盈已达 {pct_disp:.1f}%，建议分批止盈（如 1/3），剩余继续持有"
+                )
+    elif gain_pct >= p["tp_t1"]:
+        pct_disp = gain_pct * Decimal("100")
+        if f.regime in HIGH_REGIMES and ff_turning_down:
+            raise_to(
+                f"{prefix}take_profit_t1+reversal", "trim", Decimal("0.70"),
+                f"{px_label}浮盈 ≥{p['tp_t1'] * 100:.0f}% + 创新高 + 资金反转 → 局部止盈"
+                if is_etf else
+                f"浮盈 ≥{p['tp_t1'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
+                "创新高 + 资金反转 → 局部止盈",
+            )
+            if is_etf:
+                extra_reasons.append(
+                    f"ETF 浮盈已达 {pct_disp:.1f}%，叠加创新高 + 资金反转，"
+                    "建议先止盈一部分"
+                )
+            else:
+                extra_reasons.append(
+                    f"浮盈已达 {pct_disp:.1f}%，价格创新高叠加资金反转，"
+                    "建议先止盈一部分（如 1/4），剩余跟趋势"
+                )
+        else:
+            raise_to(
+                f"{prefix}take_profit_t1", "trim", Decimal("0.65"),
+                f"{px_label}浮盈 ≥{p['tp_t1'] * 100:.0f}%（{pct_disp:.1f}%）→ 温和止盈"
+                if is_etf else
+                f"浮盈 ≥{p['tp_t1'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ 温和止盈提示",
+            )
+            if is_etf:
+                extra_reasons.append(
+                    f"ETF 浮盈已达 {pct_disp:.1f}%，可考虑分批兑现部分利润"
+                )
+            else:
+                extra_reasons.append(
+                    f"浮盈已达 {pct_disp:.1f}%，可考虑分批兑现部分利润，"
+                    "但趋势良好时不必急于全退"
+                )
+
+
+def _apply_p2b_trailing_stop(
+    f: "Features",
+    p: dict,
+    cur_price: Decimal,
+    *,
+    is_etf: bool,
+    record,
+    raise_to,
+    current,
+    extra_reasons: list[str],
+) -> None:
+    """P2b trailing stop（持仓期间最高价回撤）→ trim / sell。"""
+    if not (
+        f.peak_price is not None
+        and f.peak_price > 0
+        and cur_price > f.avg_cost
+        and current()[0] != "sell"
+    ):
+        return
+    prefix = "etf_" if is_etf else ""
+    peak_label = "ETF 持仓期间最高" if is_etf else "持仓期间最高"
+    drawdown = (f.peak_price - cur_price) / f.peak_price
+    if drawdown >= p["trail_severe_pct"]:
+        record(
+            f"{prefix}trailing_stop_severe", "sell", Decimal("0.78"),
+            f"{peak_label} {f.peak_price} → 现价 {cur_price} 回撤 "
+            f"{drawdown * 100:.1f}% ≥ {p['trail_severe_pct'] * 100:.0f}% → sell",
+        )
+        if is_etf:
+            extra_reasons.append(
+                f"ETF 现价已从持仓期间最高 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                "趋势已走坏，建议退出剩余仓位"
+            )
+        else:
+            extra_reasons.append(
+                f"现价已从持仓期间最高价 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                "趋势已实质走坏，建议止盈退出剩余仓位"
+            )
+    elif drawdown >= p["trail_pct"]:
+        raise_to(
+            f"{prefix}trailing_stop", "trim", Decimal("0.72"),
+            f"{peak_label} {f.peak_price} → 现价 {cur_price} 回撤 "
+            f"{drawdown * 100:.1f}% ≥ {p['trail_pct'] * 100:.0f}% → trim",
+        )
+        if is_etf:
+            extra_reasons.append(
+                f"ETF 现价已从持仓期间最高 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                "建议先减仓锁定一部分利润"
+            )
+        else:
+            extra_reasons.append(
+                f"现价已从持仓期间最高价 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
+                "建议先减仓锁定一部分利润，避免回吐过多"
+            )
+
+
 def _decide_etf_for_holding(
     f: Features,
     max_single_pct: Decimal,
@@ -939,9 +1224,7 @@ def _decide_etf_for_holding(
     # ── 4-8. 通用价格风控（与股票持仓侧对齐） ─────────────────
     if f.current is not None and f.avg_cost > 0:
         cur_price = to_decimal(f.current, "current")
-        t1 = p["hard_stop_etf_t1"]
-        t2 = p["hard_stop_etf_t2"]
-        t3 = p["hard_stop_etf_t3"]
+        t1, t2, t3 = _hard_stop_thresholds(f, p)
 
         # ── 4. P0a 分级硬止损（与股票分支对齐，三档 + 大盘联动 + 分档幂等） ──
         # ETF 没有"风险公告 + 跌 8% = sell"那条 L4 规则的对应分支
@@ -998,114 +1281,27 @@ def _decide_etf_for_holding(
                         "建议减半仓锁定损失，给行业方向留出修复机会"
                     )
 
-        # ── 5. P2a execution_plan 预案价位 ────────────────────
-        if f.plan_stop_loss_price is not None and cur_price <= f.plan_stop_loss_price:
-            record("etf_plan_stop_loss", "sell", Decimal("0.82"),
-                   f"ETF 现价 {cur_price} ≤ 预案止损价 {f.plan_stop_loss_price} → "
-                   "按计划 sell")
-            extra_reasons.append(
-                f"ETF 现价已触及预案止损价 {f.plan_stop_loss_price}，按既定纪律退出"
-            )
-        if (
-            f.plan_take_profit_price is not None
-            and cur_price >= f.plan_take_profit_price
-            and current()[0] != "sell"
-        ):
-            raise_to("etf_plan_take_profit", "trim", Decimal("0.78"),
-                     f"ETF 现价 {cur_price} ≥ 预案止盈价 {f.plan_take_profit_price} → "
-                     "按计划 trim")
-            extra_reasons.append(
-                f"ETF 现价已达到预案止盈价 {f.plan_take_profit_price}，建议至少分批兑现"
-            )
-
-        # ── 6. 仓位超限 + 浮盈 → trim ─────────────────────────
-        if (
-            f.weight_pct > max_single_pct
-            and cur_price > f.avg_cost
-            and current()[0] != "sell"
-        ):
-            raise_to("etf_weight_over_cap", "trim", Decimal("0.70"),
-                     f"ETF 持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
-            extra_reasons.append("ETF 仓位超过单票上限且已有浮盈，建议减仓")
-
-        # ── 7. P0b 分级止盈（ETF 同股票） ─────────────────────
-        if cur_price > f.avg_cost and current()[0] != "sell":
-            gain_pct = (cur_price - f.avg_cost) / f.avg_cost
-            top_signal = (
-                f.regime in HIGH_REGIMES
-                and f.ff_regime == FUND_PERSISTENT_OUTFLOW
-            )
-            ff_turning_down = (f.ff_reversal == FUND_REVERSAL_DOWN)
-            top_or_turning = top_signal or ff_turning_down
-
-            if gain_pct >= p["tp_t3"]:
-                pct_disp = gain_pct * Decimal("100")
-                if top_or_turning:
-                    record("etf_take_profit_t3+top", "sell", Decimal("0.82"),
-                           f"ETF 浮盈 ≥{p['tp_t3'] * 100:.0f}%（{pct_disp:.1f}%）+ 顶部信号 → sell")
-                    extra_reasons.append(
-                        f"ETF 浮盈已超过 {p['tp_t3'] * 100:.0f}% 且出现顶部 / 资金反转，"
-                        "建议大幅止盈退出"
-                    )
-                else:
-                    raise_to("etf_take_profit_t3", "trim", Decimal("0.78"),
-                             f"ETF 浮盈 ≥{p['tp_t3'] * 100:.0f}%（{pct_disp:.1f}%）→ 大幅止盈")
-                    extra_reasons.append(
-                        f"ETF 浮盈已超过 {pct_disp:.1f}%，建议至少减半锁定利润"
-                    )
-            elif gain_pct >= p["tp_t2"]:
-                pct_disp = gain_pct * Decimal("100")
-                if top_or_turning:
-                    record("etf_take_profit_t2+top", "sell", Decimal("0.80"),
-                           f"ETF 浮盈 ≥{p['tp_t2'] * 100:.0f}%（{pct_disp:.1f}%）+ 顶部信号 → sell")
-                    extra_reasons.append(
-                        f"ETF 浮盈已达 {pct_disp:.1f}% + 顶部信号，建议升级为 sell"
-                    )
-                else:
-                    raise_to("etf_take_profit_t2", "trim", Decimal("0.75"),
-                             f"ETF 浮盈 ≥{p['tp_t2'] * 100:.0f}%（{pct_disp:.1f}%）→ 分批止盈")
-                    extra_reasons.append(
-                        f"ETF 浮盈已达 {pct_disp:.1f}%，建议分批止盈"
-                    )
-            elif gain_pct >= p["tp_t1"]:
-                pct_disp = gain_pct * Decimal("100")
-                if f.regime in HIGH_REGIMES and ff_turning_down:
-                    raise_to("etf_take_profit_t1+reversal", "trim", Decimal("0.70"),
-                             f"ETF 浮盈 ≥{p['tp_t1'] * 100:.0f}% + 创新高 + 资金反转 → 局部止盈")
-                    extra_reasons.append(
-                        f"ETF 浮盈已达 {pct_disp:.1f}%，叠加创新高 + 资金反转，建议先止盈一部分"
-                    )
-                else:
-                    raise_to("etf_take_profit_t1", "trim", Decimal("0.65"),
-                             f"ETF 浮盈 ≥{p['tp_t1'] * 100:.0f}%（{pct_disp:.1f}%）→ 温和止盈")
-                    extra_reasons.append(
-                        f"ETF 浮盈已达 {pct_disp:.1f}%，可考虑分批兑现部分利润"
-                    )
-
-        # ── 8. P2b trailing stop（ETF 同股票） ────────────────
-        if (
-            f.peak_price is not None
-            and f.peak_price > 0
-            and cur_price > f.avg_cost
-            and current()[0] != "sell"
-        ):
-            drawdown = (f.peak_price - cur_price) / f.peak_price
-            if drawdown >= p["trail_severe_pct"]:
-                record("etf_trailing_stop_severe", "sell", Decimal("0.78"),
-                       f"ETF 持仓期间最高 {f.peak_price} → 现价 {cur_price} 回撤 "
-                       f"{drawdown * 100:.1f}% ≥ {p['trail_severe_pct'] * 100:.0f}% → sell")
-                extra_reasons.append(
-                    f"ETF 现价已从持仓期间最高 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
-                    "趋势已走坏，建议退出剩余仓位"
-                )
-            elif drawdown >= p["trail_pct"]:
-                raise_to("etf_trailing_stop", "trim", Decimal("0.72"),
-                         f"ETF 持仓期间最高 {f.peak_price} → 现价 {cur_price} 回撤 "
-                         f"{drawdown * 100:.1f}% ≥ {p['trail_pct'] * 100:.0f}% → trim")
-                extra_reasons.append(
-                    f"ETF 现价已从持仓期间最高 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
-                    "建议先减仓锁定一部分利润"
-                )
+        # ── 5-8. 共享：P2a 预案 / cap / P0b 止盈 / P2b trailing stop ──
+        _apply_p2a_plan_price(
+            f, cur_price, is_etf=True,
+            record=record, raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
+        _apply_weight_cap_trim(
+            f, cur_price, max_single_pct, is_etf=True,
+            raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
+        _apply_p0b_take_profit(
+            f, p, cur_price, is_etf=True,
+            record=record, raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
+        _apply_p2b_trailing_stop(
+            f, p, cur_price, is_etf=True,
+            record=record, raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
 
         # ── 残股识别（摊薄成本 >> 现价） ─────────────────────
         if f.avg_cost > cur_price * _ETF_RESIDUAL_THRESHOLD:
@@ -1188,18 +1384,7 @@ def _decide_for_holding(
     # ── 3-8. 价格驱动的止损/止盈/加仓/trailing 都需要现价 + 成本 ─
     if f.current is not None and f.avg_cost > 0:
         cur_price = to_decimal(f.current, "current")
-        if f.is_etf:
-            t1 = p["hard_stop_etf_t1"]
-            t2 = p["hard_stop_etf_t2"]
-            t3 = p["hard_stop_etf_t3"]
-        elif f.market == MARKET_HK:
-            t1 = p["hard_stop_hk_t1"]
-            t2 = p["hard_stop_hk_t2"]
-            t3 = p["hard_stop_hk_t3"]
-        else:
-            t1 = p["hard_stop_a_t1"]
-            t2 = p["hard_stop_a_t2"]
-            t3 = p["hard_stop_a_t3"]
+        t1, t2, t3 = _hard_stop_thresholds(f, p)
 
         # ── 3. L4 旧规则升档：跌 8% + 风险公告 → sell @ 0.80 ─────
         # 旧规则保留触发条件（跌 8% + 风险公告），但 confidence 从 0.78 升到 0.80：
@@ -1289,130 +1474,28 @@ def _decide_for_holding(
                         f"建议减半仓锁定损失，给标的留出修复机会"
                     )
 
-        # ── 5. P2a execution_plan 预案价位 ────────────────────
-        # 用户事前手填的 stop_loss / take_profit 拥有较高优先级：
-        # 一旦触发，trace 会显式标注 "from_execution_plan"，避免和系统规则混淆。
-        if f.plan_stop_loss_price is not None and cur_price <= f.plan_stop_loss_price:
-            record("plan_stop_loss", "sell", Decimal("0.82"),
-                   f"现价 {cur_price} ≤ 预案止损价 {f.plan_stop_loss_price} → "
-                   f"按计划 sell（execution_plan 配置）")
-            extra_reasons.append(
-                f"现价已触及预案止损价 {f.plan_stop_loss_price}，按既定纪律退出，"
-                "事后请走 exec review 复盘"
-            )
-        if (
-            f.plan_take_profit_price is not None
-            and cur_price >= f.plan_take_profit_price
-            and current()[0] != "sell"
-        ):
-            raise_to("plan_take_profit", "trim", Decimal("0.78"),
-                     f"现价 {cur_price} ≥ 预案止盈价 {f.plan_take_profit_price} → "
-                     f"按计划 trim（execution_plan 配置）")
-            extra_reasons.append(
-                f"现价已达到预案止盈价 {f.plan_take_profit_price}，建议至少分批兑现一部分利润"
-            )
-
-        # ── 6. 仓位超限 + 浮盈 → trim（保留旧规则） ─────────────
-        if (
-            f.weight_pct > max_single_pct
-            and cur_price > f.avg_cost
-            and current()[0] != "sell"
-        ):
-            raise_to("weight_over_cap", "trim", Decimal("0.70"),
-                     f"持仓权重 {f.weight_pct}% > 单票上限 {max_single_pct}% 且浮盈 → trim")
-            extra_reasons.append("当前仓位超过单票上限且已有浮盈")
-
-        # ── 7. P0b 分级止盈 ────────────────────────────────────
-        # gain_pct 用 (cur - avg) / avg；只在浮盈状态下评估，亏损交给止损路径处理
-        if cur_price > f.avg_cost and current()[0] != "sell":
-            gain_pct = (cur_price - f.avg_cost) / f.avg_cost
-            # 顶部 / 资金反转叠加信号：让止盈从 trim 升级为 sell
-            top_signal = (
-                f.regime in HIGH_REGIMES
-                and f.ff_regime == FUND_PERSISTENT_OUTFLOW
-            )
-            ff_turning_down = (f.ff_reversal == FUND_REVERSAL_DOWN)
-            top_or_turning = top_signal or ff_turning_down
-
-            if gain_pct >= p["tp_t3"]:
-                pct_disp = gain_pct * Decimal("100")
-                if top_or_turning:
-                    record("take_profit_t3+top", "sell", Decimal("0.82"),
-                           f"浮盈 ≥{p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
-                           f"顶部/资金反转信号 → 升级 sell")
-                    extra_reasons.append(
-                        f"浮盈已超过 {p['tp_t3'] * 100:.0f}% 且出现顶部 / 资金反转信号，"
-                        "建议大幅止盈（如 2/3 以上）退出"
-                    )
-                else:
-                    raise_to("take_profit_t3", "trim", Decimal("0.78"),
-                             f"浮盈 ≥{p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ "
-                             "分批止盈锁定利润")
-                    extra_reasons.append(
-                        f"浮盈已超过 {p['tp_t3'] * 100:.0f}%（实际 {pct_disp:.1f}%），"
-                        "建议至少减半锁定利润，剩余仓位用 trailing stop 跟踪"
-                    )
-            elif gain_pct >= p["tp_t2"]:
-                pct_disp = gain_pct * Decimal("100")
-                if top_or_turning:
-                    record("take_profit_t2+top", "sell", Decimal("0.80"),
-                           f"浮盈 ≥{p['tp_t2'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
-                           "顶部/资金反转信号 → 升级 sell")
-                    extra_reasons.append(
-                        f"浮盈已达 {pct_disp:.1f}% 且出现顶部 / 资金反转信号，"
-                        "建议升级为 sell 锁定大部分利润"
-                    )
-                else:
-                    raise_to("take_profit_t2", "trim", Decimal("0.75"),
-                             f"浮盈 ≥{p['tp_t2'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ "
-                             "分批止盈")
-                    extra_reasons.append(
-                        f"浮盈已达 {pct_disp:.1f}%，建议分批止盈（如 1/3），剩余继续持有"
-                    )
-            elif gain_pct >= p["tp_t1"]:
-                pct_disp = gain_pct * Decimal("100")
-                if f.regime in HIGH_REGIMES and ff_turning_down:
-                    raise_to("take_profit_t1+reversal", "trim", Decimal("0.70"),
-                             f"浮盈 ≥{p['tp_t1'] * 100:.0f}%（实际 {pct_disp:.1f}%）+ "
-                             "创新高 + 资金反转 → 局部止盈")
-                    extra_reasons.append(
-                        f"浮盈已达 {pct_disp:.1f}%，价格创新高叠加资金反转，"
-                        "建议先止盈一部分（如 1/4），剩余跟趋势"
-                    )
-                else:
-                    raise_to("take_profit_t1", "trim", Decimal("0.65"),
-                             f"浮盈 ≥{p['tp_t1'] * 100:.0f}%（实际 {pct_disp:.1f}%）→ "
-                             "温和止盈提示")
-                    extra_reasons.append(
-                        f"浮盈已达 {pct_disp:.1f}%，可考虑分批兑现部分利润，"
-                        "但趋势良好时不必急于全退"
-                    )
-
-        # ── 8. P2b trailing stop（持仓期间最高价回撤） ──────────
-        # 仅在浮盈状态下生效（亏损交给硬止损），用持仓期间最高价作锚
-        if (
-            f.peak_price is not None
-            and f.peak_price > 0
-            and cur_price > f.avg_cost
-            and current()[0] != "sell"
-        ):
-            drawdown = (f.peak_price - cur_price) / f.peak_price
-            if drawdown >= p["trail_severe_pct"]:
-                record("trailing_stop_severe", "sell", Decimal("0.78"),
-                       f"持仓期间最高 {f.peak_price} → 现价 {cur_price} "
-                       f"回撤 {drawdown * 100:.1f}% ≥ {p['trail_severe_pct'] * 100:.0f}% → sell")
-                extra_reasons.append(
-                    f"现价已从持仓期间最高价 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
-                    "趋势已实质走坏，建议止盈退出剩余仓位"
-                )
-            elif drawdown >= p["trail_pct"]:
-                raise_to("trailing_stop", "trim", Decimal("0.72"),
-                         f"持仓期间最高 {f.peak_price} → 现价 {cur_price} "
-                         f"回撤 {drawdown * 100:.1f}% ≥ {p['trail_pct'] * 100:.0f}% → trim")
-                extra_reasons.append(
-                    f"现价已从持仓期间最高价 {f.peak_price} 回撤 {drawdown * 100:.1f}%，"
-                    "建议先减仓锁定一部分利润，避免回吐过多"
-                )
+        # ── 5-8. 共享：P2a 预案 / cap / P0b 止盈 / P2b trailing stop ──
+        # 这 4 块与 ETF 持仓分支结构完全相同，参数化共享（is_etf=False 走股票文案）。
+        _apply_p2a_plan_price(
+            f, cur_price, is_etf=False,
+            record=record, raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
+        _apply_weight_cap_trim(
+            f, cur_price, max_single_pct, is_etf=False,
+            raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
+        _apply_p0b_take_profit(
+            f, p, cur_price, is_etf=False,
+            record=record, raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
+        _apply_p2b_trailing_stop(
+            f, p, cur_price, is_etf=False,
+            record=record, raise_to=raise_to, current=current,
+            extra_reasons=extra_reasons,
+        )
 
         # ── 9. P1a 加仓（仅在没有任何减仓/止损/止盈信号时考虑） ──
         # 触发条件：

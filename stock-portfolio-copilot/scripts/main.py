@@ -18,6 +18,7 @@ from spc_core.ledger import (
     create_execution_plan,
     delete_trade,
     delete_watch,
+    execution_plan_fill_summaries_lite,
     get_execution_plan_detail,
     latest_analysis_run,
     latest_snapshots,
@@ -603,9 +604,14 @@ def cmd_exec_plan_list(args, conn) -> None:
     if not rows:
         print("暂无执行计划")
         return
+    # 列表页只需要 filled_qty + completion_pct，旧实现逐 plan 调
+    # get_execution_plan_detail（内部 6+ SQL）属于 N+1。这里改成一次批量聚合。
+    fills_by_id = execution_plan_fill_summaries_lite(
+        conn, acct["id"], [dict(row) for row in rows]
+    )
     table_rows = []
     for row in rows:
-        fill = get_execution_plan_detail(conn, acct["id"], row["id"])["fill_summary"]
+        fill = fills_by_id.get(int(row["id"]), {"filled_qty": "0", "completion_pct": None})
         table_rows.append(
             [
                 row["id"],

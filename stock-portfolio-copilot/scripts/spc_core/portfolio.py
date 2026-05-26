@@ -60,6 +60,45 @@ def _derive_trade_fees(conn, trade: dict) -> tuple[Decimal, Decimal]:
     return total_fees, stamp
 
 
+def _bulk_load_seeds_and_trades(
+    conn,
+    account_id: int,
+    symbols: list[tuple[str, str]],
+) -> tuple[dict[tuple[str, str], dict], dict[tuple[str, str], list[dict]]]:
+    """一次性把指定账户下所有 seeds 和 trade_ledger 全部捞回内存，按 (market, code) 索引。
+
+    用来替代 ``sync_portfolio`` / ``check_portfolio_consistency`` 旧逻辑里
+    "for sym: SELECT seed; SELECT trades" 的 N+1（50 个持仓 = 100 次往返）。
+
+    总查询变成 2 次 SQL，结果按 ``symbols`` 集合 / 实际命中范围切片即可。
+    """
+    wanted = set(symbols)
+    seeds_by_key: dict[tuple[str, str], dict] = {}
+    seed_rows = conn.execute(
+        "SELECT * FROM position_seed WHERE account_id = ?",
+        (account_id,),
+    ).fetchall()
+    for row in seed_rows:
+        key = (row["market"], row["code"])
+        if not wanted or key in wanted:
+            seeds_by_key[key] = dict(row)
+
+    trades_by_key: dict[tuple[str, str], list[dict]] = {}
+    trade_rows = conn.execute(
+        """
+        SELECT * FROM trade_ledger
+         WHERE account_id = ? AND is_deleted = 0
+         ORDER BY trade_time, id
+        """,
+        (account_id,),
+    ).fetchall()
+    for row in trade_rows:
+        key = (row["market"], row["code"])
+        if not wanted or key in wanted:
+            trades_by_key.setdefault(key, []).append(dict(row))
+    return seeds_by_key, trades_by_key
+
+
 def _symbol_universe(conn, account_id: int, market: str | None, code: str | None) -> list[tuple[str, str]]:
     if code and not market:
         raise ValueError("只传 code 时必须同时传 market")
@@ -91,20 +130,13 @@ def sync_portfolio(conn, account_id: int, market: str | None = None, code: str |
     provider = analysis_provider or StockMarketHubProvider()
     fx_provider = fx_rate_provider or FXRateProvider()
     symbols = _symbol_universe(conn, account_id, market, code)
+    # N+1 修复：一次性预加载所有 seeds + trades，按 (market, code) 索引。
+    # 旧实现每个 symbol 各发 2 次 SQL（50 持仓 = 100 次往返）；现在只 2 次总查询。
+    seeds_by_key, trades_by_key = _bulk_load_seeds_and_trades(conn, account_id, symbols)
     snapshots = []
     for sym_market, sym_code in symbols:
-        seed = conn.execute(
-            "SELECT * FROM position_seed WHERE account_id = ? AND market = ? AND code = ?",
-            (account_id, sym_market, sym_code),
-        ).fetchone()
-        trades = conn.execute(
-            """
-            SELECT * FROM trade_ledger
-             WHERE account_id = ? AND market = ? AND code = ? AND is_deleted = 0
-             ORDER BY trade_time, id
-            """,
-            (account_id, sym_market, sym_code),
-        ).fetchall()
+        seed = seeds_by_key.get((sym_market, sym_code))
+        trades = trades_by_key.get((sym_market, sym_code), [])
         qty = Decimal(seed["qty"]) if seed else Decimal("0")
         avg_cost = Decimal(seed["cost_price"]) if seed else Decimal("0")
         cost_basis = q_money(qty * avg_cost)
@@ -112,8 +144,7 @@ def sync_portfolio(conn, account_id: int, market: str | None = None, code: str |
         total_fees = Decimal("0")
         currency = seed["currency"] if seed else default_currency(sym_market)
 
-        for trade_row in trades:
-            trade = dict(trade_row)
+        for trade in trades:
             t_qty = to_decimal(trade["qty"], "qty")
             t_price = to_decimal(trade["price"], "price")
             amount = q_money(t_qty * t_price)
@@ -270,20 +301,13 @@ def check_portfolio_consistency(conn, account_id: int) -> list[dict]:
         (account_id, account_id),
     ).fetchall()
     symbols = [(r["market"], r["code"]) for r in rows]
+    # N+1 修复：一次性预加载所有 seeds + trades 而不是 for-each-symbol 各 SELECT 一次。
+    seeds_by_key, trades_by_key = _bulk_load_seeds_and_trades(conn, account_id, symbols)
 
     reports: list[dict] = []
     for sym_market, sym_code in symbols:
-        seed = conn.execute(
-            "SELECT qty, cost_price, currency, note FROM position_seed "
-            "WHERE account_id = ? AND market = ? AND code = ?",
-            (account_id, sym_market, sym_code),
-        ).fetchone()
-        trades = conn.execute(
-            "SELECT side, qty, price FROM trade_ledger "
-            "WHERE account_id = ? AND market = ? AND code = ? AND is_deleted = 0 "
-            "ORDER BY trade_time, id",
-            (account_id, sym_market, sym_code),
-        ).fetchall()
+        seed = seeds_by_key.get((sym_market, sym_code))
+        trades = trades_by_key.get((sym_market, sym_code), [])
         snap = latest_snapshot_for_symbol(conn, account_id, sym_market, sym_code)
         snap_source = (snap or {}).get("source") or ""
         snap_is_manual = snap_source.startswith("manual_")

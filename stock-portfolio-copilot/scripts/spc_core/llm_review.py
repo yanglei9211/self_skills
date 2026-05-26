@@ -306,6 +306,8 @@ def _invoke_codex(prompt: str, schema_path: str, timeout: int) -> str:
         input=prompt,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         env={**os.environ, "NO_COLOR": "1"},
     )
@@ -330,6 +332,8 @@ def _invoke_claude(prompt: str, schema_json: str, timeout: int) -> str:
         input=prompt,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
     if proc.returncode != 0:

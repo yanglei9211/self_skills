@@ -38,16 +38,20 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.http import fetch  # noqa: E402
 
 
 CACHE_DIR = Path.home() / ".cache" / "stock-market-hub" / "pdfs"
+
+# 年报 / 招股书有勘误修正版本，30 天再回源一次足够新鲜，又避免反复拉同一文件。
+# 历史包袱：原实现 TTL=∞ + 非原子写入 → 进程被 kill 时残留 <1KB 截断文件被
+# 永久缓存（>1024 字节也可能损坏但同样被永远命中）。
+_PDF_CACHE_TTL_SECONDS = 30 * 86400
+_PDF_MIN_VALID_BYTES = 1024
 
 
 # 章节定位关键词（A 股 / 港股年报通用）
@@ -160,21 +164,52 @@ SECTION_PATTERNS = {
 # ============ 下载 PDF ============ #
 
 def download_pdf(url: str) -> Path:
-    """下载 PDF 到缓存。"""
+    """下载 PDF 到缓存。
+
+    缓存策略：
+      - 文件大小 > 1KB 且 mtime 在 ``_PDF_CACHE_TTL_SECONDS`` 之内 → 命中。
+      - 否则重新下载，写入用 ``tmp + rename`` 保证原子（避免进程中途被 kill
+        留下截断文件，结合无限 TTL 永久毒化缓存）。
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256(url.encode()).hexdigest()[:16]
     fname = re.sub(r"[^A-Za-z0-9_.-]", "_", url.rsplit("/", 1)[-1])[:80]
     path = CACHE_DIR / f"{h}_{fname}"
     if not path.suffix.lower().endswith("pdf"):
         path = path.with_suffix(path.suffix + ".pdf")
-    if path.exists() and path.stat().st_size > 1024:
-        print(f"[pdf_extract] cached: {path}", file=sys.stderr)
-        return path
+    if path.exists():
+        st = path.stat()
+        age = time.time() - st.st_mtime
+        if st.st_size > _PDF_MIN_VALID_BYTES and age < _PDF_CACHE_TTL_SECONDS:
+            print(f"[pdf_extract] cached: {path}", file=sys.stderr)
+            return path
+        if st.st_size <= _PDF_MIN_VALID_BYTES:
+            print(f"[pdf_extract] cache evict (truncated, {st.st_size}B): {path}", file=sys.stderr)
+        else:
+            print(
+                f"[pdf_extract] cache stale ({age/86400:.0f}d > {_PDF_CACHE_TTL_SECONDS/86400:.0f}d): {path}",
+                file=sys.stderr,
+            )
     print(f"[pdf_extract] downloading: {url}", file=sys.stderr)
     r = fetch(url, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"PDF 下载失败 HTTP {r.status_code}")
-    path.write_bytes(r.content)
+    if len(r.content) <= _PDF_MIN_VALID_BYTES:
+        # 不写入缓存，避免下次仍被当作有效命中
+        raise RuntimeError(
+            f"PDF 下载内容过短（{len(r.content)} 字节），疑似失败页；不写入缓存"
+        )
+    tmp = path.with_suffix(path.suffix + ".part")
+    try:
+        tmp.write_bytes(r.content)
+        os.replace(tmp, path)  # 原子 rename（同分区保证）
+    except Exception:
+        # 写入失败时清理临时文件，避免遗留垃圾
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     print(f"[pdf_extract] saved: {path} ({path.stat().st_size/1024:.0f} KB)", file=sys.stderr)
     return path
 

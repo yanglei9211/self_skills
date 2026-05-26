@@ -37,12 +37,8 @@ import json
 import re
 import sys
 from datetime import datetime
-from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.announcements import (  # noqa: E402
     CNINFO_CATEGORY,
     _parse_a_share_symbol,

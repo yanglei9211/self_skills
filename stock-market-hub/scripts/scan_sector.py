@@ -29,16 +29,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import re
 import sys
 from datetime import datetime
-from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.http import fetch  # noqa: E402
 from stock_core.symbols import parts_to_symbol  # noqa: E402
 from stock_core.tz import CN_TZ  # noqa: E402
@@ -54,8 +51,7 @@ def get_sector_map(kind: str = "concept") -> dict:
         url = "https://q.10jqka.com.cn/gn/"
     else:
         url = "https://q.10jqka.com.cn/thshy/"
-    r = fetch(url)
-    r.encoding = "gbk"
+    r = fetch(url, encoding="gbk")
     tree = html.fromstring(r.text)
     out: dict = {}
     selectors = [
@@ -114,8 +110,7 @@ def get_sector_constituents(kind: str, code: str, max_pages: int = 5) -> list[st
         for page in range(1, max_pages + 1):
             url = tpl.format(page=page) if "{page}" in tpl else tpl
             try:
-                r = fetch(url, retries=1)
-                r.encoding = "gbk"
+                r = fetch(url, retries=1, encoding="gbk")
             except Exception:
                 continue
             # 成分股的代码通常在 <td> 文本里（6 位数字，sh/sz）
@@ -188,11 +183,12 @@ def scan_sector(sector_name: str, kind: str | None = None, top: int = 10) -> dic
         q["market_cap_yi"] = (q.get("market_capital") or 0) / 1e8
         q["is_st"] = "ST" in (q.get("name") or "")
 
-    # 排序生成各榜单
-    by_cap = sorted(quotes, key=lambda x: x.get("market_capital") or 0, reverse=True)
-    by_pct = sorted(quotes, key=lambda x: x.get("percent") or -999, reverse=True)
-    by_amount = sorted(quotes, key=lambda x: x.get("amount") or 0, reverse=True)
-    by_loss = sorted(quotes, key=lambda x: x.get("percent") if x.get("percent") is not None else 999)
+    # 榜单：只取 top N，用 heapq O(n log top) 替代 4 次 sorted O(n log n)。
+    # 板块成分通常 50~300 只，top 通常 10，常数级别提速但代码意图更清晰。
+    by_cap = heapq.nlargest(top, quotes, key=lambda x: x.get("market_capital") or 0)
+    by_pct = heapq.nlargest(top, quotes, key=lambda x: x.get("percent") if x.get("percent") is not None else -999)
+    by_amount = heapq.nlargest(top, quotes, key=lambda x: x.get("amount") or 0)
+    by_loss = heapq.nsmallest(top, quotes, key=lambda x: x.get("percent") if x.get("percent") is not None else 999)
     risk_stocks = [
         q for q in quotes
         if q.get("is_st") or (q.get("percent") is not None and q["percent"] <= -7)
@@ -218,10 +214,10 @@ def scan_sector(sector_name: str, kind: str | None = None, top: int = 10) -> dic
             "down": down_count,
             "flat": flat_count,
         },
-        "leaders_by_cap": by_cap[:top],          # 龙头股（按市值）
-        "top_gainers": by_pct[:top],             # 涨幅榜
-        "top_amount": by_amount[:top],           # 成交额榜（市场关注度）
-        "top_losers": by_loss[:top],             # 跌幅榜
+        "leaders_by_cap": by_cap,                # 龙头股（按市值）
+        "top_gainers": by_pct,                   # 涨幅榜
+        "top_amount": by_amount,                 # 成交额榜（市场关注度）
+        "top_losers": by_loss,                   # 跌幅榜
         "risk_stocks": risk_stocks[:top],        # 风险股（ST + 大跌）
     }
 
@@ -232,8 +228,7 @@ def _get_name_map_from_ths(kind: str, code: str) -> dict[str, str]:
     kind_path = "gn" if kind == "concept" else "thshy"
     url = f"https://q.10jqka.com.cn/{kind_path}/detail/code/{code}/"
     try:
-        r = fetch(url, retries=1)
-        r.encoding = "gbk"
+        r = fetch(url, retries=1, encoding="gbk")
     except Exception:
         return {}
     tree = html.fromstring(r.text)

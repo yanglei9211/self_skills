@@ -14,10 +14,13 @@ from stock_core.stock_market_hub import analyze_symbol, fetch_market_board
 
 class StockMarketHubProvider:
     def __init__(self, hub_dir: str | None = None) -> None:
+        # 注：以前这里会硬要求 `<hub_dir>/scripts/analyze_company.py` 存在并把它
+        # 存到 `self.script_path`，但 ``analyze_symbol()`` 走默认 hub 时根本不用
+        # 这个文件（直接 import shared.stock_core.company_analysis.analyze），所以
+        # 该校验会产生误导性错误。改成只在解析后保留 hub_dir，不做存在性检查；
+        # 真的指向了不存在的外部 hub_dir 时，``stock_market_hub._load_external_module``
+        # 会在第一次调用时报清楚的 ImportError。
         self.hub_dir = Path(hub_dir or self._resolve_hub_dir())
-        self.script_path = self.hub_dir / "scripts" / "analyze_company.py"
-        if not self.script_path.exists():
-            raise FileNotFoundError(f"找不到分析脚本: {self.script_path}")
 
     def _resolve_hub_dir(self) -> str:
         env_dir = os.environ.get("STOCK_MARKET_HUB_DIR")

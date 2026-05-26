@@ -23,13 +23,9 @@ import json
 import re
 import sys
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
 from stock_core.http import fetch  # noqa: E402
 from stock_core.kline import fetch_daily_kline  # noqa: E402
 from stock_core.symbols import normalize_symbol as _normalize_symbol_impl  # noqa: E402
@@ -59,10 +55,53 @@ def kline_events(symbol: str, market: str, kline_sym: str, days: int) -> list[di
 
     events = []
     n_days = len(sub)
-    # 计算每日涨跌幅（基于昨收）
-    closes = {sub[i]["date"]: sub[i]["close"] for i in range(n_days)}
     full_dates = [k["date"] for k in kline]
     full_idx = {d: i for i, d in enumerate(full_dates)}
+
+    # 预计算每日的"年内累计 min/max"和"60 日窗口 min/max"。
+    # 旧实现里每天都重新 `[x for x in kline if x.date[:4]==yr and x.date<=d]` 是 O(n²)；
+    # 这里改成两次 O(n) 累计扫描，把内层每天的工作量降到 O(1)。
+    ytd_low_at: dict[str, float] = {}
+    ytd_high_at: dict[str, float] = {}
+    cur_year: str | None = None
+    ymin: float | None = None
+    ymax: float | None = None
+    for x in kline:  # kline 已按日期升序
+        yr = x["date"][:4]
+        if yr != cur_year:
+            cur_year = yr
+            ymin = x["low"]
+            ymax = x["high"]
+        else:
+            if x["low"] < ymin:  # type: ignore[operator]
+                ymin = x["low"]
+            if x["high"] > ymax:  # type: ignore[operator]
+                ymax = x["high"]
+        ytd_low_at[x["date"]] = ymin  # type: ignore[assignment]
+        ytd_high_at[x["date"]] = ymax  # type: ignore[assignment]
+
+    # 60 日窗口 min/max：用单调 deque 做 O(n)。
+    # 旧实现 `kline[max(0,idx-60):idx+1]` + `min/max` 单点是 O(60)，整体 O(60n)——
+    # 已经是线性，但既然在重构就一起换成更明确的滑动窗口。
+    from collections import deque
+    win60_low_at: dict[str, float] = {}
+    win60_high_at: dict[str, float] = {}
+    low_dq: deque[int] = deque()   # 存索引，低值单调递增
+    high_dq: deque[int] = deque()  # 存索引，高值单调递减
+    for i, x in enumerate(kline):
+        while low_dq and low_dq[0] < i - 60:
+            low_dq.popleft()
+        while high_dq and high_dq[0] < i - 60:
+            high_dq.popleft()
+        while low_dq and kline[low_dq[-1]]["low"] >= x["low"]:
+            low_dq.pop()
+        while high_dq and kline[high_dq[-1]]["high"] <= x["high"]:
+            high_dq.pop()
+        low_dq.append(i)
+        high_dq.append(i)
+        win60_low_at[x["date"]] = kline[low_dq[0]]["low"]
+        win60_high_at[x["date"]] = kline[high_dq[0]]["high"]
+
     for i, k in enumerate(sub):
         d = k["date"]
         idx = full_idx[d]
@@ -83,21 +122,19 @@ def kline_events(symbol: str, market: str, kline_sym: str, days: int) -> list[di
             and abs(pct) >= 19.5
         )
 
-        # 创年内新高/新低
-        ytd_kline = [x for x in kline if x["date"][:4] == d[:4] and x["date"] <= d]
-        if ytd_kline:
-            ytd_low = min(x["low"] for x in ytd_kline)
-            ytd_high = max(x["high"] for x in ytd_kline)
+        # 创年内新高/新低（预计算好的累计 min/max）
+        ytd_low = ytd_low_at.get(d)
+        ytd_high = ytd_high_at.get(d)
+        if ytd_low is not None and ytd_high is not None:
             new_ytd_low = k["low"] <= ytd_low + 1e-6
             new_ytd_high = k["high"] >= ytd_high - 1e-6
         else:
             new_ytd_low = new_ytd_high = False
 
-        # 30 / 60 日新高/新低
-        win = kline[max(0, idx - 60) : idx + 1]
-        if win:
-            win_low = min(x["low"] for x in win)
-            win_high = max(x["high"] for x in win)
+        # 60 日新高/新低（滑动窗口预计算）
+        win_low = win60_low_at.get(d)
+        win_high = win60_high_at.get(d)
+        if win_low is not None and win_high is not None:
             new_60d_low = k["low"] <= win_low + 1e-6
             new_60d_high = k["high"] >= win_high - 1e-6
         else:

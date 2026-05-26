@@ -37,12 +37,9 @@ import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 
-_SHARED = Path(__file__).resolve().parents[2] / "shared"
-if str(_SHARED) not in sys.path:
-    sys.path.insert(0, str(_SHARED))
-
+import _path_setup  # noqa: F401,E402  把 <repo>/shared 加入 sys.path
+from stock_core.symbols import parts_to_symbol  # noqa: E402
 from stock_core.tz import CN_TZ  # noqa: E402
 from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
@@ -170,8 +167,16 @@ def rule_announcement_keyword(keyword: str, days: int = 7) -> list[dict]:
         if not sym:
             continue
         if sym not in by_stock:
+            # 注：旧版 `"SH"+sym if sym.startswith("6") else "SZ"+sym` 漏了
+            # 5/9 开头的 SH ETF/B 股、1 开头的 SZ ETF/LOF、4/8 开头的北交所。
+            # 统一走 shared.stock_core.symbols.parts_to_symbol（与 scan_sector/
+            # supply_chain 同源）。
+            try:
+                full_symbol = parts_to_symbol("a", sym)
+            except Exception:
+                continue
             by_stock[sym] = {
-                "symbol": "SH" + sym if sym.startswith("6") else "SZ" + sym,
+                "symbol": full_symbol,
                 "name": ann.get("name"),
                 "_signals": [],
                 "_announcements": [],
