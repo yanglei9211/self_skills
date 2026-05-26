@@ -44,9 +44,11 @@ def _ensure_hub_scripts_path() -> None:
     """让本模块在需要时能 ``from supply_chain import get_peers_from_concept``。
 
     历史包袱：`supply_chain.get_peers_from_concept` 内部跟 `scan_sector` 私有函数
-    （`code_to_xueqiu` / `_get_board_constituents_em` / `_format_peers`）耦合，
-    现阶段保留在 ``stock-market-hub/scripts/`` 下，shared 层暂未拆。等 supply_chain
-    重构时一并搬过来，这个 sys.path 注入就可以删了。
+    （`_get_board_constituents_em` / `_format_peers`）耦合，现阶段保留在
+    ``stock-market-hub/scripts/`` 下，shared 层暂未拆。等 supply_chain 重构时
+    一并搬过来，这个 sys.path 注入就可以删了。
+    （原本耦合里还有 ``scan_sector.code_to_xueqiu``，已在 2026-05-22 统一到
+    ``shared.stock_core.symbols.parts_to_symbol``，不再是阻碍下沉的因素。）
 
     底层基础设施（announcements / http / xueqiu / cache / kline / sec_edgar / ...）
     已经全部搬到 ``shared/stock_core/``，无需再走 hub scripts 路径。
@@ -129,11 +131,13 @@ def _get_peers(xq_sym: str, top: int = 8) -> list[dict]:
     """同业（同概念）公司横向对比：含 PE/PB/ROE/营收增速 等。
 
     ⚠️ 历史包袱：``get_peers_from_concept`` 内部跟 hub 私有模块
-       （scan_sector.code_to_xueqiu / supply_chain._get_board_constituents_em / _format_peers）
-       耦合，暂不搬到 shared。这里通过 ``_ensure_hub_scripts_path`` 注入
+       （supply_chain._get_board_constituents_em / _format_peers）耦合，
+       暂不搬到 shared。这里通过 ``_ensure_hub_scripts_path`` 注入
        hub scripts 路径后 try-import，拿不到就静默退化（peers 字段为空，
        不会阻塞 analyze_company 主流程）。下一轮 supply_chain 重构时把
        peers 抽到 shared/stock_core/peers.py，这段就可以删了。
+       （原本还耦合 ``scan_sector.code_to_xueqiu``，已统一改用
+       ``shared.stock_core.symbols.parts_to_symbol``。）
     """
     try:
         from supply_chain import get_peers_from_concept  # type: ignore

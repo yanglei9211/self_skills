@@ -304,6 +304,32 @@ class SPCTestCase(unittest.TestCase):
         self.assertEqual(snap["total_fees_ccy"], "20.36")
         self.assertEqual(snap["position_value_cny"], "44252.00")
 
+    def test_a_share_etf_sell_has_no_stamp_tax(self):
+        add_position_seed(self.conn, self.acct_id, "a", "588200", "7000", "3.702", None, "2026-05-20 10:57:44", "")
+        add_trade(
+            self.conn,
+            self.acct_id,
+            "a",
+            "588200",
+            "sell",
+            "1000",
+            "3.758",
+            "2026-05-25 10:27:10",
+            None,
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+        )
+        sync_portfolio(self.conn, self.acct_id, analysis_provider=self.provider, fx_rate_provider=self.fx_provider)
+        snap = latest_snapshot_for_symbol(self.conn, self.acct_id, "a", "588200")
+        self.assertEqual(snap["qty"], "6000.0000")
+        self.assertEqual(snap["avg_cost_price"], "3.7020")
+        self.assertEqual(snap["total_fees_ccy"], "0.00")
+        self.assertEqual(snap["realized_pnl_ccy"], "56.00")
+
     def test_manual_snapshot_preferred_over_newer_sync_snapshot(self):
         self.conn.execute(
             """

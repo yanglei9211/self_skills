@@ -37,6 +37,7 @@ from stock_core.eastmoney import (  # noqa: E402
     fetch_a_core_conception_raw,
     fetch_board_constituents,
 )
+from stock_core.symbols import parts_to_symbol  # noqa: E402
 from stock_core.tz import CN_TZ  # noqa: E402
 from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
@@ -163,7 +164,6 @@ def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
     """通过东财所属板块找同业公司，输出 PE/PB/ROE 等横向对比数据。"""
     try:
         from stock_core.company_analysis import normalize_symbol  # type: ignore
-        from scan_sector import code_to_xueqiu  # type: ignore
     except ImportError as e:
         print(f"[supply_chain] import peers deps failed: {e}", file=sys.stderr)
         return []
@@ -208,7 +208,7 @@ def get_peers_from_concept(symbol: str, top: int = 8) -> list[dict]:
         return []
 
     cli = XueqiuClient()
-    syms = [code_to_xueqiu(c) for c in consts]
+    syms = [parts_to_symbol("a", c) for c in consts]
     try:
         full = cli.screener_by_symbols(syms, market="all_a")
     except Exception as e:  # noqa: BLE001
@@ -221,7 +221,7 @@ def get_peers_legacy(symbol: str, top: int = 8) -> list[dict]:
     """旧版：通过同花顺映射找同业（保留作 fallback）。"""
     try:
         from stock_core.company_analysis import get_a_concepts, normalize_symbol  # type: ignore
-        from scan_sector import get_sector_map, get_sector_constituents, code_to_xueqiu  # type: ignore
+        from scan_sector import get_sector_map, get_sector_constituents  # type: ignore
     except ImportError as e:
         print(f"[supply_chain] import peers deps failed: {e}", file=sys.stderr)
         return []
@@ -287,8 +287,7 @@ def get_peers_legacy(symbol: str, top: int = 8) -> list[dict]:
             if not consts:
                 return []
             cli = XueqiuClient()
-            from scan_sector import code_to_xueqiu  # type: ignore
-            syms = [code_to_xueqiu(x) for x in consts]
+            syms = [parts_to_symbol("a", x) for x in consts]
             try:
                 full = cli.screener_by_symbols(syms, market="all_a")
             except Exception:
@@ -309,7 +308,7 @@ def get_peers_legacy(symbol: str, top: int = 8) -> list[dict]:
         return []
 
     cli = XueqiuClient()
-    syms = [code_to_xueqiu(c) for c in consts]
+    syms = [parts_to_symbol("a", c) for c in consts]
     try:
         full = cli.screener_by_symbols(syms, market="all_a")
     except Exception as e:  # noqa: BLE001

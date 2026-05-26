@@ -39,7 +39,8 @@ def _derive_trade_fees(conn, trade: dict) -> tuple[Decimal, Decimal]:
     if market == "a":
         if commission == 0:
             commission = q_money(amount * get_decimal_setting(conn, "rules.a.share.commission_rate", "0"))
-        if side == "sell" and stamp == 0:
+        # A 股场内 ETF / LOF 卖出不收印花税；仅普通股票卖出补默认印花税。
+        if side == "sell" and stamp == 0 and not is_etf_fn(market, trade["code"]):
             stamp = q_money(amount * get_decimal_setting(conn, "rules.a.share.stamp_tax_sell_rate", "0.0005"))
     elif market == "hk":
         if commission == 0:

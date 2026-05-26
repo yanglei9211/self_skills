@@ -40,6 +40,7 @@ if str(_SHARED) not in sys.path:
     sys.path.insert(0, str(_SHARED))
 
 from stock_core.http import fetch  # noqa: E402
+from stock_core.symbols import parts_to_symbol  # noqa: E402
 from stock_core.tz import CN_TZ  # noqa: E402
 from stock_core.xueqiu import XueqiuClient  # noqa: E402
 
@@ -141,15 +142,10 @@ def get_sector_constituents(kind: str, code: str, max_pages: int = 5) -> list[st
     return codes
 
 
-def code_to_xueqiu(code: str) -> str:
-    """6 位数字代码 → 雪球前缀代码"""
-    if code.startswith("6"):
-        return "SH" + code
-    if code.startswith(("0", "3")):
-        return "SZ" + code
-    if code.startswith(("4", "8")):
-        return "BJ" + code
-    return code
+# 历史包袱：本文件原有一个 ``code_to_xueqiu`` 私有函数，规则不完整
+# （漏了 5/9/1 开头的上交所 ETF / B 股 / 深交所 ETF/LOF 前缀），
+# 已统一改用 ``shared.stock_core.symbols.parts_to_symbol("a", code)``，
+# supply_chain.py 也跟着切换；后续新代码请直接用 parts_to_symbol。
 
 
 # ============ 板块扫描主流程 ============ #
@@ -174,7 +170,7 @@ def scan_sector(sector_name: str, kind: str | None = None, top: int = 10) -> dic
     quotes: list[dict] = []
     for i in range(0, len(constituents), batch_size):
         batch = constituents[i : i + batch_size]
-        symbols = [code_to_xueqiu(c) for c in batch]
+        symbols = [parts_to_symbol("a", c) for c in batch]
         try:
             qs = cli.quotes(symbols)
             quotes.extend(qs)
