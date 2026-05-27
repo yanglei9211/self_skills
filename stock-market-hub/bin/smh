@@ -5,6 +5,7 @@
 #   smh company SZ300750               公司深度卡片
 #   smh company HK01810 --with-peers   含同业横向对比
 #   smh company BABA --ann-days 60     SEC EDGAR 中概股
+#   smh quote HK01810                  兼容旧调用（等价于 smh company HK01810）
 #
 #   smh sector "AI PC"                 板块扫描
 #   smh sector --list                  列出可用板块
@@ -76,9 +77,29 @@ export PYTHONPATH="$SHARED:$SCRIPTS:${PYTHONPATH:-}"
 
 cmd="${1:-}"; shift || true
 
+_wants_help() {
+    case "${1:-}" in
+        -h|--help|help)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 case "$cmd" in
-    company|c)
-        exec "$VPY" "$SCRIPTS/company_api.py" --symbol "$@"
+    company|c|quote|q)
+        # `company` 把第一个位置参数映射成 --symbol，但 `--help` 不应被误塞给
+        # --symbol；同时兼容历史调用 `smh quote HK01810`。
+        if _wants_help "${1:-}"; then
+            exec "$VPY" "$SCRIPTS/company_api.py" --help
+        elif [ -n "${1:-}" ] && [[ "${1:0:2}" != "--" ]]; then
+            sym="$1"; shift
+            exec "$VPY" "$SCRIPTS/company_api.py" --symbol "$sym" "$@"
+        else
+            exec "$VPY" "$SCRIPTS/company_api.py" "$@"
+        fi
         ;;
     sector|s)
         exec "$VPY" "$SCRIPTS/scan_sector.py" "$@"
@@ -152,12 +173,12 @@ case "$cmd" in
         exec "$VPY" -m stock_core.cache "$@"
         ;;
     help|--help|-h|"")
-        sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//'
+        sed -n '/^# Usage:/,/^$/p' "$0" | sed -E 's/^# ?//'
         ;;
     *)
         echo "未知命令: $cmd" >&2
         echo "" >&2
-        sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \?//' >&2
+        sed -n '/^# Usage:/,/^$/p' "$0" | sed -E 's/^# ?//' >&2
         exit 1
         ;;
 esac
