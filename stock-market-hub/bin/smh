@@ -15,6 +15,9 @@
 #   smh market --board gainers --top 10  全市场涨幅榜
 #   smh market --markets all_a,hk,us --board gainers --top 5
 #
+#   smh screen                         A 股 1-4 周中短线初筛
+#   smh screen --top 15 --format json  机器可读候选池
+#
 #   smh risk                           风险扫描（默认 R1+R2+R5）
 #   smh risk --all                     全规则
 #
@@ -88,6 +91,9 @@ case "$cmd" in
         ;;
     market|m)
         exec "$VPY" "$SCRIPTS/xueqiu_market.py" "$@"
+        ;;
+    screen|scr)
+        exec "$VPY" "$SCRIPTS/swing_screen.py" "$@"
         ;;
     risk|r)
         exec "$VPY" "$SCRIPTS/risk_scan.py" "$@"
