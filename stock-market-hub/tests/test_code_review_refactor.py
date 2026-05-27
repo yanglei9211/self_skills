@@ -39,6 +39,7 @@ _PATH_SETUP_USERS = [
     "pdf_extract.py",
     "risk_scan.py",
     "scan_sector.py",
+    "swing_screen.py",
     "supply_chain.py",
     "xueqiu_market.py",
 ]
