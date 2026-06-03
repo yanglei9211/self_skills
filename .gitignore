@@ -67,6 +67,7 @@ cards/
 stock-portfolio-copilot/docs/
 # superpowers 计划 / review 等本地协作过程文档，不随 skill 代码提交
 docs/
+.superpower/
 # 仓库根目录 / 任意子目录里 LLM 生成的 docx 产物（持仓分析等）
 *.docx
 !references/**/*.docx

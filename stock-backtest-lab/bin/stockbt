@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# stock-backtest-lab 统一 CLI 入口
+#
+# Usage:
+#   stockbt sync SZ000333 --from 2020-01-01            同步个股 K 线
+#   stockbt sync-index --from 2020-01-01              同步指数 K 线
+#   stockbt run SZ000333 --strategy boll_squeeze_entry  运行回测
+#     --from 2020-01-01 --to 2026-05-31 --hold-days 5,10,20,60
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# 使用项目 .venv
+if [ -f "$PROJECT_ROOT/.venv/bin/python3" ]; then
+    PYTHON="$PROJECT_ROOT/.venv/bin/python3"
+else
+    PYTHON="python3"
+fi
+
+PYTHONPATH="$PROJECT_ROOT/stock-backtest-lab/scripts:$PROJECT_ROOT" exec "$PYTHON" -m backtest_core.cli "$@"

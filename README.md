@@ -10,10 +10,12 @@
 |-------|-----------|-----------|
 | [divination](divination/) | 中国传统算卦命理 CLI：八字排盘、周易起卦（铜钱 / 时间 / 数字 / 文字）、推背图、五行、穷通宝鉴 · 滴天髓 · 子平真诠全文搜索 | 算卦、占卜、八字、周易、易经、推背图、五行、运势、用神 |
 | [newsboat-news-hub](newsboat-news-hub/) | 终端新闻方案：Newsboat 配置 → RSS 源管理（中国直连版 / 代理版）→ 每日新闻汇总 → 卡片图 / Word 导出 | Newsboat、RSS、新闻汇总、daily briefing、global news |
+| [spec-driven-audited-implementation](spec-driven-audited-implementation/) | 已有 spec 的中复杂代码任务执行协议：计划、测试、review、修复、final audit 产物落盘，并显式披露独立性降级 | spec、实现、plan、review、test report、final audit、可审计、subagent、独立审查 |
+| [stock-backtest-lab](stock-backtest-lab/) | Point-in-Time 回测系统：本地 SQLite 历史数据仓、技术信号、策略回测、报告输出 | 回测、point-in-time、snapshot、SQLite、BOLL、MA、策略验证 |
 | [stock-market-hub](stock-market-hub/) | A 股 / 港股 / 中概 市场分析中心：当日财经新闻、板块龙头与热门股、公司深度卡片（基本面 / 财报 / 公告 / 上下游 / 年报 PDF 解析） | A股、港股、中概、个股分析、板块扫描、龙头、涨幅榜、主力净流入、ST、财报、巨潮、披露易、HKEX、SEC EDGAR、财联社、雪球 |
 | [stock-portfolio-copilot](stock-portfolio-copilot/) | A 股 / 港股 持仓与交易决策助手：初始持仓、成交流水、自选股、资金约束、盘中建议（buy / add / hold / trim / sell / avoid / watch） | 持仓、成本价、成交记录、自选股、仓位、加仓、减仓、清仓、交易日志 |
 
-除了上述四个 skill，仓库内还有一份共享 Python 包 [shared/stock_core](shared/stock_core/)（`company_analysis / market_snapshot / stock_market_hub`），被两个股票 skill 共同复用——它本身不是 skill，不要把 `shared/` 链接到 `~/.cursor/skills/`。
+除了上述 skill，仓库内还有一份共享 Python 包 [shared/stock_core](shared/stock_core/)（`company_analysis / market_snapshot / stock_market_hub`），被股票相关 skill 共同复用——它本身不是 skill，不要把 `shared/` 链接到 `~/.cursor/skills/`。
 
 ## 目录结构
 
@@ -25,6 +27,7 @@ self_skills/
 ├── .gitignore
 │
 ├── divination/                   # 算卦 CLI（独立 skill）
+│   ├── README.md
 │   ├── SKILL.md
 │   ├── scripts/
 │   │   ├── divination            # 主 CLI（python3 脚本）
@@ -37,6 +40,7 @@ self_skills/
 │   └── references/commands.md    # 完整命令参数手册
 │
 ├── newsboat-news-hub/            # 终端新闻 hub（独立 skill）
+│   ├── README.md
 │   ├── SKILL.md
 │   ├── config                    # Newsboat 主配置（vim 键位 + 4 个分类宏）
 │   ├── urls-china                # 中国大陆直连源（28 条）
@@ -47,7 +51,21 @@ self_skills/
 │       ├── generate_cards.py     # JSON → 小红书风格新闻卡片图（playwright）
 │       └── md_to_docx.py         # 汇总 markdown → Word（python-docx）
 │
+├── spec-driven-audited-implementation/
+│   ├── README.md
+│   ├── SKILL.md                  # 已有 spec 的可审计实现协议
+│   ├── templates/                # capability_check / plan / review / final_audit 等模板
+│   └── scripts/verify_artifacts.py
+│
+├── stock-backtest-lab/           # Point-in-Time 回测系统（独立 skill）
+│   ├── README.md
+│   ├── SKILL.md
+│   ├── bin/stockbt
+│   ├── scripts/backtest_core/
+│   └── tests/
+│
 ├── stock-market-hub/             # 股票分析中心（独立 skill）
+│   ├── README.md
 │   ├── SKILL.md
 │   ├── bin/smh                   # 统一 CLI 入口（company / sector / news / market / risk / ann / timeline / pdf / supply / cache）
 │   ├── scripts/
@@ -69,6 +87,7 @@ self_skills/
 │       └── v2_roadmap.md
 │
 ├── stock-portfolio-copilot/      # 持仓与交易决策助手（独立 skill）
+│   ├── README.md
 │   ├── SKILL.md
 │   ├── bin/spc                   # CLI 入口
 │   ├── scripts/
@@ -133,6 +152,8 @@ cp stock-market-hub/data/xueqiu.cookie.example ~/.config/stock-market-hub/xueqiu
 # Cursor 客户端
 ln -s "$(pwd)/divination"               ~/.cursor/skills/divination
 ln -s "$(pwd)/newsboat-news-hub"        ~/.cursor/skills/newsboat-news-hub
+ln -s "$(pwd)/spec-driven-audited-implementation" ~/.cursor/skills/spec-driven-audited-implementation
+ln -s "$(pwd)/stock-backtest-lab"       ~/.cursor/skills/stock-backtest-lab
 ln -s "$(pwd)/stock-market-hub"         ~/.cursor/skills/stock-market-hub
 ln -s "$(pwd)/stock-portfolio-copilot"  ~/.cursor/skills/stock-portfolio-copilot
 
@@ -173,12 +194,14 @@ python3 newsboat-news-hub/scripts/fetch_news.py --date 2026-05-10 --tz ET --retr
 | `newsboat-news-hub/scripts/generate_cards.py` | `playwright` | 还需 `playwright install chromium` |
 | `newsboat-news-hub/scripts/md_to_docx.py` | `python-docx` | 仅在用户明确"导出 Word"时调用 |
 | Newsboat 本身 | `brew install newsboat` / `apt install newsboat` | macOS / Linux |
+| `stock-backtest-lab/**` | 同股票共享依赖中的 `curl_cffi` | sync 阶段复用 `shared/stock_core` 拉 K 线；回测阶段只读本地 SQLite |
 | `stock-market-hub/**` | `akshare` `pdfplumber` `curl_cffi` `pandas` `lxml` `pytesseract` `pdf2image` | 系统层另需 `tesseract` + `poppler`（港股年报 OCR fallback） |
 | `stock-portfolio-copilot/**` | 同上（通过 `shared/stock_core` 复用 stock-market-hub） | 持仓数据库存在 `~/.local/share/stock-portfolio-copilot/portfolio.db`，可用 `SPC_DATA_DIR` 覆盖 |
 
 ## 内部约定 / 开发规范
 
 - **skill 布局**：每个 skill 目录根必须有一份 `SKILL.md`，第一段带 YAML frontmatter（`name` + `description`），description 里要写明触发关键词供 Agent 匹配。
+- **README 分工**：每个 skill 目录根必须有一份 `README.md`，面向真人说明“能做什么、怎么用、依赖、配置、数据产物、注意事项”。`SKILL.md` 面向 Agent，写触发条件、执行协议、工具调用和红线纪律；不要把两者混成一份长文。
 - **真身 + 软链**：skill 的代码永远在本仓库里维护、提交，`~/.cursor/skills/<name>` / `~/.claude/skills/<name>` 必须是软链接，不允许是真实目录或复制。改造已有真实目录的步骤见 `.cursor/rules/skills-layout.mdc`。
 - **依赖最小化**：能用标准库就不引第三方。必须引入时在 `requirements.txt` 里注明"服务于哪个脚本"。
 - **共享代码**：跨 skill 的可复用 Python 模块放 `shared/stock_core/` 这样的目录，由各 skill 内的脚本 `import`，不要把同样的代码各拷一份。

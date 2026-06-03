@@ -1,0 +1,7 @@
+interface:
+  display_name: "Spec-Driven Audited Implementation"
+  short_description: "Implement an existing spec with audit evidence"
+  default_prompt: "Use $spec-driven-audited-implementation to implement this existing spec with Chinese audit artifacts, testing/review evidence, and minimal mid-task interruptions."
+
+policy:
+  allow_implicit_invocation: true
