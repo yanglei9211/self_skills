@@ -261,10 +261,17 @@ def fetch_daily_fund_flow(market: str, code: str) -> list[dict]:
     return []
 
 
+# 港股东财分时接口返回的金额单位异常（约 A 股的 1000 倍），需做市场特定缩放。
+# 已验证：01810 分时主力 -648 亿 vs 实际约 -0.65 亿（1000x）；
+# 01276 分时主力 -3.74 亿 vs 日线量级 0.03-0.17 亿（同样偏大约 1000x）。
+_HK_INTRADAY_SCALE = 1000.0
+_AMOUNT_FIELDS = ("main", "small", "mid", "big", "super_big")
+
+
 @cached(
     ttl=lambda market, code: _ttl_for_moment(market, datetime.now(CN_TZ)),
     key_prefix="ffi",
-    schema_version=1,
+    schema_version=2,
 )
 def fetch_intraday_fund_flow(market: str, code: str) -> list[dict]:
     """拉东财分时资金流（分钟级累计）。"""
@@ -281,7 +288,15 @@ def fetch_intraday_fund_flow(market: str, code: str) -> list[dict]:
     payload = r.json() or {}
     klines = ((payload.get("data") or {}).get("klines") or [])
     rows = [_parse_kline_row(k) for k in klines]
-    return [row for row in rows if row is not None and row.get("date")]
+    rows = [row for row in rows if row is not None and row.get("date")]
+    # 港股分时接口金额单位异常（~1000x），缩放至元
+    if market == "hk":
+        for row in rows:
+            for field in _AMOUNT_FIELDS:
+                val = row.get(field)
+                if val is not None:
+                    row[field] = val / _HK_INTRADAY_SCALE
+    return rows
 
 
 def _to_yi(value: float | None) -> float | None:
